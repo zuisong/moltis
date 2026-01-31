@@ -309,12 +309,11 @@ pub async fn run_agent_loop_with_context(
             let result = if let Some(tool) = tools.get(&tc.name) {
                 // Merge tool_context (e.g. _session_key) into the tool call params.
                 let mut args = tc.arguments.clone();
-                if let Some(ref ctx) = tool_context {
-                    if let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
-                    {
-                        for (k, v) in ctx_obj {
-                            args_obj.insert(k.clone(), v.clone());
-                        }
+                if let Some(ref ctx) = tool_context
+                    && let (Some(args_obj), Some(ctx_obj)) = (args.as_object_mut(), ctx.as_object())
+                {
+                    for (k, v) in ctx_obj {
+                        args_obj.insert(k.clone(), v.clone());
                     }
                 }
                 match tool.execute(args).await {

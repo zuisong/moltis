@@ -91,7 +91,7 @@ impl OpenAiCodexProvider {
     fn convert_messages(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
         messages
             .iter()
-            .filter_map(|msg| {
+            .flat_map(|msg| {
                 let role = msg["role"].as_str().unwrap_or("user");
                 match role {
                     "assistant" => {
@@ -108,46 +108,45 @@ impl OpenAiCodexProvider {
                                 }));
                             }
                             // Also include text content if present
-                            if let Some(text) = msg["content"].as_str() {
-                                if !text.is_empty() {
-                                    items.insert(
-                                        0,
-                                        serde_json::json!({
-                                            "type": "message",
-                                            "role": "assistant",
-                                            "content": [{"type": "output_text", "text": text}]
-                                        }),
-                                    );
-                                }
+                            if let Some(text) = msg["content"].as_str()
+                                && !text.is_empty()
+                            {
+                                items.insert(
+                                    0,
+                                    serde_json::json!({
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [{"type": "output_text", "text": text}]
+                                    }),
+                                );
                             }
-                            Some(items)
+                            items
                         } else {
                             let content = msg["content"].as_str().unwrap_or("");
-                            Some(vec![serde_json::json!({
+                            vec![serde_json::json!({
                                 "type": "message",
                                 "role": "assistant",
                                 "content": [{"type": "output_text", "text": content}]
-                            })])
+                            })]
                         }
                     },
                     "tool" => {
                         // Convert tool result to function_call_output
-                        Some(vec![serde_json::json!({
+                        vec![serde_json::json!({
                             "type": "function_call_output",
                             "call_id": msg["tool_call_id"],
                             "output": msg["content"].as_str().unwrap_or(""),
-                        })])
+                        })]
                     },
                     _ => {
                         let content = msg["content"].as_str().unwrap_or("");
-                        Some(vec![serde_json::json!({
+                        vec![serde_json::json!({
                             "role": "user",
                             "content": [{"type": "input_text", "text": content}]
-                        })])
+                        })]
                     },
                 }
             })
-            .flatten()
             .collect()
     }
 }
@@ -315,10 +314,10 @@ impl LlmProvider for OpenAiCodexProvider {
                         }
                     },
                     "response.function_call_arguments.delta" => {
-                        if let Some(delta) = evt["delta"].as_str() {
-                            if let Some(last) = fn_call_args.last_mut() {
-                                last.push_str(delta);
-                            }
+                        if let Some(delta) = evt["delta"].as_str()
+                            && let Some(last) = fn_call_args.last_mut()
+                        {
+                            last.push_str(delta);
                         }
                     },
                     "response.function_call_arguments.done" => {

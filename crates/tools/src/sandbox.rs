@@ -438,11 +438,11 @@ impl Sandbox for AppleContainerSandbox {
             .output()
             .await;
 
-        if let Ok(output) = check {
-            if output.status.success() {
-                debug!(name, "apple container already running");
-                return Ok(());
-            }
+        if let Ok(output) = check
+            && output.status.success()
+        {
+            debug!(name, "apple container already running");
+            return Ok(());
         }
 
         let args = vec![

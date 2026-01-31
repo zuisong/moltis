@@ -161,21 +161,20 @@ impl WorktreeManager {
             } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
                 current_branch = Some(branch.to_string());
             } else if line.is_empty() {
-                if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take()) {
-                    // Only include moltis-managed worktrees
-                    if branch.starts_with("moltis/") {
-                        worktrees.push(WorktreeInfo { path, branch });
-                    }
+                if let (Some(path), Some(branch)) = (current_path.take(), current_branch.take())
+                    && branch.starts_with("moltis/")
+                {
+                    worktrees.push(WorktreeInfo { path, branch });
                 }
                 current_path = None;
                 current_branch = None;
             }
         }
         // Handle last entry (no trailing blank line)
-        if let (Some(path), Some(branch)) = (current_path, current_branch) {
-            if branch.starts_with("moltis/") {
-                worktrees.push(WorktreeInfo { path, branch });
-            }
+        if let (Some(path), Some(branch)) = (current_path, current_branch)
+            && branch.starts_with("moltis/")
+        {
+            worktrees.push(WorktreeInfo { path, branch });
         }
 
         Ok(worktrees)

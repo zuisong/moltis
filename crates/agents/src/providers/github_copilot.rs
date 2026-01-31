@@ -141,15 +141,15 @@ impl GitHubCopilotProvider {
         // We need to exchange it for a Copilot API token each time
         // (the Copilot token is short-lived ~30 min).
         // We store the Copilot token in a separate key for caching.
-        if let Some(copilot_tokens) = self.token_store.load("github-copilot-api") {
-            if let Some(expires_at) = copilot_tokens.expires_at {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if now + 60 < expires_at {
-                    return Ok(copilot_tokens.access_token);
-                }
+        if let Some(copilot_tokens) = self.token_store.load("github-copilot-api")
+            && let Some(expires_at) = copilot_tokens.expires_at
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            if now + 60 < expires_at {
+                return Ok(copilot_tokens.access_token);
             }
         }
 

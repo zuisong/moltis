@@ -434,13 +434,13 @@ impl CronService {
     async fn clear_stuck_jobs(&self, now: u64) {
         let mut jobs = self.jobs.write().await;
         for job in jobs.iter_mut() {
-            if let Some(running_at) = job.state.running_at_ms {
-                if now - running_at > STUCK_THRESHOLD_MS {
-                    warn!(id = %job.id, "clearing stuck cron job");
-                    job.state.running_at_ms = None;
-                    job.state.last_status = Some(RunStatus::Error);
-                    job.state.last_error = Some("stuck: exceeded 2h timeout".into());
-                }
+            if let Some(running_at) = job.state.running_at_ms
+                && now - running_at > STUCK_THRESHOLD_MS
+            {
+                warn!(id = %job.id, "clearing stuck cron job");
+                job.state.running_at_ms = None;
+                job.state.last_status = Some(RunStatus::Error);
+                job.state.last_error = Some("stuck: exceeded 2h timeout".into());
             }
         }
     }

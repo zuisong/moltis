@@ -75,19 +75,19 @@ fn git_remote_name(dir: &Path) -> Option<String> {
             in_origin = false;
             continue;
         }
-        if in_origin && trimmed.starts_with("url") {
-            if let Some(url) = trimmed.split('=').nth(1) {
-                let url = url.trim();
-                // Extract repo name from URL like git@...:user/repo.git or https://.../repo.git
-                let name = url
-                    .rsplit('/')
-                    .next()
-                    .or_else(|| url.rsplit(':').next())
-                    .unwrap_or(url)
-                    .trim_end_matches(".git");
-                if !name.is_empty() {
-                    return Some(name.to_string());
-                }
+        if in_origin && trimmed.starts_with("url")
+            && let Some(url) = trimmed.split('=').nth(1)
+        {
+            let url = url.trim();
+            // Extract repo name from URL like git@...:user/repo.git or https://.../repo.git
+            let name = url
+                .rsplit('/')
+                .next()
+                .or_else(|| url.rsplit(':').next())
+                .unwrap_or(url)
+                .trim_end_matches(".git");
+            if !name.is_empty() {
+                return Some(name.to_string());
             }
         }
     }
@@ -138,10 +138,10 @@ pub fn auto_detect(dirs: &[&Path], known_ids: &[String]) -> Vec<Project> {
         if !is_git_repo(dir) {
             continue;
         }
-        if let Some(project) = detect_project(dir) {
-            if !known_ids.contains(&project.id) {
-                detected.push(project);
-            }
+        if let Some(project) = detect_project(dir)
+            && !known_ids.contains(&project.id)
+        {
+            detected.push(project);
         }
     }
     detected

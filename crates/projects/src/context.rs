@@ -28,16 +28,15 @@ pub fn load_context_files(project_dir: &Path) -> Result<Vec<ContextFile>> {
         let mut layer = Vec::new();
         for name in CONTEXT_FILE_NAMES {
             let file_path = dir.join(name);
-            if file_path.is_file() {
-                if let Ok(content) = fs::read_to_string(&file_path) {
-                    if !content.trim().is_empty() {
-                        debug!(path = %file_path.display(), "loaded context file");
-                        layer.push(ContextFile {
-                            path: file_path,
-                            content,
-                        });
-                    }
-                }
+            if file_path.is_file()
+                && let Ok(content) = fs::read_to_string(&file_path)
+                && !content.trim().is_empty()
+            {
+                debug!(path = %file_path.display(), "loaded context file");
+                layer.push(ContextFile {
+                    path: file_path,
+                    content,
+                });
             }
         }
         if !layer.is_empty() {
@@ -60,11 +59,11 @@ pub fn load_context_files(project_dir: &Path) -> Result<Vec<ContextFile>> {
             .collect();
         rule_files.sort();
         for path in rule_files {
-            if let Ok(content) = fs::read_to_string(&path) {
-                if !content.trim().is_empty() {
-                    debug!(path = %path.display(), "loaded rule file");
-                    files.push(ContextFile { path, content });
-                }
+            if let Ok(content) = fs::read_to_string(&path)
+                && !content.trim().is_empty()
+            {
+                debug!(path = %path.display(), "loaded rule file");
+                files.push(ContextFile { path, content });
             }
         }
     }

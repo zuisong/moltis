@@ -4,7 +4,7 @@ use {async_trait::async_trait, serde_json::Value, tokio::sync::RwLock, tracing::
 
 use {
     moltis_agents::providers::ProviderRegistry,
-    moltis_config::schema::{ProviderEntry, ProvidersConfig},
+    moltis_config::schema::ProvidersConfig,
     moltis_oauth::{
         CallbackServer, OAuthFlow, TokenStore, callback_port, device_flow, load_oauth_config,
     },
@@ -96,7 +96,7 @@ pub(crate) fn config_with_saved_keys(
         let entry = config
             .providers
             .entry(name)
-            .or_insert_with(ProviderEntry::default);
+            .or_default();
         // Only override if config doesn't already have a key.
         if entry.api_key.as_ref().is_none_or(|k| k.is_empty()) {
             entry.api_key = Some(key);
@@ -499,6 +499,7 @@ impl ProviderSetupService for LiveProviderSetupService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use moltis_config::schema::ProviderEntry;
 
     #[test]
     fn known_providers_have_valid_auth_types() {

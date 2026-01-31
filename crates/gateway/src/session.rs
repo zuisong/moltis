@@ -176,10 +176,10 @@ impl SessionService for LiveSessionService {
         self.store.clear(key).await.map_err(|e| e.to_string())?;
 
         // Clean up sandbox resources for this session.
-        if let Some(ref router) = self.sandbox_router {
-            if let Err(e) = router.cleanup_session(key).await {
-                tracing::warn!("sandbox cleanup for session {key}: {e}");
-            }
+        if let Some(ref router) = self.sandbox_router
+            && let Err(e) = router.cleanup_session(key).await
+        {
+            tracing::warn!("sandbox cleanup for session {key}: {e}");
         }
 
         self.metadata.remove(key).await;

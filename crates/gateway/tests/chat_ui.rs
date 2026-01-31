@@ -17,7 +17,7 @@ use moltis_gateway::{
     state::GatewayState,
 };
 
-use {moltis_agents::providers::ProviderRegistry, sqlx};
+use moltis_agents::providers::ProviderRegistry;
 
 /// Spin up a test gateway on an ephemeral port, return the bound address.
 async fn start_test_server() -> SocketAddr {

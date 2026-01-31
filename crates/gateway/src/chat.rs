@@ -676,15 +676,15 @@ async fn run_with_tools(
                         // Cap output sent to the UI to avoid huge WS frames.
                         let mut capped = res.clone();
                         for field in &["stdout", "stderr"] {
-                            if let Some(s) = capped.get(*field).and_then(|v| v.as_str()) {
-                                if s.len() > 10_000 {
-                                    let truncated = format!(
-                                        "{}\n\n... [truncated — {} bytes total]",
-                                        &s[..10_000],
-                                        s.len()
-                                    );
-                                    capped[*field] = serde_json::Value::String(truncated);
-                                }
+                            if let Some(s) = capped.get(*field).and_then(|v| v.as_str())
+                                && s.len() > 10_000
+                            {
+                                let truncated = format!(
+                                    "{}\n\n... [truncated — {} bytes total]",
+                                    &s[..10_000],
+                                    s.len()
+                                );
+                                capped[*field] = serde_json::Value::String(truncated);
                             }
                         }
                         payload["result"] = capped;
