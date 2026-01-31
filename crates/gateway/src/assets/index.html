@@ -17,18 +17,6 @@
   <h1 class="text-base font-medium tracking-wide text-[var(--text-strong)]">moltis</h1>
   <span class="status-dot" id="statusDot"></span>
   <span class="text-xs text-[var(--muted)]" id="statusText">disconnected</span>
-  <!-- Model selector (searchable) -->
-  <div id="modelCombo" class="model-combo hidden">
-    <button id="modelComboBtn" class="model-combo-btn" type="button">
-      <span id="modelComboLabel">no models</span>
-      <svg class="model-combo-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" width="12" height="12"><path d="M19.5 8.25l-7.5 7.5-7.5-7.5"/></svg>
-    </button>
-    <div id="modelDropdown" class="model-dropdown hidden">
-      <input id="modelSearchInput" type="text" placeholder="Search models…" class="model-search-input" autocomplete="off" />
-      <div id="modelDropdownList" class="model-dropdown-list"></div>
-    </div>
-  </div>
-  <button id="addProviderBtn" class="text-xs text-[var(--muted)] border border-[var(--border)] w-7 h-7 rounded-md hover:text-[var(--text)] hover:border-[var(--border-strong)] transition-colors cursor-pointer bg-transparent font-[var(--font-body)] flex items-center justify-center" title="Add provider">+</button>
 
   <div class="flex-1"></div>
 
@@ -60,6 +48,13 @@
       <a href="/projects" data-nav class="nav-link">Projects</a>
       <a href="/crons" data-nav class="nav-link">Crons</a>
       <a href="/methods" data-nav class="nav-link">Methods</a>
+    </div>
+    <div class="px-3 py-2 border-t border-[var(--border)]">
+      <div class="flex items-center justify-between mb-1">
+        <span class="text-xs text-[var(--muted)] font-medium">Providers</span>
+        <button id="navAddProviderBtn" class="text-xs text-[var(--muted)] border border-[var(--border)] w-5 h-5 rounded flex items-center justify-center hover:text-[var(--text)] hover:border-[var(--border-strong)] transition-colors cursor-pointer bg-transparent" title="Add provider">+</button>
+      </div>
+      <div id="navProviderList" class="flex flex-col gap-0.5"></div>
     </div>
   </nav>
 

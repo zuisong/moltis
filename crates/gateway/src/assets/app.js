@@ -64,12 +64,13 @@
 
   var dot = $("statusDot");
   var sText = $("statusText");
-  var modelCombo = $("modelCombo");
-  var modelComboBtn = $("modelComboBtn");
-  var modelComboLabel = $("modelComboLabel");
-  var modelDropdown = $("modelDropdown");
-  var modelSearchInput = $("modelSearchInput");
-  var modelDropdownList = $("modelDropdownList");
+  // Model selector elements — created dynamically inside the chat page
+  var modelCombo = null;
+  var modelComboBtn = null;
+  var modelComboLabel = null;
+  var modelDropdown = null;
+  var modelSearchInput = null;
+  var modelDropdownList = null;
   var selectedModelId = localStorage.getItem("moltis-model") || "";
   var modelIdx = -1;
   function setSessionModel(sessionKey, modelId) {
@@ -79,7 +80,8 @@
   var sessionsPanel = $("sessionsPanel");
   var sessionList = $("sessionList");
   var newSessionBtn = $("newSessionBtn");
-  var addProviderBtn = $("addProviderBtn");
+  var navAddProviderBtn = $("navAddProviderBtn");
+  var navProviderList = $("navProviderList");
 
   function setStatus(state, text) {
     dot.className = "status-dot " + state;
@@ -117,46 +119,49 @@
       if (!res || !res.ok) return;
       models = res.payload || [];
       if (models.length === 0) {
-        modelCombo.classList.add("hidden");
+        if (modelCombo) modelCombo.classList.add("hidden");
         return;
       }
       var saved = localStorage.getItem("moltis-model") || "";
       var found = models.find(function (m) { return m.id === saved; });
       if (found) {
         selectedModelId = found.id;
-        modelComboLabel.textContent = found.displayName || found.id;
+        if (modelComboLabel) modelComboLabel.textContent = found.displayName || found.id;
       } else {
         selectedModelId = models[0].id;
-        modelComboLabel.textContent = models[0].displayName || models[0].id;
+        if (modelComboLabel) modelComboLabel.textContent = models[0].displayName || models[0].id;
         localStorage.setItem("moltis-model", selectedModelId);
       }
-      modelCombo.classList.remove("hidden");
+      if (modelCombo) modelCombo.classList.remove("hidden");
     });
   }
 
   function selectModel(m) {
     selectedModelId = m.id;
-    modelComboLabel.textContent = m.displayName || m.id;
+    if (modelComboLabel) modelComboLabel.textContent = m.displayName || m.id;
     localStorage.setItem("moltis-model", m.id);
     setSessionModel(activeSessionKey, m.id);
     closeModelDropdown();
   }
 
   function openModelDropdown() {
+    if (!modelDropdown) return;
     modelDropdown.classList.remove("hidden");
     modelSearchInput.value = "";
     modelIdx = -1;
     renderModelList("");
-    requestAnimationFrame(function () { modelSearchInput.focus(); });
+    requestAnimationFrame(function () { if (modelSearchInput) modelSearchInput.focus(); });
   }
 
   function closeModelDropdown() {
+    if (!modelDropdown) return;
     modelDropdown.classList.add("hidden");
-    modelSearchInput.value = "";
+    if (modelSearchInput) modelSearchInput.value = "";
     modelIdx = -1;
   }
 
   function renderModelList(query) {
+    if (!modelDropdownList) return;
     modelDropdownList.textContent = "";
     var q = query.toLowerCase();
     var filtered = models.filter(function (m) {
@@ -191,6 +196,7 @@
   }
 
   function updateModelActive() {
+    if (!modelDropdownList) return;
     var items = modelDropdownList.querySelectorAll(".model-dropdown-item");
     items.forEach(function (el, i) {
       el.classList.toggle("kb-active", i === modelIdx);
@@ -200,44 +206,50 @@
     }
   }
 
-  modelComboBtn.addEventListener("click", function () {
-    if (modelDropdown.classList.contains("hidden")) {
-      openModelDropdown();
-    } else {
-      closeModelDropdown();
-    }
-  });
+  // Model combo event listeners are set up dynamically inside initChat
+  // when the model selector is created in the chat page.
+  function bindModelComboEvents() {
+    if (!modelComboBtn || !modelSearchInput || !modelDropdownList || !modelCombo) return;
 
-  modelSearchInput.addEventListener("input", function () {
-    modelIdx = -1;
-    renderModelList(modelSearchInput.value.trim());
-  });
-
-  modelSearchInput.addEventListener("keydown", function (e) {
-    var items = modelDropdownList.querySelectorAll(".model-dropdown-item");
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      modelIdx = Math.min(modelIdx + 1, items.length - 1);
-      updateModelActive();
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      modelIdx = Math.max(modelIdx - 1, 0);
-      updateModelActive();
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      if (modelIdx >= 0 && items[modelIdx]) {
-        items[modelIdx].click();
-      } else if (items.length === 1) {
-        items[0].click();
+    modelComboBtn.addEventListener("click", function () {
+      if (modelDropdown.classList.contains("hidden")) {
+        openModelDropdown();
+      } else {
+        closeModelDropdown();
       }
-    } else if (e.key === "Escape") {
-      closeModelDropdown();
-      modelComboBtn.focus();
-    }
-  });
+    });
+
+    modelSearchInput.addEventListener("input", function () {
+      modelIdx = -1;
+      renderModelList(modelSearchInput.value.trim());
+    });
+
+    modelSearchInput.addEventListener("keydown", function (e) {
+      var items = modelDropdownList.querySelectorAll(".model-dropdown-item");
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        modelIdx = Math.min(modelIdx + 1, items.length - 1);
+        updateModelActive();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        modelIdx = Math.max(modelIdx - 1, 0);
+        updateModelActive();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (modelIdx >= 0 && items[modelIdx]) {
+          items[modelIdx].click();
+        } else if (items.length === 1) {
+          items[0].click();
+        }
+      } else if (e.key === "Escape") {
+        closeModelDropdown();
+        modelComboBtn.focus();
+      }
+    });
+  }
 
   document.addEventListener("click", function (e) {
-    if (!modelCombo.contains(e.target)) {
+    if (modelCombo && !modelCombo.contains(e.target)) {
       closeModelDropdown();
     }
   });
@@ -869,6 +881,7 @@
           status.textContent = provider.displayName + " configured successfully!";
           providerModalBody.appendChild(status);
           fetchModels();
+          fetchNavProviders();
           setTimeout(closeProviderModal, 1500);
         } else {
           saveBtn.disabled = false;
@@ -971,19 +984,68 @@
           status.textContent = provider.displayName + " connected successfully!";
           providerModalBody.appendChild(status);
           fetchModels();
+          fetchNavProviders();
           setTimeout(closeProviderModal, 1500);
         }
       });
     }, 2000);
   }
 
-  addProviderBtn.addEventListener("click", function () {
+  navAddProviderBtn.addEventListener("click", function () {
     if (connected) openProviderModal();
   });
   providerModalClose.addEventListener("click", closeProviderModal);
   providerModal.addEventListener("click", function (e) {
     if (e.target === providerModal) closeProviderModal();
   });
+
+  // ── Nav provider list ──────────────────────────────────────
+  function fetchNavProviders() {
+    sendRpc("providers.available", {}).then(function (res) {
+      if (!res || !res.ok) return;
+      renderNavProviders(res.payload || []);
+    });
+  }
+
+  function renderNavProviders(providers) {
+    while (navProviderList.firstChild) navProviderList.removeChild(navProviderList.firstChild);
+    var configured = providers.filter(function (p) { return p.configured; });
+    if (configured.length === 0) {
+      var empty = document.createElement("div");
+      empty.className = "text-xs text-[var(--muted)]";
+      empty.style.padding = "2px 0";
+      empty.textContent = "No providers configured";
+      navProviderList.appendChild(empty);
+      return;
+    }
+    configured.forEach(function (p) {
+      var row = document.createElement("div");
+      row.className = "flex items-center justify-between py-0.5";
+
+      var name = document.createElement("span");
+      name.className = "text-xs text-[var(--text)]";
+      name.textContent = p.displayName;
+      row.appendChild(name);
+
+      var logoutBtn = document.createElement("button");
+      logoutBtn.className = "text-[10px] text-[var(--muted)] hover:text-[var(--error)] cursor-pointer bg-transparent border-none transition-colors";
+      logoutBtn.textContent = "remove";
+      logoutBtn.title = "Remove " + p.displayName;
+      logoutBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        if (!confirm("Remove credentials for " + p.displayName + "?")) return;
+        sendRpc("providers.remove_key", { provider: p.name }).then(function (res) {
+          if (res && res.ok) {
+            fetchModels();
+            fetchNavProviders();
+          }
+        });
+      });
+      row.appendChild(logoutBtn);
+
+      navProviderList.appendChild(row);
+    });
+  }
 
   // ── Error helpers ───────────────────────────────────────────
   function parseErrorMessage(message) {
@@ -1213,7 +1275,7 @@
           var found = models.find(function (m) { return m.id === entry.model; });
           if (found) {
             selectedModelId = found.id;
-            modelComboLabel.textContent = found.displayName || found.id;
+            if (modelComboLabel) modelComboLabel.textContent = found.displayName || found.id;
             localStorage.setItem("moltis-model", found.id);
           }
         }
@@ -1353,6 +1415,18 @@
   // Safe: static hardcoded HTML template, no user input.
   var chatPageHTML =
     '<div class="flex-1 flex flex-col min-w-0">' +
+      '<div class="px-4 py-1.5 border-b border-[var(--border)] bg-[var(--surface)] flex items-center gap-2 shrink-0">' +
+        '<div id="modelCombo" class="model-combo hidden">' +
+          '<button id="modelComboBtn" class="model-combo-btn" type="button">' +
+            '<span id="modelComboLabel">no models</span>' +
+            '<svg class="model-combo-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" width="12" height="12"><path d="M19.5 8.25l-7.5 7.5-7.5-7.5"/></svg>' +
+          '</button>' +
+          '<div id="modelDropdown" class="model-dropdown hidden">' +
+            '<input id="modelSearchInput" type="text" placeholder="Search models\u2026" class="model-search-input" autocomplete="off" />' +
+            '<div id="modelDropdownList" class="model-dropdown-list"></div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
       '<div class="flex-1 overflow-y-auto p-4 flex flex-col gap-2" id="messages"></div>' +
       '<div class="px-4 py-3 border-t border-[var(--border)] bg-[var(--surface)] flex gap-2 items-end">' +
         '<textarea id="chatInput" placeholder="Type a message..." rows="1" ' +
@@ -1367,6 +1441,26 @@
     chatMsgBox = $("messages");
     chatInput = $("chatInput");
     chatSendBtn = $("sendBtn");
+
+    // Bind model selector elements (now inside chat page)
+    modelCombo = $("modelCombo");
+    modelComboBtn = $("modelComboBtn");
+    modelComboLabel = $("modelComboLabel");
+    modelDropdown = $("modelDropdown");
+    modelSearchInput = $("modelSearchInput");
+    modelDropdownList = $("modelDropdownList");
+    bindModelComboEvents();
+
+    // Show model selector if models are loaded
+    if (models.length > 0 && modelCombo) {
+      modelCombo.classList.remove("hidden");
+      var found = models.find(function (m) { return m.id === selectedModelId; });
+      if (found && modelComboLabel) {
+        modelComboLabel.textContent = found.displayName || found.id;
+      } else if (models[0] && modelComboLabel) {
+        modelComboLabel.textContent = models[0].displayName || models[0].id;
+      }
+    }
 
     if (connected) chatSendBtn.disabled = false;
 
@@ -1410,6 +1504,12 @@
     chatSendBtn = null;
     streamEl = null;
     streamText = "";
+    modelCombo = null;
+    modelComboBtn = null;
+    modelComboLabel = null;
+    modelDropdown = null;
+    modelSearchInput = null;
+    modelDropdownList = null;
   });
 
   // ════════════════════════════════════════════════════════════
@@ -2254,6 +2354,7 @@
           var ts = now.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
           chatAddMsg("system", "Connected to moltis gateway v" + hello.server.version + " at " + ts);
           fetchModels();
+          fetchNavProviders();
           fetchSessions();
           fetchProjects();
           if (currentPage === "/") switchSession(activeSessionKey);

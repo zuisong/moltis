@@ -82,6 +82,7 @@ const WRITE_METHODS: &[&str] = &[
     "chat.abort",
     "browser.request",
     "providers.save_key",
+    "providers.remove_key",
     "providers.oauth.start",
     "sessions.switch",
     "projects.upsert",
@@ -536,11 +537,14 @@ impl MethodRegistry {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     {
                         let mut invokes = ctx.state.pending_invokes.write().await;
-                        invokes.insert(invoke_id.clone(), crate::state::PendingInvoke {
-                            request_id: ctx.request_id.clone(),
-                            sender: tx,
-                            created_at: std::time::Instant::now(),
-                        });
+                        invokes.insert(
+                            invoke_id.clone(),
+                            crate::state::PendingInvoke {
+                                request_id: ctx.request_id.clone(),
+                                sender: tx,
+                                created_at: std::time::Instant::now(),
+                            },
+                        );
                     }
 
                     // Wait for result with 30s timeout.
@@ -1730,6 +1734,19 @@ impl MethodRegistry {
                         .services
                         .provider_setup
                         .oauth_status(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
+            "providers.remove_key",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .provider_setup
+                        .remove_key(ctx.params.clone())
                         .await
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
                 })
