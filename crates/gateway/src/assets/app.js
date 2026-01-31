@@ -81,12 +81,13 @@
   }
 
   // ── Sandbox toggle ───────────────────────────────────────────
-  var sandboxToggleBtn = $("sandboxToggle");
-  var sandboxLabel = $("sandboxLabel");
+  var sandboxToggleBtn = null;
+  var sandboxLabel = null;
   var sessionSandboxEnabled = true;
 
   function updateSandboxUI(enabled) {
     sessionSandboxEnabled = !!enabled;
+    if (!sandboxLabel || !sandboxToggleBtn) return;
     if (sessionSandboxEnabled) {
       sandboxLabel.textContent = "sandboxed";
       sandboxToggleBtn.style.borderColor = "var(--accent, #f59e0b)";
@@ -98,18 +99,19 @@
     }
   }
 
-  updateSandboxUI(true); // default: sandboxed
-
-  sandboxToggleBtn.addEventListener("click", function () {
-    var newVal = !sessionSandboxEnabled;
-    sendRpc("sessions.patch", { key: activeSessionKey, sandbox_enabled: newVal }).then(function (res) {
-      if (res && res.result) {
-        updateSandboxUI(res.result.sandbox_enabled);
-      } else {
-        updateSandboxUI(newVal);
-      }
+  function bindSandboxToggleEvents() {
+    if (!sandboxToggleBtn) return;
+    sandboxToggleBtn.addEventListener("click", function () {
+      var newVal = !sessionSandboxEnabled;
+      sendRpc("sessions.patch", { key: activeSessionKey, sandbox_enabled: newVal }).then(function (res) {
+        if (res && res.result) {
+          updateSandboxUI(res.result.sandbox_enabled);
+        } else {
+          updateSandboxUI(newVal);
+        }
+      });
     });
-  });
+  }
   var sessionsPanel = $("sessionsPanel");
   var sessionList = $("sessionList");
   var newSessionBtn = $("newSessionBtn");
@@ -1276,7 +1278,7 @@
           }
         }
         // Restore sandbox state
-        updateSandboxUI(entry.sandbox_enabled);
+        updateSandboxUI(entry.sandbox_enabled !== false);
         var history = res.payload.history || [];
         var msgEls = [];
         sessionTokens = { input: 0, output: 0 };
@@ -1458,6 +1460,10 @@
             '<div id="modelDropdownList" class="model-dropdown-list"></div>' +
           '</div>' +
         '</div>' +
+        '<button id="sandboxToggle" class="sandbox-toggle text-xs border border-[var(--border)] px-2 py-1 rounded-md transition-colors cursor-pointer bg-transparent font-[var(--font-body)]" title="Toggle sandbox mode">' +
+          '<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" width="14" height="14" style="display:inline-block;vertical-align:middle;margin-right:2px"><path d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"/></svg>' +
+          '<span id="sandboxLabel">sandboxed</span>' +
+        '</button>' +
       '</div>' +
       '<div class="flex-1 overflow-y-auto p-4 flex flex-col gap-2" id="messages"></div>' +
       '<div id="tokenBar" class="token-bar"></div>' +
@@ -1483,6 +1489,12 @@
     modelSearchInput = $("modelSearchInput");
     modelDropdownList = $("modelDropdownList");
     bindModelComboEvents();
+
+    // Bind sandbox toggle elements (now inside chat page)
+    sandboxToggleBtn = $("sandboxToggle");
+    sandboxLabel = $("sandboxLabel");
+    bindSandboxToggleEvents();
+    updateSandboxUI(true); // default: sandboxed until session loads
 
     // Update model selector label if models are already loaded
     if (models.length > 0 && modelComboLabel) {
@@ -1545,6 +1557,8 @@
     modelDropdown = null;
     modelSearchInput = null;
     modelDropdownList = null;
+    sandboxToggleBtn = null;
+    sandboxLabel = null;
   });
 
   // ════════════════════════════════════════════════════════════
