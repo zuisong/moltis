@@ -82,6 +82,7 @@ const WRITE_METHODS: &[&str] = &[
     "chat.abort",
     "browser.request",
     "providers.save_key",
+    "providers.remove_key",
     "providers.oauth.start",
     "sessions.switch",
     "projects.upsert",
@@ -1730,6 +1731,19 @@ impl MethodRegistry {
                         .services
                         .provider_setup
                         .oauth_status(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
+            "providers.remove_key",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .provider_setup
+                        .remove_key(ctx.params.clone())
                         .await
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
                 })

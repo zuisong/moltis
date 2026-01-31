@@ -49,6 +49,22 @@ impl KeyStore {
         self.load_all().get(provider).cloned()
     }
 
+    fn remove(&self, provider: &str) -> Result<(), String> {
+        let mut map = self.load_all();
+        map.remove(provider);
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let data = serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?;
+        std::fs::write(&self.path, &data).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
     fn save(&self, provider: &str, api_key: &str) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -427,6 +443,45 @@ impl ProviderSetupService for LiveProviderSetupService {
         }))
     }
 
+    async fn remove_key(&self, params: Value) -> ServiceResult {
+        let provider_name = params
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing 'provider' parameter".to_string())?;
+
+        let known = KNOWN_PROVIDERS
+            .iter()
+            .find(|p| p.name == provider_name)
+            .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
+
+        // Remove persisted API key
+        if known.auth_type == "api-key" {
+            self.key_store.remove(provider_name)?;
+            // Unset the environment variable so the registry rebuild no longer finds it.
+            if let Some(env_key) = known.env_key {
+                unsafe { std::env::remove_var(env_key) };
+            }
+        }
+
+        // Remove OAuth tokens
+        if known.auth_type == "oauth" {
+            let _ = self.token_store.delete(provider_name);
+        }
+
+        // Rebuild the provider registry without the removed provider.
+        let effective = self.effective_config();
+        let new_registry = ProviderRegistry::from_env_with_config(&effective);
+        let mut reg = self.registry.write().await;
+        *reg = new_registry;
+
+        info!(
+            provider = provider_name,
+            "removed provider credentials and rebuilt registry"
+        );
+
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
     async fn oauth_status(&self, params: Value) -> ServiceResult {
         let provider_name = params
             .get("provider")
@@ -507,6 +562,42 @@ mod tests {
         assert_eq!(store.load("anthropic").unwrap(), "sk-new");
         let all = store.load_all();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn key_store_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::with_path(dir.path().join("keys.json"));
+        store.save("anthropic", "sk-test").unwrap();
+        store.save("openai", "sk-openai").unwrap();
+        assert!(store.load("anthropic").is_some());
+        store.remove("anthropic").unwrap();
+        assert!(store.load("anthropic").is_none());
+        // Other keys unaffected
+        assert_eq!(store.load("openai").unwrap(), "sk-openai");
+        // Removing non-existent key is fine
+        store.remove("nonexistent").unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_key_rejects_unknown_provider() {
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default());
+        let result = svc
+            .remove_key(serde_json::json!({"provider": "nonexistent"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_key_rejects_missing_params() {
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default());
+        assert!(svc.remove_key(serde_json::json!({})).await.is_err());
     }
 
     #[test]

@@ -22,7 +22,13 @@ use moltis_agents::providers::ProviderRegistry;
 
 use moltis_tools::approval::ApprovalManager;
 
-use moltis_sessions::{metadata::SessionMetadata, store::SessionStore};
+use {
+    moltis_projects::ProjectStore,
+    moltis_sessions::{
+        metadata::{SessionMetadata, SqliteSessionMetadata},
+        store::SessionStore,
+    },
+};
 
 use crate::{
     approval::{GatewayApprovalBroadcaster, LiveExecApprovalService},
@@ -107,20 +113,77 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         services = services.with_model(Arc::new(LiveModelService::new(Arc::clone(&registry))));
     }
 
-    // Initialize session storage.
-    let sessions_dir = directories::ProjectDirs::from("", "", "moltis")
-        .map(|d| d.data_dir().join("sessions"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".moltis/sessions"));
-    let session_store = Arc::new(SessionStore::new(sessions_dir.clone()));
-    let metadata_path = sessions_dir.join("metadata.json");
-    let session_metadata = Arc::new(tokio::sync::RwLock::new(
-        SessionMetadata::load(metadata_path).unwrap_or_else(|e| {
-            tracing::warn!("failed to load session metadata: {e}, starting fresh");
-            // Create empty metadata — load won't fail on a non-existent file,
-            // so this error means the file was corrupt. Start fresh.
-            SessionMetadata::load(sessions_dir.join("metadata_fallback.json")).unwrap()
-        }),
-    ));
+    // Initialize data directory and SQLite database.
+    let data_dir = directories::ProjectDirs::from("", "", "moltis")
+        .map(|d| d.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(".moltis"));
+    std::fs::create_dir_all(&data_dir).ok();
+    let db_path = data_dir.join("moltis.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+    let db_pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .expect("failed to open moltis.db");
+
+    // Create tables.
+    moltis_projects::SqliteProjectStore::init(&db_pool)
+        .await
+        .expect("failed to init projects table");
+    SqliteSessionMetadata::init(&db_pool)
+        .await
+        .expect("failed to init sessions table");
+
+    // Migrate from projects.toml if it exists.
+    let config_dir = directories::ProjectDirs::from("", "", "moltis")
+        .map(|d| d.config_dir().to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from(".moltis"));
+    let projects_toml_path = config_dir.join("projects.toml");
+    if projects_toml_path.exists() {
+        info!("migrating projects.toml to SQLite");
+        let old_store = moltis_projects::TomlProjectStore::new(projects_toml_path.clone());
+        let sqlite_store = moltis_projects::SqliteProjectStore::new(db_pool.clone());
+        if let Ok(projects) =
+            <moltis_projects::TomlProjectStore as moltis_projects::ProjectStore>::list(&old_store)
+                .await
+        {
+            for p in projects {
+                if let Err(e) = sqlite_store.upsert(p).await {
+                    tracing::warn!("failed to migrate project: {e}");
+                }
+            }
+        }
+        let bak = projects_toml_path.with_extension("toml.bak");
+        std::fs::rename(&projects_toml_path, &bak).ok();
+    }
+
+    // Migrate from metadata.json if it exists.
+    let sessions_dir = data_dir.join("sessions");
+    let metadata_json_path = sessions_dir.join("metadata.json");
+    if metadata_json_path.exists() {
+        info!("migrating metadata.json to SQLite");
+        if let Ok(old_meta) = SessionMetadata::load(metadata_json_path.clone()) {
+            let sqlite_meta = SqliteSessionMetadata::new(db_pool.clone());
+            for entry in old_meta.list() {
+                sqlite_meta.upsert(&entry.key, entry.label.clone()).await;
+                if entry.model.is_some() {
+                    sqlite_meta.set_model(&entry.key, entry.model.clone()).await;
+                }
+                sqlite_meta.touch(&entry.key, entry.message_count).await;
+                if entry.project_id.is_some() {
+                    sqlite_meta
+                        .set_project_id(&entry.key, entry.project_id.clone())
+                        .await;
+                }
+            }
+        }
+        let bak = metadata_json_path.with_extension("json.bak");
+        std::fs::rename(&metadata_json_path, &bak).ok();
+    }
+
+    // Wire stores.
+    let project_store: Arc<dyn moltis_projects::ProjectStore> =
+        Arc::new(moltis_projects::SqliteProjectStore::new(db_pool.clone()));
+    let session_store = Arc::new(SessionStore::new(sessions_dir));
+    let session_metadata = Arc::new(SqliteSessionMetadata::new(db_pool.clone()));
 
     // Wire live session service.
     services.session = Arc::new(LiveSessionService::new(
@@ -129,10 +192,6 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
     ));
 
     // Wire live project service.
-    let projects_path = directories::ProjectDirs::from("", "", "moltis")
-        .map(|d| d.config_dir().join("projects.toml"))
-        .unwrap_or_else(|| std::path::PathBuf::from(".moltis/projects.toml"));
-    let project_store = moltis_projects::TomlProjectStore::new(projects_path);
     services.project = Arc::new(crate::project::LiveProjectService::new(project_store));
 
     // Initialize cron service with file-backed store.
@@ -142,7 +201,7 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
             Err(e) => {
                 tracing::warn!("cron file store unavailable ({e}), using in-memory");
                 Arc::new(moltis_cron::store_memory::InMemoryStore::new())
-            }
+            },
         };
 
     // Deferred reference: populated once GatewayState is ready.
@@ -185,11 +244,8 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         })
     });
 
-    let cron_service = moltis_cron::service::CronService::new(
-        cron_store,
-        on_system_event,
-        on_agent_turn,
-    );
+    let cron_service =
+        moltis_cron::service::CronService::new(cron_store, on_system_event, on_agent_turn);
 
     // Wire cron into gateway services.
     let live_cron = Arc::new(crate::cron::LiveCronService::new(Arc::clone(&cron_service)));

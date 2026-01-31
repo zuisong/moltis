@@ -17,7 +17,7 @@ use moltis_gateway::{
     state::GatewayState,
 };
 
-use moltis_agents::providers::ProviderRegistry;
+use {moltis_agents::providers::ProviderRegistry, sqlx};
 
 /// Spin up a test gateway on an ephemeral port, return the bound address.
 async fn start_test_server() -> SocketAddr {
@@ -234,9 +234,16 @@ async fn gateway_startup_with_llm_wiring_does_not_block() {
     let session_store1 = Arc::new(moltis_sessions::store::SessionStore::new(
         tmp1.path().to_path_buf(),
     ));
-    let session_metadata1 = Arc::new(tokio::sync::RwLock::new(
-        moltis_sessions::metadata::SessionMetadata::load(tmp1.path().join("metadata.json"))
-            .unwrap(),
+    let db_pool1 = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY)")
+        .execute(&db_pool1)
+        .await
+        .unwrap();
+    moltis_sessions::metadata::SqliteSessionMetadata::init(&db_pool1)
+        .await
+        .unwrap();
+    let session_metadata1 = Arc::new(moltis_sessions::metadata::SqliteSessionMetadata::new(
+        db_pool1,
     ));
     if !registry.read().await.is_empty() {
         state
@@ -262,9 +269,16 @@ async fn gateway_startup_with_llm_wiring_does_not_block() {
     let session_store2 = Arc::new(moltis_sessions::store::SessionStore::new(
         tmp2.path().to_path_buf(),
     ));
-    let session_metadata2 = Arc::new(tokio::sync::RwLock::new(
-        moltis_sessions::metadata::SessionMetadata::load(tmp2.path().join("metadata.json"))
-            .unwrap(),
+    let db_pool2 = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+    sqlx::query("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY)")
+        .execute(&db_pool2)
+        .await
+        .unwrap();
+    moltis_sessions::metadata::SqliteSessionMetadata::init(&db_pool2)
+        .await
+        .unwrap();
+    let session_metadata2 = Arc::new(moltis_sessions::metadata::SqliteSessionMetadata::new(
+        db_pool2,
     ));
     state2
         .set_chat(Arc::new(LiveChatService::new(

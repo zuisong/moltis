@@ -12,6 +12,6 @@ pub mod types;
 pub mod worktree;
 
 pub use {
-    store::{ProjectStore, TomlProjectStore},
+    store::{ProjectStore, SqliteProjectStore, TomlProjectStore},
     types::{ContextFile, Project, ProjectContext},
 };

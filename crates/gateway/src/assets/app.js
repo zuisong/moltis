@@ -67,22 +67,21 @@
 
   var dot = $("statusDot");
   var sText = $("statusText");
-  var modelCombo = $("modelCombo");
-  var modelComboBtn = $("modelComboBtn");
-  var modelComboLabel = $("modelComboLabel");
-  var modelDropdown = $("modelDropdown");
-  var modelSearchInput = $("modelSearchInput");
-  var modelDropdownList = $("modelDropdownList");
+  // Model selector elements — created dynamically inside the chat page
+  var modelCombo = null;
+  var modelComboBtn = null;
+  var modelComboLabel = null;
+  var modelDropdown = null;
+  var modelSearchInput = null;
+  var modelDropdownList = null;
   var selectedModelId = localStorage.getItem("moltis-model") || "";
   var modelIdx = -1;
   function setSessionModel(sessionKey, modelId) {
     sendRpc("sessions.patch", { key: sessionKey, model: modelId });
   }
-  var sessionsToggle = $("sessionsToggle");
   var sessionsPanel = $("sessionsPanel");
   var sessionList = $("sessionList");
   var newSessionBtn = $("newSessionBtn");
-  var addProviderBtn = $("addProviderBtn");
 
   function setStatus(state, text) {
     dot.className = "status-dot " + state;
@@ -120,46 +119,49 @@
       if (!res || !res.ok) return;
       models = res.payload || [];
       if (models.length === 0) {
-        modelCombo.classList.add("hidden");
+        if (modelCombo) modelCombo.classList.add("hidden");
         return;
       }
       var saved = localStorage.getItem("moltis-model") || "";
       var found = models.find(function (m) { return m.id === saved; });
       if (found) {
         selectedModelId = found.id;
-        modelComboLabel.textContent = found.displayName || found.id;
+        if (modelComboLabel) modelComboLabel.textContent = found.displayName || found.id;
       } else {
         selectedModelId = models[0].id;
-        modelComboLabel.textContent = models[0].displayName || models[0].id;
+        if (modelComboLabel) modelComboLabel.textContent = models[0].displayName || models[0].id;
         localStorage.setItem("moltis-model", selectedModelId);
       }
-      modelCombo.classList.remove("hidden");
+      if (modelCombo) modelCombo.classList.remove("hidden");
     });
   }
 
   function selectModel(m) {
     selectedModelId = m.id;
-    modelComboLabel.textContent = m.displayName || m.id;
+    if (modelComboLabel) modelComboLabel.textContent = m.displayName || m.id;
     localStorage.setItem("moltis-model", m.id);
     setSessionModel(activeSessionKey, m.id);
     closeModelDropdown();
   }
 
   function openModelDropdown() {
+    if (!modelDropdown) return;
     modelDropdown.classList.remove("hidden");
     modelSearchInput.value = "";
     modelIdx = -1;
     renderModelList("");
-    requestAnimationFrame(function () { modelSearchInput.focus(); });
+    requestAnimationFrame(function () { if (modelSearchInput) modelSearchInput.focus(); });
   }
 
   function closeModelDropdown() {
+    if (!modelDropdown) return;
     modelDropdown.classList.add("hidden");
-    modelSearchInput.value = "";
+    if (modelSearchInput) modelSearchInput.value = "";
     modelIdx = -1;
   }
 
   function renderModelList(query) {
+    if (!modelDropdownList) return;
     modelDropdownList.textContent = "";
     var q = query.toLowerCase();
     var filtered = models.filter(function (m) {
@@ -194,6 +196,7 @@
   }
 
   function updateModelActive() {
+    if (!modelDropdownList) return;
     var items = modelDropdownList.querySelectorAll(".model-dropdown-item");
     items.forEach(function (el, i) {
       el.classList.toggle("kb-active", i === modelIdx);
@@ -203,44 +206,50 @@
     }
   }
 
-  modelComboBtn.addEventListener("click", function () {
-    if (modelDropdown.classList.contains("hidden")) {
-      openModelDropdown();
-    } else {
-      closeModelDropdown();
-    }
-  });
+  // Model combo event listeners are set up dynamically inside initChat
+  // when the model selector is created in the chat page.
+  function bindModelComboEvents() {
+    if (!modelComboBtn || !modelSearchInput || !modelDropdownList || !modelCombo) return;
 
-  modelSearchInput.addEventListener("input", function () {
-    modelIdx = -1;
-    renderModelList(modelSearchInput.value.trim());
-  });
-
-  modelSearchInput.addEventListener("keydown", function (e) {
-    var items = modelDropdownList.querySelectorAll(".model-dropdown-item");
-    if (e.key === "ArrowDown") {
-      e.preventDefault();
-      modelIdx = Math.min(modelIdx + 1, items.length - 1);
-      updateModelActive();
-    } else if (e.key === "ArrowUp") {
-      e.preventDefault();
-      modelIdx = Math.max(modelIdx - 1, 0);
-      updateModelActive();
-    } else if (e.key === "Enter") {
-      e.preventDefault();
-      if (modelIdx >= 0 && items[modelIdx]) {
-        items[modelIdx].click();
-      } else if (items.length === 1) {
-        items[0].click();
+    modelComboBtn.addEventListener("click", function () {
+      if (modelDropdown.classList.contains("hidden")) {
+        openModelDropdown();
+      } else {
+        closeModelDropdown();
       }
-    } else if (e.key === "Escape") {
-      closeModelDropdown();
-      modelComboBtn.focus();
-    }
-  });
+    });
+
+    modelSearchInput.addEventListener("input", function () {
+      modelIdx = -1;
+      renderModelList(modelSearchInput.value.trim());
+    });
+
+    modelSearchInput.addEventListener("keydown", function (e) {
+      var items = modelDropdownList.querySelectorAll(".model-dropdown-item");
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        modelIdx = Math.min(modelIdx + 1, items.length - 1);
+        updateModelActive();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        modelIdx = Math.max(modelIdx - 1, 0);
+        updateModelActive();
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        if (modelIdx >= 0 && items[modelIdx]) {
+          items[modelIdx].click();
+        } else if (items.length === 1) {
+          items[0].click();
+        }
+      } else if (e.key === "Escape") {
+        closeModelDropdown();
+        modelComboBtn.focus();
+      }
+    });
+  }
 
   document.addEventListener("click", function (e) {
-    if (!modelCombo.contains(e.target)) {
+    if (modelCombo && !modelCombo.contains(e.target)) {
       closeModelDropdown();
     }
   });
@@ -274,6 +283,13 @@
       a.classList.toggle("active", a.getAttribute("href") === currentPage);
     });
 
+    // Show sessions panel only on the chat page
+    if (currentPage === "/") {
+      sessionsPanel.classList.remove("hidden");
+    } else {
+      sessionsPanel.classList.add("hidden");
+    }
+
     if (page) page.init(pageContent);
   }
 
@@ -294,11 +310,6 @@
     if (!link) return;
     e.preventDefault();
     navigate(link.getAttribute("href"));
-  });
-
-  // ── Sessions sidebar ────────────────────────────────────────
-  sessionsToggle.addEventListener("click", function () {
-    sessionsPanel.classList.toggle("hidden");
   });
 
   function fetchSessions() {
@@ -872,6 +883,7 @@
           status.textContent = provider.displayName + " configured successfully!";
           providerModalBody.appendChild(status);
           fetchModels();
+          if (refreshProvidersPage) refreshProvidersPage();
           setTimeout(closeProviderModal, 1500);
         } else {
           saveBtn.disabled = false;
@@ -974,19 +986,19 @@
           status.textContent = provider.displayName + " connected successfully!";
           providerModalBody.appendChild(status);
           fetchModels();
+          if (refreshProvidersPage) refreshProvidersPage();
           setTimeout(closeProviderModal, 1500);
         }
       });
     }, 2000);
   }
 
-  addProviderBtn.addEventListener("click", function () {
-    if (connected) openProviderModal();
-  });
   providerModalClose.addEventListener("click", closeProviderModal);
   providerModal.addEventListener("click", function (e) {
     if (e.target === providerModal) closeProviderModal();
   });
+
+  var refreshProvidersPage = null;
 
   // ── Error helpers ───────────────────────────────────────────
   function parseErrorMessage(message) {
@@ -1197,9 +1209,7 @@
       if (isTarget) el.classList.remove("unread");
     });
 
-    var switchParams = { key: key };
-    if (activeProjectId) switchParams.project_id = activeProjectId;
-    sendRpc("sessions.switch", switchParams).then(function (res) {
+    sendRpc("sessions.switch", { key: key }).then(function (res) {
       if (res && res.ok && res.payload) {
         var entry = res.payload.entry || {};
         // Restore the session's project binding.
@@ -1207,7 +1217,7 @@
           activeProjectId = entry.projectId;
           localStorage.setItem("moltis-project", activeProjectId);
           projectSelect.value = activeProjectId;
-        } else if (!switchParams.project_id) {
+        } else {
           // Session has no project — clear selection.
           activeProjectId = "";
           localStorage.setItem("moltis-project", "");
@@ -1218,7 +1228,7 @@
           var found = models.find(function (m) { return m.id === entry.model; });
           if (found) {
             selectedModelId = found.id;
-            modelComboLabel.textContent = found.displayName || found.id;
+            if (modelComboLabel) modelComboLabel.textContent = found.displayName || found.id;
             localStorage.setItem("moltis-model", found.id);
           }
         }
@@ -1378,6 +1388,18 @@
   // Safe: static hardcoded HTML template, no user input.
   var chatPageHTML =
     '<div class="flex-1 flex flex-col min-w-0">' +
+      '<div class="px-4 py-1.5 border-b border-[var(--border)] bg-[var(--surface)] flex items-center gap-2 shrink-0">' +
+        '<div id="modelCombo" class="model-combo hidden">' +
+          '<button id="modelComboBtn" class="model-combo-btn" type="button">' +
+            '<span id="modelComboLabel">no models</span>' +
+            '<svg class="model-combo-chevron" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" width="12" height="12"><path d="M19.5 8.25l-7.5 7.5-7.5-7.5"/></svg>' +
+          '</button>' +
+          '<div id="modelDropdown" class="model-dropdown hidden">' +
+            '<input id="modelSearchInput" type="text" placeholder="Search models\u2026" class="model-search-input" autocomplete="off" />' +
+            '<div id="modelDropdownList" class="model-dropdown-list"></div>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
       '<div class="flex-1 overflow-y-auto p-4 flex flex-col gap-2" id="messages"></div>' +
       '<div id="tokenBar" class="token-bar"></div>' +
       '<div class="px-4 py-3 border-t border-[var(--border)] bg-[var(--surface)] flex gap-2 items-end">' +
@@ -1394,7 +1416,30 @@
     chatInput = $("chatInput");
     chatSendBtn = $("sendBtn");
 
-    if (connected) chatSendBtn.disabled = false;
+    // Bind model selector elements (now inside chat page)
+    modelCombo = $("modelCombo");
+    modelComboBtn = $("modelComboBtn");
+    modelComboLabel = $("modelComboLabel");
+    modelDropdown = $("modelDropdown");
+    modelSearchInput = $("modelSearchInput");
+    modelDropdownList = $("modelDropdownList");
+    bindModelComboEvents();
+
+    // Show model selector if models are loaded
+    if (models.length > 0 && modelCombo) {
+      modelCombo.classList.remove("hidden");
+      var found = models.find(function (m) { return m.id === selectedModelId; });
+      if (found && modelComboLabel) {
+        modelComboLabel.textContent = found.displayName || found.id;
+      } else if (models[0] && modelComboLabel) {
+        modelComboLabel.textContent = models[0].displayName || models[0].id;
+      }
+    }
+
+    if (connected) {
+      chatSendBtn.disabled = false;
+      switchSession(activeSessionKey);
+    }
 
     chatInput.addEventListener("input", chatAutoResize);
     chatInput.addEventListener("keydown", function (e) {
@@ -1436,6 +1481,12 @@
     chatSendBtn = null;
     streamEl = null;
     streamText = "";
+    modelCombo = null;
+    modelComboBtn = null;
+    modelComboLabel = null;
+    modelDropdown = null;
+    modelSearchInput = null;
+    modelDropdownList = null;
   });
 
   // ════════════════════════════════════════════════════════════
@@ -2255,6 +2306,109 @@
     renderList();
   });
 
+  // ════════════════════════════════════════════════════════════
+  // Providers page
+  // ════════════════════════════════════════════════════════════
+  // Safe: static hardcoded HTML template, no user input.
+  var providersPageHTML =
+    '<div class="flex-1 flex flex-col min-w-0 p-4 gap-4 overflow-y-auto">' +
+      '<div class="flex items-center gap-3">' +
+        '<h2 class="text-lg font-medium text-[var(--text-strong)]">Providers</h2>' +
+        '<button id="provAddBtn" class="bg-[var(--accent-dim)] text-white border-none px-3 py-1.5 rounded text-xs cursor-pointer hover:bg-[var(--accent)] transition-colors">+ Add Provider</button>' +
+      '</div>' +
+      '<div id="providerPageList"></div>' +
+    '</div>';
+
+  registerPage("/providers", function initProviders(container) {
+    container.innerHTML = providersPageHTML;
+
+    var addBtn = $("provAddBtn");
+    var listEl = $("providerPageList");
+
+    addBtn.addEventListener("click", function () {
+      if (connected) openProviderModal();
+    });
+
+    function renderProviderList() {
+      sendRpc("providers.available", {}).then(function (res) {
+        if (!res || !res.ok) return;
+        var providers = res.payload || [];
+        while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+
+        if (providers.length === 0) {
+          listEl.appendChild(createEl("div", {
+            className: "text-sm text-[var(--muted)]",
+            textContent: "No providers available."
+          }));
+          return;
+        }
+
+        providers.forEach(function (p) {
+          var card = createEl("div", {
+            style: "display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border:1px solid var(--border);border-radius:6px;margin-bottom:6px;" +
+              (p.configured ? "" : "opacity:0.5;")
+          });
+
+          var left = createEl("div", { style: "display:flex;align-items:center;gap:8px;" });
+          left.appendChild(createEl("span", {
+            className: "text-sm text-[var(--text-strong)]",
+            textContent: p.displayName
+          }));
+
+          var badge = createEl("span", {
+            className: "provider-item-badge " + p.authType,
+            textContent: p.authType === "oauth" ? "OAuth" : "API Key"
+          });
+          left.appendChild(badge);
+
+          if (p.configured) {
+            left.appendChild(createEl("span", {
+              className: "provider-item-badge configured",
+              textContent: "configured"
+            }));
+          }
+
+          card.appendChild(left);
+
+          if (p.configured) {
+            var removeBtn = createEl("button", {
+              className: "session-action-btn session-delete",
+              textContent: "Remove",
+              title: "Remove " + p.displayName
+            });
+            removeBtn.addEventListener("click", function () {
+              if (!confirm("Remove credentials for " + p.displayName + "?")) return;
+              sendRpc("providers.remove_key", { provider: p.name }).then(function (res) {
+                if (res && res.ok) {
+                  fetchModels();
+                  renderProviderList();
+                }
+              });
+            });
+            card.appendChild(removeBtn);
+          } else {
+            var connectBtn = createEl("button", {
+              className: "bg-[var(--accent-dim)] text-white border-none px-2.5 py-1 rounded text-xs cursor-pointer hover:bg-[var(--accent)] transition-colors",
+              textContent: "Connect"
+            });
+            connectBtn.addEventListener("click", function () {
+              if (p.authType === "api-key") showApiKeyForm(p);
+              else if (p.authType === "oauth") showOAuthFlow(p);
+            });
+            card.appendChild(connectBtn);
+          }
+
+          listEl.appendChild(card);
+        });
+      });
+    }
+
+    refreshProvidersPage = renderProviderList;
+    renderProviderList();
+  }, function teardownProviders() {
+    refreshProvidersPage = null;
+  });
+
   // ── WebSocket ─────────────────────────────────────────────
   function connect() {
     setStatus("connecting", "connecting...");
@@ -2282,7 +2436,8 @@
           fetchModels();
           fetchSessions();
           fetchProjects();
-          if (currentPage === "/") switchSession(activeSessionKey);
+          // Re-mount the current page so it can fetch data now that we're connected
+          mount(currentPage);
         } else {
           setStatus("", "handshake failed");
           var reason = (frame.error && frame.error.message) || "unknown error";

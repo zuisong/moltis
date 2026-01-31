@@ -1,19 +1,19 @@
 use std::sync::Arc;
 
-use {async_trait::async_trait, serde_json::Value, tokio::sync::RwLock};
+use {async_trait::async_trait, serde_json::Value};
 
-use moltis_sessions::{metadata::SessionMetadata, store::SessionStore};
+use moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore};
 
 use crate::services::{ServiceResult, SessionService};
 
-/// Live session service backed by JSONL store + metadata index.
+/// Live session service backed by JSONL store + SQLite metadata.
 pub struct LiveSessionService {
     store: Arc<SessionStore>,
-    metadata: Arc<RwLock<SessionMetadata>>,
+    metadata: Arc<SqliteSessionMetadata>,
 }
 
 impl LiveSessionService {
-    pub fn new(store: Arc<SessionStore>, metadata: Arc<RwLock<SessionMetadata>>) -> Self {
+    pub fn new(store: Arc<SessionStore>, metadata: Arc<SqliteSessionMetadata>) -> Self {
         Self { store, metadata }
     }
 }
@@ -21,9 +21,10 @@ impl LiveSessionService {
 #[async_trait]
 impl SessionService for LiveSessionService {
     async fn list(&self) -> ServiceResult {
-        let meta = self.metadata.read().await;
-        let entries: Vec<Value> = meta
+        let entries: Vec<Value> = self
+            .metadata
             .list()
+            .await
             .into_iter()
             .map(|e| {
                 serde_json::json!({
@@ -61,13 +62,7 @@ impl SessionService for LiveSessionService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'key' parameter".to_string())?;
 
-        // Auto-create the session entry if it doesn't exist.
-        let entry = {
-            let mut meta = self.metadata.write().await;
-            let entry = meta.upsert(key, None).clone();
-            let _ = meta.save();
-            entry
-        };
+        let entry = self.metadata.upsert(key, None).await;
         let history = self.store.read(key).await.map_err(|e| e.to_string())?;
 
         Ok(serde_json::json!({
@@ -100,28 +95,25 @@ impl SessionService for LiveSessionService {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let mut meta = self.metadata.write().await;
-        if meta.get(key).is_none() {
+        if self.metadata.get(key).await.is_none() {
             return Err(format!("session '{key}' not found"));
         }
         if label.is_some() {
-            meta.upsert(key, label);
+            self.metadata.upsert(key, label).await;
         }
         if model.is_some() {
-            meta.set_model(key, model);
+            self.metadata.set_model(key, model).await;
         }
-        // Update project_id if provided (explicit null clears it).
         if params.get("project_id").is_some() {
             let project_id = params
                 .get("project_id")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
-            meta.set_project_id(key, project_id);
+            self.metadata.set_project_id(key, project_id).await;
         }
-        meta.save().map_err(|e| e.to_string())?;
 
-        let entry = meta.get(key).unwrap();
+        let entry = self.metadata.get(key).await.unwrap();
         Ok(serde_json::json!({
             "id": entry.id,
             "key": entry.key,
@@ -137,10 +129,7 @@ impl SessionService for LiveSessionService {
             .ok_or_else(|| "missing 'key' parameter".to_string())?;
 
         self.store.clear(key).await.map_err(|e| e.to_string())?;
-
-        let mut meta = self.metadata.write().await;
-        meta.touch(key, 0);
-        meta.save().map_err(|e| e.to_string())?;
+        self.metadata.touch(key, 0).await;
 
         Ok(serde_json::json!({}))
     }
@@ -156,16 +145,12 @@ impl SessionService for LiveSessionService {
         }
 
         self.store.clear(key).await.map_err(|e| e.to_string())?;
-
-        let mut meta = self.metadata.write().await;
-        meta.remove(key);
-        meta.save().map_err(|e| e.to_string())?;
+        self.metadata.remove(key).await;
 
         Ok(serde_json::json!({}))
     }
 
     async fn compact(&self, _params: Value) -> ServiceResult {
-        // Stub — compaction not yet implemented.
         Ok(serde_json::json!({}))
     }
 
@@ -188,20 +173,24 @@ impl SessionService for LiveSessionService {
             .await
             .map_err(|e| e.to_string())?;
 
-        let meta = self.metadata.read().await;
-        let enriched: Vec<Value> = results
-            .into_iter()
-            .map(|r| {
-                let label = meta.get(&r.session_key).and_then(|e| e.label.clone());
-                serde_json::json!({
+        let enriched: Vec<Value> = {
+            let mut out = Vec::with_capacity(results.len());
+            for r in results {
+                let label = self
+                    .metadata
+                    .get(&r.session_key)
+                    .await
+                    .and_then(|e| e.label);
+                out.push(serde_json::json!({
                     "sessionKey": r.session_key,
                     "snippet": r.snippet,
                     "role": r.role,
                     "messageIndex": r.message_index,
                     "label": label,
-                })
-            })
-            .collect();
+                }));
+            }
+            out
+        };
 
         Ok(serde_json::json!(enriched))
     }

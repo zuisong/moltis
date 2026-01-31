@@ -131,6 +131,161 @@ impl SessionMetadata {
     }
 }
 
+// ── SQLite-backed session metadata ──────────────────────────────────
+
+/// SQLite-backed session metadata store.
+pub struct SqliteSessionMetadata {
+    pool: sqlx::SqlitePool,
+}
+
+#[derive(sqlx::FromRow)]
+struct SessionRow {
+    key: String,
+    id: String,
+    label: Option<String>,
+    model: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    message_count: i32,
+    project_id: Option<String>,
+    archived: i32,
+    worktree_branch: Option<String>,
+}
+
+impl From<SessionRow> for SessionEntry {
+    fn from(r: SessionRow) -> Self {
+        Self {
+            key: r.key,
+            id: r.id,
+            label: r.label,
+            model: r.model,
+            created_at: r.created_at as u64,
+            updated_at: r.updated_at as u64,
+            message_count: r.message_count as u32,
+            project_id: r.project_id,
+            archived: r.archived != 0,
+            worktree_branch: r.worktree_branch,
+        }
+    }
+}
+
+impl SqliteSessionMetadata {
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Create the `sessions` table if it doesn't exist.
+    pub async fn init(pool: &sqlx::SqlitePool) -> Result<()> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS sessions (
+                key             TEXT PRIMARY KEY,
+                id              TEXT NOT NULL,
+                label           TEXT,
+                model           TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                message_count   INTEGER NOT NULL DEFAULT 0,
+                project_id      TEXT REFERENCES projects(id) ON DELETE SET NULL,
+                archived        INTEGER NOT NULL DEFAULT 0,
+                worktree_branch TEXT
+            )"#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get(&self, key: &str) -> Option<SessionEntry> {
+        sqlx::query_as::<_, SessionRow>("SELECT * FROM sessions WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .map(Into::into)
+    }
+
+    /// Insert or update an entry. Returns the entry.
+    pub async fn upsert(&self, key: &str, label: Option<String>) -> SessionEntry {
+        let now = now_ms() as i64;
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"INSERT INTO sessions (key, id, label, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET
+                 label = COALESCE(excluded.label, sessions.label),
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(key)
+        .bind(&id)
+        .bind(&label)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .ok();
+        self.get(key).await.unwrap()
+    }
+
+    pub async fn set_model(&self, key: &str, model: Option<String>) {
+        let now = now_ms() as i64;
+        sqlx::query("UPDATE sessions SET model = ?, updated_at = ? WHERE key = ?")
+            .bind(&model)
+            .bind(now)
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .ok();
+    }
+
+    pub async fn touch(&self, key: &str, message_count: u32) {
+        let now = now_ms() as i64;
+        sqlx::query("UPDATE sessions SET message_count = ?, updated_at = ? WHERE key = ?")
+            .bind(message_count as i32)
+            .bind(now)
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .ok();
+    }
+
+    pub async fn set_project_id(&self, key: &str, project_id: Option<String>) {
+        let now = now_ms() as i64;
+        sqlx::query("UPDATE sessions SET project_id = ?, updated_at = ? WHERE key = ?")
+            .bind(&project_id)
+            .bind(now)
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .ok();
+    }
+
+    pub async fn remove(&self, key: &str) -> Option<SessionEntry> {
+        let entry = self.get(key).await;
+        sqlx::query("DELETE FROM sessions WHERE key = ?")
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .ok();
+        entry
+    }
+
+    pub async fn list(&self) -> Vec<SessionEntry> {
+        sqlx::query_as::<_, SessionRow>("SELECT * FROM sessions ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// No-op — SQLite auto-persists.
+    pub fn save(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +334,53 @@ mod tests {
         assert!(meta.get("main").is_some());
         meta.remove("main");
         assert!(meta.get("main").is_none());
+    }
+
+    async fn sqlite_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        // sessions table references projects, so create a stub projects table.
+        sqlx::query("CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        SqliteSessionMetadata::init(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_upsert_and_list() {
+        let pool = sqlite_pool().await;
+        let meta = SqliteSessionMetadata::new(pool);
+
+        meta.upsert("main", None).await;
+        meta.upsert("session:abc", Some("My Chat".to_string()))
+            .await;
+
+        let list = meta.list().await;
+        assert_eq!(list.len(), 2);
+        let abc = list.iter().find(|e| e.key == "session:abc").unwrap();
+        assert_eq!(abc.label.as_deref(), Some("My Chat"));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_remove() {
+        let pool = sqlite_pool().await;
+        let meta = SqliteSessionMetadata::new(pool);
+
+        meta.upsert("main", None).await;
+        assert!(meta.get("main").await.is_some());
+        meta.remove("main").await;
+        assert!(meta.get("main").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_touch() {
+        let pool = sqlite_pool().await;
+        let meta = SqliteSessionMetadata::new(pool);
+
+        meta.upsert("main", None).await;
+        meta.touch("main", 5).await;
+        assert_eq!(meta.get("main").await.unwrap().message_count, 5);
     }
 
     #[test]

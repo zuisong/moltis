@@ -165,11 +165,7 @@ mod tests {
     #[test]
     fn test_derive_label_package_json() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"name": "my-app"}"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), r#"{"name": "my-app"}"#).unwrap();
         assert_eq!(derive_label(dir.path()), "my-app");
     }
 

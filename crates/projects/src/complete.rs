@@ -56,11 +56,7 @@ fn list_subdirs(dir: &PathBuf) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
-        .filter(|e| {
-            !e.file_name()
-                .to_string_lossy()
-                .starts_with('.')
-        })
+        .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
         .map(|e| e.path())
         .collect();
     dirs.sort();

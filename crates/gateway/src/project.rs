@@ -1,33 +1,27 @@
 use std::sync::Arc;
 
-use {async_trait::async_trait, serde_json::Value, tokio::sync::RwLock, tracing::warn};
+use {async_trait::async_trait, serde_json::Value, tracing::warn};
 
 use moltis_projects::{
-    ProjectStore, TomlProjectStore,
-    complete::complete_path,
-    context::load_context_files,
-    detect::auto_detect,
+    ProjectStore, complete::complete_path, context::load_context_files, detect::auto_detect,
 };
 
 use crate::services::{ProjectService, ServiceResult};
 
 pub struct LiveProjectService {
-    store: Arc<RwLock<TomlProjectStore>>,
+    store: Arc<dyn ProjectStore>,
 }
 
 impl LiveProjectService {
-    pub fn new(store: TomlProjectStore) -> Self {
-        Self {
-            store: Arc::new(RwLock::new(store)),
-        }
+    pub fn new(store: Arc<dyn ProjectStore>) -> Self {
+        Self { store }
     }
 }
 
 #[async_trait]
 impl ProjectService for LiveProjectService {
     async fn list(&self) -> ServiceResult {
-        let store = self.store.read().await;
-        let projects = store.list().await.map_err(|e| e.to_string())?;
+        let projects = self.store.list().await.map_err(|e| e.to_string())?;
         serde_json::to_value(projects).map_err(|e| e.to_string())
     }
 
@@ -36,16 +30,17 @@ impl ProjectService for LiveProjectService {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'id' parameter".to_string())?;
-        let store = self.store.read().await;
-        let project = store.get(id).await.map_err(|e| e.to_string())?;
+        let project = self.store.get(id).await.map_err(|e| e.to_string())?;
         serde_json::to_value(project).map_err(|e| e.to_string())
     }
 
     async fn upsert(&self, params: Value) -> ServiceResult {
         let project: moltis_projects::Project =
             serde_json::from_value(params).map_err(|e| e.to_string())?;
-        let store = self.store.read().await;
-        store.upsert(project.clone()).await.map_err(|e| e.to_string())?;
+        self.store
+            .upsert(project.clone())
+            .await
+            .map_err(|e| e.to_string())?;
         serde_json::to_value(project).map_err(|e| e.to_string())
     }
 
@@ -54,8 +49,7 @@ impl ProjectService for LiveProjectService {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'id' parameter".to_string())?;
-        let store = self.store.read().await;
-        store.delete(id).await.map_err(|e| e.to_string())?;
+        self.store.delete(id).await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"deleted": id}))
     }
 
@@ -65,17 +59,15 @@ impl ProjectService for LiveProjectService {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
-        let store = self.store.read().await;
-        let existing = store.list().await.map_err(|e| e.to_string())?;
+        let existing = self.store.list().await.map_err(|e| e.to_string())?;
         let known_ids: Vec<String> = existing.iter().map(|p| p.id.clone()).collect();
 
         let dir_refs: Vec<std::path::PathBuf> = dirs.iter().map(std::path::PathBuf::from).collect();
         let dir_slices: Vec<&std::path::Path> = dir_refs.iter().map(|p| p.as_path()).collect();
         let detected = auto_detect(&dir_slices, &known_ids);
 
-        // Persist detected projects
         for p in &detected {
-            if let Err(e) = store.upsert(p.clone()).await {
+            if let Err(e) = self.store.upsert(p.clone()).await {
                 warn!(id = %p.id, error = %e, "failed to persist detected project");
             }
         }
@@ -84,10 +76,7 @@ impl ProjectService for LiveProjectService {
     }
 
     async fn complete_path(&self, params: Value) -> ServiceResult {
-        let partial = params
-            .get("partial")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let partial = params.get("partial").and_then(|v| v.as_str()).unwrap_or("");
         let results: Vec<String> = complete_path(partial)
             .into_iter()
             .map(|p| p.to_string_lossy().to_string())
@@ -100,8 +89,8 @@ impl ProjectService for LiveProjectService {
             .get("id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'id' parameter".to_string())?;
-        let store = self.store.read().await;
-        let project = store
+        let project = self
+            .store
             .get(id)
             .await
             .map_err(|e| e.to_string())?

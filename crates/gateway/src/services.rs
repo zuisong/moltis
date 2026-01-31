@@ -518,6 +518,7 @@ pub trait ProviderSetupService: Send + Sync {
     async fn save_key(&self, params: Value) -> ServiceResult;
     async fn oauth_start(&self, params: Value) -> ServiceResult;
     async fn oauth_status(&self, params: Value) -> ServiceResult;
+    async fn remove_key(&self, params: Value) -> ServiceResult;
 }
 
 pub struct NoopProviderSetupService;
@@ -537,6 +538,10 @@ impl ProviderSetupService for NoopProviderSetupService {
     }
 
     async fn oauth_status(&self, _p: Value) -> ServiceResult {
+        Err("provider setup not configured".into())
+    }
+
+    async fn remove_key(&self, _p: Value) -> ServiceResult {
         Err("provider setup not configured".into())
     }
 }

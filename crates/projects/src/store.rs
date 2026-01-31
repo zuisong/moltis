@@ -91,6 +91,123 @@ impl ProjectStore for TomlProjectStore {
     }
 }
 
+// ── SQLite-backed implementation ────────────────────────────────────
+
+/// Stores projects in a SQLite database.
+pub struct SqliteProjectStore {
+    pool: sqlx::SqlitePool,
+}
+
+impl SqliteProjectStore {
+    pub fn new(pool: sqlx::SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Create the `projects` table if it doesn't exist.
+    pub async fn init(pool: &sqlx::SqlitePool) -> Result<()> {
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS projects (
+                id            TEXT PRIMARY KEY,
+                label         TEXT NOT NULL,
+                directory     TEXT NOT NULL,
+                system_prompt TEXT,
+                auto_worktree INTEGER NOT NULL DEFAULT 0,
+                setup_command TEXT,
+                detected      INTEGER NOT NULL DEFAULT 0,
+                created_at    INTEGER NOT NULL,
+                updated_at    INTEGER NOT NULL
+            )"#,
+        )
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProjectStore for SqliteProjectStore {
+    async fn list(&self) -> Result<Vec<Project>> {
+        let rows =
+            sqlx::query_as::<_, ProjectRow>("SELECT * FROM projects ORDER BY updated_at DESC")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn get(&self, id: &str) -> Result<Option<Project>> {
+        let row = sqlx::query_as::<_, ProjectRow>("SELECT * FROM projects WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn upsert(&self, project: Project) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO projects (id, label, directory, system_prompt, auto_worktree, setup_command, detected, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 label = excluded.label,
+                 directory = excluded.directory,
+                 system_prompt = excluded.system_prompt,
+                 auto_worktree = excluded.auto_worktree,
+                 setup_command = excluded.setup_command,
+                 detected = excluded.detected,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(&project.id)
+        .bind(&project.label)
+        .bind(project.directory.to_string_lossy().as_ref())
+        .bind(&project.system_prompt)
+        .bind(project.auto_worktree as i32)
+        .bind(&project.setup_command)
+        .bind(project.detected as i32)
+        .bind(project.created_at as i64)
+        .bind(project.updated_at as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM projects WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+/// Internal row type for sqlx mapping.
+#[derive(sqlx::FromRow)]
+struct ProjectRow {
+    id: String,
+    label: String,
+    directory: String,
+    system_prompt: Option<String>,
+    auto_worktree: i32,
+    setup_command: Option<String>,
+    detected: i32,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl From<ProjectRow> for Project {
+    fn from(r: ProjectRow) -> Self {
+        Self {
+            id: r.id,
+            label: r.label,
+            directory: PathBuf::from(r.directory),
+            system_prompt: r.system_prompt,
+            auto_worktree: r.auto_worktree != 0,
+            setup_command: r.setup_command,
+            detected: r.detected != 0,
+            created_at: r.created_at as u64,
+            updated_at: r.updated_at as u64,
+        }
+    }
+}
+
 /// Create a new project with auto-derived fields.
 pub fn new_project(id: String, label: String, directory: PathBuf) -> Project {
     let now = now_ms();
@@ -137,6 +254,36 @@ mod tests {
         assert_eq!(store.get("test").await.unwrap().unwrap().label, "Updated");
 
         // Delete
+        store.delete("test").await.unwrap();
+        assert!(store.list().await.unwrap().is_empty());
+    }
+
+    async fn sqlite_pool() -> sqlx::SqlitePool {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        SqliteProjectStore::init(&pool).await.unwrap();
+        pool
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_store_crud() {
+        let pool = sqlite_pool().await;
+        let store = SqliteProjectStore::new(pool);
+
+        assert!(store.list().await.unwrap().is_empty());
+
+        let p = new_project("test".into(), "Test".into(), "/tmp/test".into());
+        store.upsert(p).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 1);
+
+        let found = store.get("test").await.unwrap().unwrap();
+        assert_eq!(found.label, "Test");
+
+        let mut updated = found;
+        updated.label = "Updated".into();
+        store.upsert(updated).await.unwrap();
+        assert_eq!(store.list().await.unwrap().len(), 1);
+        assert_eq!(store.get("test").await.unwrap().unwrap().label, "Updated");
+
         store.delete("test").await.unwrap();
         assert!(store.list().await.unwrap().is_empty());
     }

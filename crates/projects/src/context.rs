@@ -3,8 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::Result;
-use tracing::debug;
+use {anyhow::Result, tracing::debug};
 
 use crate::types::ContextFile;
 

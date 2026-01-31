@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use tokio::process::Command;
-use tracing::{debug, warn};
+use {
+    anyhow::{Context, Result, bail},
+    tokio::process::Command,
+    tracing::{debug, warn},
+};
 
 const WORKTREE_DIR: &str = ".moltis-worktrees";
 
@@ -121,14 +123,14 @@ impl WorktreeManager {
             match output {
                 Ok(o) if o.status.success() => {
                     debug!(branch = %branch, "deleted local branch");
-                }
+                },
                 Ok(o) => {
                     let stderr = String::from_utf8_lossy(&o.stderr);
                     debug!(branch = %branch, stderr = %stderr, "branch delete skipped");
-                }
+                },
                 Err(e) => {
                     warn!(branch = %branch, error = %e, "failed to delete branch");
-                }
+                },
             }
         }
 
