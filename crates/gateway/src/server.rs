@@ -128,7 +128,69 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         Arc::clone(&session_metadata),
     ));
 
+    // Initialize cron service with file-backed store.
+    let cron_store: Arc<dyn moltis_cron::store::CronStore> =
+        match moltis_cron::store_file::FileStore::default_path() {
+            Ok(fs) => Arc::new(fs),
+            Err(e) => {
+                tracing::warn!("cron file store unavailable ({e}), using in-memory");
+                Arc::new(moltis_cron::store_memory::InMemoryStore::new())
+            }
+        };
+
+    // Deferred reference: populated once GatewayState is ready.
+    let deferred_state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>> =
+        Arc::new(tokio::sync::OnceCell::new());
+
+    // System event: inject text into the main session and trigger an agent response.
+    let sys_state = Arc::clone(&deferred_state);
+    let on_system_event: moltis_cron::service::SystemEventFn = Arc::new(move |text| {
+        let st = Arc::clone(&sys_state);
+        tokio::spawn(async move {
+            if let Some(state) = st.get() {
+                let chat = state.chat().await;
+                let params = serde_json::json!({ "text": text });
+                if let Err(e) = chat.send(params).await {
+                    tracing::error!("cron system event failed: {e}");
+                }
+            }
+        });
+    });
+
+    // Agent turn: run an isolated LLM turn (no session history) and return the output.
+    let agent_state = Arc::clone(&deferred_state);
+    let on_agent_turn: moltis_cron::service::AgentTurnFn = Arc::new(move |req| {
+        let st = Arc::clone(&agent_state);
+        Box::pin(async move {
+            let state = st
+                .get()
+                .ok_or_else(|| anyhow::anyhow!("gateway not ready"))?;
+            let chat = state.chat().await;
+            // Send into an isolated session keyed by a unique id so it doesn't
+            // pollute the main conversation.
+            let session_key = format!("cron:{}", uuid::Uuid::new_v4());
+            let params = serde_json::json!({
+                "text": req.message,
+                "_session_key": session_key,
+            });
+            chat.send(params).await.map_err(|e| anyhow::anyhow!(e))?;
+            Ok("agent turn dispatched".into())
+        })
+    });
+
+    let cron_service = moltis_cron::service::CronService::new(
+        cron_store,
+        on_system_event,
+        on_agent_turn,
+    );
+
+    // Wire cron into gateway services.
+    let live_cron = Arc::new(crate::cron::LiveCronService::new(Arc::clone(&cron_service)));
+    services = services.with_cron(live_cron);
+
     let state = GatewayState::new(resolved_auth, services, Arc::clone(&approval_manager));
+    // Populate the deferred reference so cron callbacks can reach the gateway.
+    let _ = deferred_state.set(Arc::clone(&state));
 
     // Wire live chat service (needs state reference, so done after state creation).
     if !registry.read().await.is_empty() {
@@ -136,8 +198,11 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
         let exec_tool = moltis_tools::exec::ExecTool::default()
             .with_approval(Arc::clone(&approval_manager), broadcaster);
 
+        let cron_tool = moltis_tools::cron_tool::CronTool::new(Arc::clone(&cron_service));
+
         let mut tool_registry = moltis_agents::tool_registry::ToolRegistry::new();
         tool_registry.register(Box::new(exec_tool));
+        tool_registry.register(Box::new(cron_tool));
         let live_chat = Arc::new(
             LiveChatService::new(
                 Arc::clone(&registry),
@@ -185,6 +250,11 @@ pub async fn start_gateway(bind: &str, port: u16) -> anyhow::Result<()> {
             broadcast_tick(&tick_state).await;
         }
     });
+
+    // Start the cron scheduler (loads persisted jobs, arms the timer).
+    if let Err(e) = cron_service.start().await {
+        tracing::warn!("failed to start cron scheduler: {e}");
+    }
 
     // Run the server with ConnectInfo for remote IP extraction.
     axum::serve(

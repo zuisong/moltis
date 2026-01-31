@@ -8,14 +8,16 @@ use {
     tracing::{debug, info, warn},
 };
 
-use moltis_agents::{
-    model::StreamEvent,
-    prompt::build_system_prompt,
-    providers::ProviderRegistry,
-    runner::{RunnerEvent, run_agent_loop},
-    tool_registry::ToolRegistry,
+use {
+    moltis_agents::{
+        model::StreamEvent,
+        prompt::build_system_prompt,
+        providers::ProviderRegistry,
+        runner::{RunnerEvent, run_agent_loop},
+        tool_registry::ToolRegistry,
+    },
+    moltis_sessions::{metadata::SessionMetadata, store::SessionStore},
 };
-use moltis_sessions::{metadata::SessionMetadata, store::SessionStore};
 
 use crate::{
     broadcast::{BroadcastOpts, broadcast},
@@ -113,7 +115,10 @@ impl ChatService for LiveChatService {
             .ok_or_else(|| "missing 'text' parameter".to_string())?
             .to_string();
 
-        let conn_id = params.get("_conn_id").and_then(|v| v.as_str()).map(String::from);
+        let conn_id = params
+            .get("_conn_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let model_id = params.get("model").and_then(|v| v.as_str());
         // Use streaming-only mode if explicitly requested or if no tools are registered.
         let stream_only = params
@@ -139,8 +144,13 @@ impl ChatService for LiveChatService {
             }
         };
 
-        // Resolve session key and load history.
-        let session_key = self.session_key_for(conn_id.as_deref()).await;
+        // Resolve session key: explicit override (used by cron callbacks) or
+        // connection-scoped lookup.
+        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
+            sk.to_string()
+        } else {
+            self.session_key_for(conn_id.as_deref()).await
+        };
 
         // Persist the user message.
         let user_msg = serde_json::json!({"role": "user", "content": &text});
@@ -227,7 +237,10 @@ impl ChatService for LiveChatService {
             if let Some(response_text) = assistant_text {
                 let assistant_msg =
                     serde_json::json!({"role": "assistant", "content": response_text});
-                if let Err(e) = session_store.append(&session_key_clone, &assistant_msg).await {
+                if let Err(e) = session_store
+                    .append(&session_key_clone, &assistant_msg)
+                    .await
+                {
                     warn!("failed to persist assistant message: {e}");
                 }
                 // Update metadata counts.
@@ -262,7 +275,10 @@ impl ChatService for LiveChatService {
     }
 
     async fn history(&self, params: Value) -> ServiceResult {
-        let conn_id = params.get("_conn_id").and_then(|v| v.as_str()).map(String::from);
+        let conn_id = params
+            .get("_conn_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let session_key = self.session_key_for(conn_id.as_deref()).await;
         let messages = self
             .session_store
