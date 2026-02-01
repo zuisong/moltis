@@ -19,6 +19,7 @@ import "./page-logs.js";
 import "./page-plugins.js";
 import "./page-skills.js";
 import "./page-settings.js";
+import "./page-images.js";
 
 // Import side-effect modules
 import "./session-search.js";
@@ -71,6 +72,7 @@ fetch("/api/bootstrap")
 			renderProjectSelect();
 			renderSessionProjectSelect();
 		}
+		S.setSandboxInfo(boot.sandbox || null);
 	})
 	.catch(() => {
 		/* WS connect will fetch this data anyway */

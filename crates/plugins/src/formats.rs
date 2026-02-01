@@ -167,6 +167,7 @@ impl ClaudeCodeAdapter {
                     requires: SkillRequirements::default(),
                     path: path.parent().unwrap_or(plugin_dir).to_path_buf(),
                     source: Some(SkillSource::Plugin),
+                    dockerfile: None,
                 };
 
                 results.push(PluginSkillEntry {

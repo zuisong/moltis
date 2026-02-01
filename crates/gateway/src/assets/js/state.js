@@ -72,6 +72,9 @@ export function setCachedChannels(v) {
 	sig.cachedChannels.value = v;
 }
 
+// Sandbox
+export var sandboxInfo = null;
+
 // Logs
 export var logsEventHandler = null;
 export var unseenErrors = 0;
@@ -243,4 +246,8 @@ export function setUnseenWarns(v) {
 }
 export function setProjectFilterId(v) {
 	projectFilterId = v;
+}
+export function setSandboxInfo(v) {
+	sandboxInfo = v;
+	sig.sandboxInfo.value = v;
 }

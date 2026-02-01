@@ -90,6 +90,18 @@ pub fn build_gateway_app(state: Arc<GatewayState>, methods: Arc<MethodRegistry>)
             "/api/images/cached/{tag}",
             axum::routing::delete(api_delete_cached_image_handler),
         )
+        .route(
+            "/api/images/build",
+            axum::routing::post(api_build_image_handler),
+        )
+        .route(
+            "/api/images/check-packages",
+            axum::routing::post(api_check_packages_handler),
+        )
+        .route(
+            "/api/images/default",
+            get(api_get_default_image_handler).put(api_set_default_image_handler),
+        )
         .fallback(spa_fallback);
 
     router.layer(cors).with_state(app_state)
@@ -765,6 +777,20 @@ async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoRespon
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let identity = gw.services.agent.identity_get().await.ok();
+    let sandbox = if let Some(ref router) = state.gateway.sandbox_router {
+        let default_image = router.default_image().await;
+        serde_json::json!({
+            "backend": router.backend_name(),
+            "os": std::env::consts::OS,
+            "default_image": default_image,
+        })
+    } else {
+        serde_json::json!({
+            "backend": "none",
+            "os": std::env::consts::OS,
+            "default_image": moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE,
+        })
+    };
     Json(serde_json::json!({
         "channels": channels.ok(),
         "sessions": sessions.ok(),
@@ -772,6 +798,7 @@ async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoRespon
         "projects": projects.ok(),
         "onboarded": onboarded,
         "identity": identity,
+        "sandbox": sandbox,
     }))
 }
 
@@ -985,6 +1012,199 @@ async fn api_prune_cached_images_handler() -> impl IntoResponse {
         },
     }
 }
+
+/// Check which packages already exist in a base image.
+///
+/// Runs `dpkg -s <pkg>` and `which <pkg>` inside the base image to detect
+/// packages that are already installed. Returns a map of package name to
+/// boolean (true = already present).
+#[cfg(feature = "web-ui")]
+async fn api_check_packages_handler(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let base = body
+        .get("base")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ubuntu:25.10")
+        .trim()
+        .to_string();
+    let packages: Vec<String> = body
+        .get("packages")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if packages.is_empty() {
+        return Json(serde_json::json!({ "found": {} })).into_response();
+    }
+
+    // Build a shell command that checks each package via dpkg -s or which.
+    let checks: Vec<String> = packages
+        .iter()
+        .map(|pkg| {
+            format!(
+                r#"if dpkg -s '{pkg}' >/dev/null 2>&1 || command -v '{pkg}' >/dev/null 2>&1; then echo "FOUND:{pkg}"; fi"#
+            )
+        })
+        .collect();
+    let script = checks.join("\n");
+
+    let output = tokio::process::Command::new("docker")
+        .args(["run", "--rm", "--entrypoint", "sh", &base, "-c", &script])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut found = serde_json::Map::new();
+            for pkg in &packages {
+                let present = stdout.lines().any(|l| l.trim() == format!("FOUND:{pkg}"));
+                found.insert(pkg.clone(), serde_json::Value::Bool(present));
+            }
+            Json(serde_json::json!({ "found": found })).into_response()
+        },
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Get the current default sandbox image.
+#[cfg(feature = "web-ui")]
+async fn api_get_default_image_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let image = if let Some(ref router) = state.gateway.sandbox_router {
+        router.default_image().await
+    } else {
+        moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE.to_string()
+    };
+    Json(serde_json::json!({ "image": image }))
+}
+
+/// Set the default sandbox image.
+#[cfg(feature = "web-ui")]
+async fn api_set_default_image_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let image = body.get("image").and_then(|v| v.as_str()).map(|s| s.trim());
+
+    if let Some(ref router) = state.gateway.sandbox_router {
+        let value = image.filter(|s| !s.is_empty()).map(String::from);
+        router.set_global_image(value.clone()).await;
+        let effective = router.default_image().await;
+        Json(serde_json::json!({ "image": effective })).into_response()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "no sandbox backend available" })),
+        )
+            .into_response()
+    }
+}
+
+/// Build a custom image from a base + apt packages.
+#[cfg(feature = "web-ui")]
+async fn api_build_image_handler(
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let base = body
+        .get("base")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ubuntu:25.10")
+        .trim();
+    let packages: Vec<&str> = body
+        .get("packages")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "name is required" })),
+        )
+            .into_response();
+    }
+    if packages.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "packages list is empty" })),
+        )
+            .into_response();
+    }
+
+    // Validate name: only allow alphanumeric, dash, underscore
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "name must be alphanumeric, dash, or underscore" })),
+        )
+            .into_response();
+    }
+
+    let pkg_list = packages.join(" ");
+    let dockerfile_contents = format!(
+        "FROM {base}\nRUN apt-get update && apt-get install -y {pkg_list} && rm -rf /var/lib/apt/lists/*\n"
+    );
+
+    let tmp_dir = std::env::temp_dir().join(format!("moltis-build-{}", uuid::Uuid::new_v4()));
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    let dockerfile_path = tmp_dir.join("Dockerfile");
+    if let Err(e) = std::fs::write(&dockerfile_path, &dockerfile_contents) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
+
+    let builder = moltis_tools::image_cache::DockerImageBuilder::new();
+    let result = builder
+        .ensure_image(name, &dockerfile_path, &tmp_dir)
+        .await;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    match result {
+        Ok(tag) => Json(serde_json::json!({ "tag": tag })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 
 #[cfg(feature = "web-ui")]
 static ASSETS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR/src/assets");

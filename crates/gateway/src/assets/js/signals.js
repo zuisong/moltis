@@ -15,3 +15,4 @@ export var selectedModelId = signal("");
 export var cachedChannels = signal(null);
 export var unseenErrors = signal(0);
 export var unseenWarns = signal(0);
+export var sandboxInfo = signal(null);

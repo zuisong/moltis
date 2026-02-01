@@ -644,6 +644,8 @@ pub struct SandboxRouter {
     overrides: RwLock<HashMap<String, bool>>,
     /// Per-session image overrides.
     image_overrides: RwLock<HashMap<String, String>>,
+    /// Runtime override for the global default image (set via API, persisted externally).
+    global_image_override: RwLock<Option<String>>,
 }
 
 impl SandboxRouter {
@@ -656,6 +658,7 @@ impl SandboxRouter {
             backend,
             overrides: RwLock::new(HashMap::new()),
             image_overrides: RwLock::new(HashMap::new()),
+            global_image_override: RwLock::new(None),
         }
     }
 
@@ -666,6 +669,7 @@ impl SandboxRouter {
             backend,
             overrides: RwLock::new(HashMap::new()),
             image_overrides: RwLock::new(HashMap::new()),
+            global_image_override: RwLock::new(None),
         }
     }
 
@@ -755,13 +759,31 @@ impl SandboxRouter {
         self.image_overrides.write().await.remove(session_key);
     }
 
+    /// Set a runtime override for the global default image.
+    /// Pass `None` to revert to the config/hardcoded default.
+    pub async fn set_global_image(&self, image: Option<String>) {
+        *self.global_image_override.write().await = image;
+    }
+
+    /// Get the current effective default image (runtime override > config > hardcoded).
+    pub async fn default_image(&self) -> String {
+        if let Some(ref img) = *self.global_image_override.read().await {
+            return img.clone();
+        }
+        self.config
+            .image
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string())
+    }
+
     /// Resolve the container image for a session.
     ///
     /// Priority (highest to lowest):
     /// 1. `skill_image` — from a skill's Dockerfile cache
     /// 2. Per-session override (`session.sandbox_image`)
-    /// 3. Global config (`config.tools.exec.sandbox.image`)
-    /// 4. Default constant (`DEFAULT_SANDBOX_IMAGE`)
+    /// 3. Runtime global override (`set_global_image`)
+    /// 4. Global config (`config.tools.exec.sandbox.image`)
+    /// 5. Default constant (`DEFAULT_SANDBOX_IMAGE`)
     pub async fn resolve_image(&self, session_key: &str, skill_image: Option<&str>) -> String {
         if let Some(img) = skill_image {
             return img.to_string();
@@ -769,10 +791,7 @@ impl SandboxRouter {
         if let Some(img) = self.image_overrides.read().await.get(session_key) {
             return img.clone();
         }
-        self.config
-            .image
-            .clone()
-            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string())
+        self.default_image().await
     }
 }
 

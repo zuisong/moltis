@@ -139,6 +139,7 @@ fn discover_plugins(install_dir: &Path, skills: &mut Vec<SkillMetadata>) {
                 requires: Default::default(),
                 path: skill_dir,
                 source: Some(SkillSource::Plugin),
+                dockerfile: None,
             });
         }
     }
