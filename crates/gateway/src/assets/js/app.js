@@ -4,7 +4,7 @@ import { onEvent } from "./events.js";
 import { renderSessionProjectSelect } from "./project-combo.js";
 import { renderProjectSelect } from "./projects.js";
 import { mount, navigate, registerPage } from "./router.js";
-import { fetchSessions, renderSessionList } from "./sessions.js";
+import { fetchSessions, refreshActiveSession, renderSessionList } from "./sessions.js";
 import * as S from "./state.js";
 import { initTheme, injectMarkdownStyles } from "./theme.js";
 import { connect } from "./websocket.js";
@@ -33,8 +33,11 @@ registerPage("/", () => {
 
 initTheme();
 injectMarkdownStyles();
-onEvent("session", () => {
+onEvent("session", (payload) => {
 	fetchSessions();
+	if (payload && payload.kind === "patched" && payload.sessionKey === S.activeSessionKey) {
+		refreshActiveSession();
+	}
 });
 
 // Check auth status before mounting the app.

@@ -88,10 +88,7 @@ function populateImageDropdown() {
 				var isCurrent = S.sessionSandboxImage === img.tag;
 				addImageOption(img.tag, isCurrent, `${img.skill_name} (${img.size})`);
 			}
-			if (images.length > 0) {
-				addPruneOption();
-			}
-		})
+			})
 		.catch(() => {});
 }
 
@@ -123,28 +120,6 @@ function addImageOption(tag, isActive, subtitle) {
 	S.sandboxImageDropdown.appendChild(opt);
 }
 
-function addPruneOption() {
-	var sep = document.createElement("div");
-	sep.className = "border-t border-[var(--border)] my-1";
-	S.sandboxImageDropdown.appendChild(sep);
-
-	var opt = document.createElement("div");
-	opt.className = "px-3 py-2 text-xs cursor-pointer hover:bg-[var(--surface2)] transition-colors";
-	opt.style.color = "var(--danger, #ef4444)";
-	opt.textContent = "Prune all cached images";
-	opt.addEventListener("click", (e) => {
-		e.stopPropagation();
-		fetch("/api/images/cached", { method: "DELETE" })
-			.then(() => {
-				if (S.sessionSandboxImage) {
-					selectImage(null);
-				}
-				S.sandboxImageDropdown.classList.add("hidden");
-			})
-			.catch(() => {});
-	});
-	S.sandboxImageDropdown.appendChild(opt);
-}
 
 function selectImage(tag) {
 	var value = tag || "";

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use {
     anyhow::anyhow,
     async_trait::async_trait,
+    moltis_tools::image_cache::ImageBuilder,
     tracing::{debug, error, info, warn},
 };
 
@@ -284,6 +285,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
             "context" => {
                 let params = serde_json::json!({ "_session_key": &session_key });
                 let res = chat.context(params).await.map_err(|e| anyhow!("{e}"))?;
+
                 let session_info = res.get("session").cloned().unwrap_or_default();
                 let msg_count = session_info
                     .get("messageCount")
@@ -297,17 +299,48 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     .get("model")
                     .and_then(|v| v.as_str())
                     .unwrap_or("default");
+
                 let tokens = res.get("tokenUsage").cloned().unwrap_or_default();
-                let estimated = tokens
-                    .get("estimatedTotal")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let total = tokens.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
                 let context_window = tokens
                     .get("contextWindow")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
+
+                // Sandbox section
+                let sandbox = res.get("sandbox").cloned().unwrap_or_default();
+                let sandbox_enabled = sandbox
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let sandbox_line = if sandbox_enabled {
+                    let image = sandbox
+                        .get("image")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default");
+                    format!("**Sandbox:** on · `{image}`")
+                } else {
+                    "**Sandbox:** off".to_string()
+                };
+
+                // Skills/plugins section
+                let skills = res
+                    .get("skills")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                let skills_line = if skills.is_empty() {
+                    "**Plugins:** none".to_string()
+                } else {
+                    let names: Vec<_> = skills
+                        .iter()
+                        .filter_map(|s| s.get("name").and_then(|v| v.as_str()))
+                        .collect();
+                    format!("**Plugins:** {}", names.join(", "))
+                };
+
                 Ok(format!(
-                    "Session: {session_key}\nMessages: {msg_count}\nProvider: {provider}\nModel: {model}\nTokens: ~{estimated}/{context_window}"
+                    "**Session:** `{session_key}`\n**Messages:** {msg_count}\n**Provider:** {provider}\n**Model:** `{model}`\n{sandbox_line}\n{skills_line}\n**Tokens:** ~{total}/{context_window}"
                 ))
             },
             "sessions" => {
@@ -389,9 +422,290 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     Ok(format!("Switched to: {label}"))
                 }
             },
+            "model" => {
+                let models_val = state
+                    .services
+                    .model
+                    .list()
+                    .await
+                    .map_err(|e| anyhow!("{e}"))?;
+                let models = models_val
+                    .as_array()
+                    .ok_or_else(|| anyhow!("bad model list"))?;
+
+                let current_model = {
+                    let entry = session_metadata.get(&session_key).await;
+                    entry.and_then(|e| e.model.clone())
+                };
+
+                if args.is_empty() {
+                    // List unique providers.
+                    let mut providers: Vec<String> = models
+                        .iter()
+                        .filter_map(|m| {
+                            m.get("provider").and_then(|v| v.as_str()).map(String::from)
+                        })
+                        .collect();
+                    providers.dedup();
+
+                    if providers.len() <= 1 {
+                        // Single provider — list models directly.
+                        return Ok(format_model_list(models, current_model.as_deref(), None));
+                    }
+
+                    // Multiple providers — list them for selection.
+                    // Prefix with "providers:" so Telegram handler knows.
+                    let current_provider = current_model.as_deref().and_then(|cm| {
+                        models.iter().find_map(|m| {
+                            let id = m.get("id").and_then(|v| v.as_str())?;
+                            if id == cm {
+                                m.get("provider").and_then(|v| v.as_str()).map(String::from)
+                            } else {
+                                None
+                            }
+                        })
+                    });
+                    let mut lines = vec!["providers:".to_string()];
+                    for (i, p) in providers.iter().enumerate() {
+                        let count = models
+                            .iter()
+                            .filter(|m| m.get("provider").and_then(|v| v.as_str()) == Some(p))
+                            .count();
+                        let marker = if current_provider.as_deref() == Some(p) {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        lines.push(format!("{}. {} ({} models){}", i + 1, p, count, marker));
+                    }
+                    Ok(lines.join("\n"))
+                } else if let Some(provider) = args.strip_prefix("provider:") {
+                    // List models for a specific provider.
+                    Ok(format_model_list(
+                        models,
+                        current_model.as_deref(),
+                        Some(provider),
+                    ))
+                } else {
+                    // Switch mode — arg is a 1-based global index.
+                    let n: usize = args
+                        .parse()
+                        .map_err(|_| anyhow!("usage: /model [number]"))?;
+                    if n == 0 || n > models.len() {
+                        return Err(anyhow!("invalid model number. Use 1–{}.", models.len()));
+                    }
+                    let chosen = &models[n - 1];
+                    let model_id = chosen
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| anyhow!("model has no id"))?;
+                    let display = chosen
+                        .get("displayName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(model_id);
+
+                    state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "model": model_id,
+                        }))
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?;
+
+                    broadcast(
+                        state,
+                        "session",
+                        serde_json::json!({
+                            "kind": "patched",
+                            "sessionKey": &session_key,
+                        }),
+                        BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                    Ok(format!("Model switched to: {display}"))
+                }
+            },
+            "sandbox" => {
+                let is_enabled = if let Some(ref router) = state.sandbox_router {
+                    router.is_sandboxed(&session_key).await
+                } else {
+                    false
+                };
+
+                if args.is_empty() {
+                    // Show current status and image list.
+                    let current_image = {
+                        let entry = session_metadata.get(&session_key).await;
+                        let session_img = entry.and_then(|e| e.sandbox_image.clone());
+                        match session_img {
+                            Some(img) if !img.is_empty() => img,
+                            _ => {
+                                if let Some(ref router) = state.sandbox_router {
+                                    router.default_image().await
+                                } else {
+                                    moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE.to_string()
+                                }
+                            },
+                        }
+                    };
+
+                    let status = if is_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    };
+
+                    // List available images.
+                    let builder = moltis_tools::image_cache::DockerImageBuilder::new();
+                    let cached = builder.list_cached().await.unwrap_or_default();
+
+                    let default_img = moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE.to_string();
+                    let mut images: Vec<(String, Option<String>)> =
+                        vec![(default_img.clone(), None)];
+                    for img in &cached {
+                        images.push((
+                            img.tag.clone(),
+                            Some(format!("{} ({})", img.skill_name, img.size)),
+                        ));
+                    }
+
+                    let mut lines = vec![format!("status:{status}")];
+                    for (i, (tag, subtitle)) in images.iter().enumerate() {
+                        let marker = if *tag == current_image {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        let label = if let Some(sub) = subtitle {
+                            format!("{}. {} — {}{}", i + 1, tag, sub, marker)
+                        } else {
+                            format!("{}. {}{}", i + 1, tag, marker)
+                        };
+                        lines.push(label);
+                    }
+                    Ok(lines.join("\n"))
+                } else if args == "on" || args == "off" {
+                    let new_val = args == "on";
+                    state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "sandbox_enabled": new_val,
+                        }))
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?;
+                    broadcast(
+                        state,
+                        "session",
+                        serde_json::json!({
+                            "kind": "patched",
+                            "sessionKey": &session_key,
+                        }),
+                        BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    let label = if new_val {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    Ok(format!("Sandbox {label}."))
+                } else if let Some(rest) = args.strip_prefix("image ") {
+                    let n: usize = rest
+                        .parse()
+                        .map_err(|_| anyhow!("usage: /sandbox image [number]"))?;
+
+                    let default_img = moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE.to_string();
+                    let builder = moltis_tools::image_cache::DockerImageBuilder::new();
+                    let cached = builder.list_cached().await.unwrap_or_default();
+                    let mut images: Vec<String> = vec![default_img];
+                    for img in &cached {
+                        images.push(img.tag.clone());
+                    }
+
+                    if n == 0 || n > images.len() {
+                        return Err(anyhow!("invalid image number. Use 1–{}.", images.len()));
+                    }
+                    let chosen = &images[n - 1];
+
+                    // If choosing the default image, clear the session override.
+                    let patch_value = if n == 1 {
+                        ""
+                    } else {
+                        chosen.as_str()
+                    };
+                    state
+                        .services
+                        .session
+                        .patch(serde_json::json!({
+                            "key": &session_key,
+                            "sandbox_image": patch_value,
+                        }))
+                        .await
+                        .map_err(|e| anyhow!("{e}"))?;
+
+                    broadcast(
+                        state,
+                        "session",
+                        serde_json::json!({
+                            "kind": "patched",
+                            "sessionKey": &session_key,
+                        }),
+                        BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                    Ok(format!("Image set to: {chosen}"))
+                } else {
+                    Err(anyhow!("usage: /sandbox [on|off|image N]"))
+                }
+            },
             _ => Err(anyhow!("unknown command: /{cmd}")),
         }
     }
+}
+
+/// Format a numbered model list, optionally filtered by provider.
+///
+/// Each line is: `N. DisplayName [provider] *` (where `*` marks the current model).
+/// Uses the global index (across all models) so the switch command works with
+/// the same numbering regardless of filtering.
+fn format_model_list(
+    models: &[serde_json::Value],
+    current_model: Option<&str>,
+    provider_filter: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    for (i, m) in models.iter().enumerate() {
+        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+        let provider = m.get("provider").and_then(|v| v.as_str()).unwrap_or("");
+        let display = m.get("displayName").and_then(|v| v.as_str()).unwrap_or(id);
+        if let Some(filter) = provider_filter
+            && provider != filter
+        {
+            continue;
+        }
+        let marker = if current_model == Some(id) {
+            " *"
+        } else {
+            ""
+        };
+        lines.push(format!("{}. {} [{}]{}", i + 1, display, provider, marker));
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]

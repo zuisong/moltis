@@ -365,7 +365,7 @@ mod tests {
     async fn init_test_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         Command::new("git")
-            .args(["init"])
+            .args(["init", "-b", "main"])
             .current_dir(dir.path())
             .output()
             .await

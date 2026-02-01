@@ -26,6 +26,16 @@ export function fetchSessions() {
 	});
 }
 
+/** Re-fetch the active session entry and restore sandbox/model state. */
+export function refreshActiveSession() {
+	if (!S.activeSessionKey) return;
+	sendRpc("sessions.resolve", { key: S.activeSessionKey }).then((res) => {
+		if (!(res?.ok && res.payload)) return;
+		var entry = res.payload.entry || res.payload;
+		restoreSessionState(entry, entry.projectId);
+	});
+}
+
 function createSessionIcon(s) {
 	var iconWrap = document.createElement("span");
 	iconWrap.className = "session-icon";
@@ -209,13 +219,11 @@ function restoreSessionState(entry, projectId) {
 	S.setActiveProjectId(effectiveProjectId);
 	localStorage.setItem("moltis-project", S.activeProjectId);
 	updateSessionProjectSelect(S.activeProjectId);
-	if (entry.model && S.models.length > 0) {
+	if (entry.model) {
+		S.setSelectedModelId(entry.model);
+		localStorage.setItem("moltis-model", entry.model);
 		var found = S.models.find((m) => m.id === entry.model);
-		if (found) {
-			S.setSelectedModelId(found.id);
-			if (S.modelComboLabel) S.modelComboLabel.textContent = found.displayName || found.id;
-			localStorage.setItem("moltis-model", found.id);
-		}
+		if (S.modelComboLabel) S.modelComboLabel.textContent = found ? found.displayName || found.id : entry.model;
 	}
 	updateSandboxUI(entry.sandbox_enabled !== false);
 	updateSandboxImageUI(entry.sandbox_image || null);

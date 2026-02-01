@@ -312,10 +312,8 @@ impl ChatService for LiveChatService {
 
         // Discover enabled skills/plugins for prompt injection.
         let cwd = std::env::current_dir().unwrap_or_default();
-        let search_paths =
-            moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
-        let discoverer =
-            moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
+        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
+        let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
         let discovered_skills = match discoverer.discover().await {
             Ok(s) => s,
             Err(e) => {
@@ -791,9 +789,7 @@ impl ChatService for LiveChatService {
             let reg = self.providers.read().await;
             let session_model = session_entry.as_ref().and_then(|e| e.model.as_deref());
             if let Some(id) = session_model {
-                reg.get(id)
-                    .map(|p| p.context_window())
-                    .unwrap_or(200_000)
+                reg.get(id).map(|p| p.context_window()).unwrap_or(200_000)
             } else {
                 reg.first().map(|p| p.context_window()).unwrap_or(200_000)
             }
@@ -803,13 +799,18 @@ impl ChatService for LiveChatService {
         let sandbox_info = if let Some(ref router) = self.state.sandbox_router {
             let is_sandboxed = router.is_sandboxed(&session_key).await;
             let config = router.config();
+            let session_image = session_entry.as_ref().and_then(|e| e.sandbox_image.clone());
+            let effective_image = match session_image {
+                Some(img) if !img.is_empty() => img,
+                _ => router.default_image().await,
+            };
             serde_json::json!({
                 "enabled": is_sandboxed,
                 "backend": router.backend_name(),
                 "mode": config.mode,
                 "scope": config.scope,
                 "workspaceMount": config.workspace_mount,
-                "image": config.image,
+                "image": effective_image,
             })
         } else {
             serde_json::json!({
@@ -820,10 +821,8 @@ impl ChatService for LiveChatService {
 
         // Discover enabled skills/plugins
         let cwd = std::env::current_dir().unwrap_or_default();
-        let search_paths =
-            moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
-        let discoverer =
-            moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
+        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths(&cwd);
+        let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
         let skills_list: Vec<_> = match discoverer.discover().await {
             Ok(s) => s
                 .iter()
