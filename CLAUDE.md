@@ -105,6 +105,9 @@ and any open items.
 
 Follow conventional commit format: `feat|fix|refactor|docs|test|chore(scope): description`
 
+When adding a new feature (`feat` commits), update the features list in
+`README.md` as part of the same branch/PR.
+
 **You MUST run all checks before every commit and fix any issues they report:**
 1. `cargo +nightly fmt --all` — format all Rust code (CI runs `cargo fmt --all -- --check`)
 2. `cargo +nightly clippy --all-targets --all-features -- -D warnings` — run linter (must pass with zero warnings)
