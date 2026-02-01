@@ -4,3 +4,4 @@ prompts
 .env
 .env.*
 .DS_Store
+.playwright-mcp/
