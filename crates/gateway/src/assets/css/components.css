@@ -689,23 +689,23 @@
     align-items: center;
     gap: 8px;
     width: 100%;
-    padding: 0.45rem 0.75rem;
+    padding: 8px 16px;
     background: none;
     border: none;
-    color: var(--text);
-    font-size: 0.8125rem;
+    color: var(--muted);
+    font-size: 0.85rem;
     cursor: pointer;
     text-align: left;
   }
 
   .settings-nav-item:hover {
-    background: var(--surface2);
+    background: var(--bg-hover);
+    color: var(--text);
   }
 
   .settings-nav-item.active {
-    background: var(--surface2);
-    color: var(--text-strong);
-    font-weight: 500;
+    color: var(--accent);
+    background: var(--accent-subtle);
   }
 
   .settings-content {
