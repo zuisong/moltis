@@ -63,6 +63,8 @@ What you get out of the box:
 - **MCP (Model Context Protocol) support** — connect to MCP tool servers over
   stdio or HTTP/SSE (remote servers), with health polling, automatic restart
   on crash (exponential backoff), and in-UI server config editing
+- **Parallel tool execution** — when the LLM requests multiple tool calls in
+  one turn, they run concurrently via `futures::join_all`, reducing latency
 - **Sandboxed execution** — Docker and Apple Container backends with pre-built
   images, configurable packages, and per-session isolation
 - **Authentication** — password and passkey (WebAuthn) authentication with
