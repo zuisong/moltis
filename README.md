@@ -35,7 +35,8 @@ What you get out of the box:
   after a cooldown — no manual intervention.
 - **Auto-compaction** — When a conversation approaches 95 % of the model's
   context window, history is summarized and important facts are persisted to
-  the memory store. No manual truncation.
+  the memory store. On context-window-exceeded errors the agent loop
+  automatically compacts and retries once.
 
 ## Features
 
@@ -46,8 +47,18 @@ What you get out of the box:
 - **Communication channels** — Telegram integration with an extensible channel
   abstraction for adding others
 - **Web gateway** — HTTP and WebSocket server with a built-in web UI
-- **Session persistence** — SQLite-backed conversation history and session
-  management
+- **Session persistence** — SQLite-backed conversation history, session
+  management, and per-session run serialization to prevent history corruption
+- **Agent-level timeout** — configurable wall-clock timeout for agent runs
+  (default 600s) to prevent runaway executions
+- **Sub-agent delegation** — `spawn_agent` tool lets the LLM delegate tasks to
+  child agent loops with nesting depth limits and tool filtering
+- **Message queue modes** — `followup` (replay each queued message as a
+  separate run) or `collect` (concatenate and send once) when messages arrive
+  during an active run
+- **Tool result sanitization** — strips base64 data URIs and long hex blobs,
+  truncates oversized results before feeding back to the LLM (configurable
+  limit, default 50 KB)
 - **Memory and knowledge base** — embeddings-powered long-term memory
 - **Skills and plugins** — extensible skill system and plugin architecture
 - **Hook system** — lifecycle hooks with priority ordering, parallel dispatch
@@ -346,7 +357,8 @@ env = { DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..." }
 ```
 
 See `examples/hooks/` for ready-to-use scripts (logging, blocking dangerous
-commands, Slack/Discord notifications, secret redaction, session saving).
+commands, content filtering, agent metrics, message audit trail,
+Slack/Discord notifications, secret redaction, session saving).
 
 ### Sandbox Image Management
 

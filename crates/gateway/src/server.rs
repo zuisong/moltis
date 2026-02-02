@@ -39,7 +39,7 @@ use crate::{
     approval::{GatewayApprovalBroadcaster, LiveExecApprovalService},
     auth,
     auth_routes::{AuthState, auth_router},
-    broadcast::broadcast_tick,
+    broadcast::{BroadcastOpts, broadcast, broadcast_tick},
     chat::{LiveChatService, LiveModelService},
     methods::MethodRegistry,
     provider_setup::LiveProviderSetupService,
@@ -558,12 +558,7 @@ pub async fn start_gateway(
         }
     }
 
-    // Wire live session service with sandbox router and project store.
-    services.session = Arc::new(
-        LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
-            .with_sandbox_router(Arc::clone(&sandbox_router))
-            .with_project_store(Arc::clone(&project_store)),
-    );
+    // Session service is wired after hook registry is built (below).
 
     // Wire channel store and Telegram channel service.
     {
@@ -699,6 +694,18 @@ pub async fn start_gateway(
 
         Some(Arc::new(registry))
     };
+
+    // Wire live session service with sandbox router, project store, and hooks.
+    {
+        let mut session_svc =
+            LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
+                .with_sandbox_router(Arc::clone(&sandbox_router))
+                .with_project_store(Arc::clone(&project_store));
+        if let Some(ref hooks) = hook_registry {
+            session_svc = session_svc.with_hooks(Arc::clone(hooks));
+        }
+        services.session = Arc::new(session_svc);
+    }
 
     // ── Memory system initialization ─────────────────────────────────────
     let memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>> = {
@@ -1072,6 +1079,54 @@ pub async fn start_gateway(
                 Arc::clone(mm),
             )));
         }
+
+        // Register spawn_agent tool for sub-agent support.
+        // The tool gets a snapshot of the current registry (without itself)
+        // so sub-agents have access to all other tools.
+        if let Some(default_provider) = registry.read().await.first_with_tools() {
+            let base_tools = Arc::new(tool_registry.clone_without(&[]));
+            let state_for_spawn = Arc::clone(&state);
+            let on_spawn_event: moltis_tools::spawn_agent::OnSpawnEvent = Arc::new(move |event| {
+                use moltis_agents::runner::RunnerEvent;
+                let state = Arc::clone(&state_for_spawn);
+                let payload = match &event {
+                    RunnerEvent::SubAgentStart { task, model, depth } => {
+                        serde_json::json!({
+                            "state": "sub_agent_start",
+                            "task": task,
+                            "model": model,
+                            "depth": depth,
+                        })
+                    },
+                    RunnerEvent::SubAgentEnd {
+                        task,
+                        model,
+                        depth,
+                        iterations,
+                        tool_calls_made,
+                    } => serde_json::json!({
+                        "state": "sub_agent_end",
+                        "task": task,
+                        "model": model,
+                        "depth": depth,
+                        "iterations": iterations,
+                        "toolCallsMade": tool_calls_made,
+                    }),
+                    _ => return, // Only broadcast sub-agent lifecycle events.
+                };
+                tokio::spawn(async move {
+                    broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
+                });
+            });
+            let spawn_tool = moltis_tools::spawn_agent::SpawnAgentTool::new(
+                Arc::clone(&registry),
+                default_provider,
+                base_tools,
+            )
+            .with_on_event(on_spawn_event);
+            tool_registry.register(Box::new(spawn_tool));
+        }
+
         let shared_tool_registry = Arc::new(tokio::sync::RwLock::new(tool_registry));
         let mut chat_service = LiveChatService::new(
             Arc::clone(&registry),

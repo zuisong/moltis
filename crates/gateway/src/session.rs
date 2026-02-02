@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use {async_trait::async_trait, serde_json::Value};
+use {async_trait::async_trait, serde_json::Value, tracing::warn};
 
 use {
+    moltis_common::hooks::HookRegistry,
     moltis_projects::ProjectStore,
     moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
     moltis_tools::sandbox::SandboxRouter,
@@ -16,6 +17,7 @@ pub struct LiveSessionService {
     metadata: Arc<SqliteSessionMetadata>,
     sandbox_router: Option<Arc<SandboxRouter>>,
     project_store: Option<Arc<dyn ProjectStore>>,
+    hook_registry: Option<Arc<HookRegistry>>,
 }
 
 impl LiveSessionService {
@@ -25,6 +27,7 @@ impl LiveSessionService {
             metadata,
             sandbox_router: None,
             project_store: None,
+            hook_registry: None,
         }
     }
 
@@ -35,6 +38,11 @@ impl LiveSessionService {
 
     pub fn with_project_store(mut self, store: Arc<dyn ProjectStore>) -> Self {
         self.project_store = Some(store);
+        self
+    }
+
+    pub fn with_hooks(mut self, registry: Arc<HookRegistry>) -> Self {
+        self.hook_registry = Some(registry);
         self
     }
 }
@@ -113,6 +121,18 @@ impl SessionService for LiveSessionService {
             .await
             .map_err(|e| e.to_string())?;
         let history = self.store.read(key).await.map_err(|e| e.to_string())?;
+
+        // Dispatch SessionStart hook for newly created sessions (empty history).
+        if history.is_empty()
+            && let Some(ref hooks) = self.hook_registry
+        {
+            let payload = moltis_common::hooks::HookPayload::SessionStart {
+                session_key: key.to_string(),
+            };
+            if let Err(e) = hooks.dispatch(&payload).await {
+                warn!(session = %key, error = %e, "SessionStart hook failed");
+            }
+        }
 
         Ok(serde_json::json!({
             "entry": {
@@ -303,6 +323,16 @@ impl SessionService for LiveSessionService {
         }
 
         self.metadata.remove(key).await;
+
+        // Dispatch SessionEnd hook (read-only).
+        if let Some(ref hooks) = self.hook_registry {
+            let payload = moltis_common::hooks::HookPayload::SessionEnd {
+                session_key: key.to_string(),
+            };
+            if let Err(e) = hooks.dispatch(&payload).await {
+                warn!(session = %key, error = %e, "SessionEnd hook failed");
+            }
+        }
 
         Ok(serde_json::json!({}))
     }

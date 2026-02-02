@@ -70,6 +70,7 @@ impl Default for ResolvedIdentity {
 #[serde(default)]
 pub struct MoltisConfig {
     pub providers: ProvidersConfig,
+    pub chat: ChatConfig,
     pub tools: ToolsConfig,
     pub skills: SkillsConfig,
     pub mcp: McpConfig,
@@ -254,13 +255,58 @@ impl Default for TlsConfig {
     }
 }
 
-/// Tools configuration (exec, sandbox, policy, web).
+/// Chat configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChatConfig {
+    /// How to handle messages that arrive while an agent run is active.
+    pub message_queue_mode: MessageQueueMode,
+}
+
+/// Behaviour when `chat.send()` is called during an active run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageQueueMode {
+    /// Queue each message; replay them one-by-one after the current run.
+    #[default]
+    Followup,
+    /// Buffer messages; concatenate and process as a single message after the current run.
+    Collect,
+}
+
+/// Tools configuration (exec, sandbox, policy, web).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     pub exec: ExecConfig,
     pub policy: ToolPolicyConfig,
     pub web: WebConfig,
+    /// Maximum wall-clock seconds for an agent run (0 = no timeout). Default 600.
+    #[serde(default = "default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+    /// Maximum bytes for a single tool result before truncation. Default 50KB.
+    #[serde(default = "default_max_tool_result_bytes")]
+    pub max_tool_result_bytes: usize,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            exec: ExecConfig::default(),
+            policy: ToolPolicyConfig::default(),
+            web: WebConfig::default(),
+            agent_timeout_secs: default_agent_timeout_secs(),
+            max_tool_result_bytes: default_max_tool_result_bytes(),
+        }
+    }
+}
+
+fn default_agent_timeout_secs() -> u64 {
+    600
+}
+
+fn default_max_tool_result_bytes() -> usize {
+    50_000
 }
 
 /// Web tools configuration (search, fetch).

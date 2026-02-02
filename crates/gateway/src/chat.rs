@@ -3,13 +3,19 @@ use std::{collections::HashMap, sync::Arc};
 use {
     async_trait::async_trait,
     serde_json::Value,
-    tokio::{sync::RwLock, task::AbortHandle},
+    tokio::{
+        sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+        task::AbortHandle,
+    },
     tokio_stream::StreamExt,
     tracing::{debug, info, warn},
 };
 
+use moltis_config::MessageQueueMode;
+
 use {
     moltis_agents::{
+        AgentRunError,
         model::StreamEvent,
         prompt::build_system_prompt_with_session,
         providers::ProviderRegistry,
@@ -67,6 +73,12 @@ impl ModelService for LiveModelService {
 
 // ── LiveChatService ─────────────────────────────────────────────────────────
 
+/// A message that arrived while an agent run was already active on the session.
+#[derive(Debug, Clone)]
+struct QueuedMessage {
+    params: Value,
+}
+
 pub struct LiveChatService {
     providers: Arc<RwLock<ProviderRegistry>>,
     state: Arc<GatewayState>,
@@ -75,6 +87,10 @@ pub struct LiveChatService {
     session_store: Arc<SessionStore>,
     session_metadata: Arc<SqliteSessionMetadata>,
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
+    /// Per-session semaphore ensuring only one agent run executes per session at a time.
+    session_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+    /// Per-session message queue for messages arriving during an active run.
+    message_queue: Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>>,
 }
 
 impl LiveChatService {
@@ -92,6 +108,8 @@ impl LiveChatService {
             session_store,
             session_metadata,
             hook_registry: None,
+            session_locks: Arc::new(RwLock::new(HashMap::new())),
+            message_queue: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -117,6 +135,24 @@ impl LiveChatService {
             .try_read()
             .map(|r| !r.list_schemas().is_empty())
             .unwrap_or(true)
+    }
+
+    /// Return the per-session semaphore, creating one if absent.
+    async fn session_semaphore(&self, key: &str) -> Arc<Semaphore> {
+        // Fast path: read lock.
+        {
+            let locks = self.session_locks.read().await;
+            if let Some(sem) = locks.get(key) {
+                return Arc::clone(sem);
+            }
+        }
+        // Slow path: write lock, insert.
+        let mut locks = self.session_locks.write().await;
+        Arc::clone(
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
     }
 
     /// Resolve a provider from session metadata, history, or first registered.
@@ -285,6 +321,22 @@ impl ChatService for LiveChatService {
                 None
             }
         };
+
+        // Dispatch MessageReceived hook (read-only).
+        if let Some(ref hooks) = self.hook_registry {
+            let channel = params
+                .get("channel")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let payload = moltis_common::hooks::HookPayload::MessageReceived {
+                session_key: session_key.clone(),
+                content: text.clone(),
+                channel,
+            };
+            if let Err(e) = hooks.dispatch(&payload).await {
+                warn!(session = %session_key, error = %e, "MessageReceived hook failed");
+            }
+        }
 
         // Persist the user message (with optional channel metadata for UI display).
         let channel_meta = params.get("channel").cloned();
@@ -507,42 +559,131 @@ impl ChatService for LiveChatService {
             }
         }
 
+        // Try to acquire the per-session semaphore.  If a run is already active,
+        // queue the message according to the configured MessageQueueMode instead
+        // of blocking the caller.
+        let session_sem = self.session_semaphore(&session_key).await;
+        let permit: OwnedSemaphorePermit = match session_sem.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                // Active run — enqueue and return immediately.
+                let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                info!(
+                    session = %session_key,
+                    mode = ?queue_mode,
+                    "queueing message (run active)"
+                );
+                self.message_queue
+                    .write()
+                    .await
+                    .entry(session_key.clone())
+                    .or_default()
+                    .push(QueuedMessage {
+                        params: params.clone(),
+                    });
+                broadcast(
+                    &self.state,
+                    "chat",
+                    serde_json::json!({
+                        "sessionKey": session_key,
+                        "state": "queued",
+                        "mode": format!("{queue_mode:?}").to_lowercase(),
+                    }),
+                    BroadcastOpts::default(),
+                )
+                .await;
+                return Ok(serde_json::json!({
+                    "queued": true,
+                    "mode": format!("{queue_mode:?}").to_lowercase(),
+                }));
+            },
+        };
+
+        let agent_timeout_secs = moltis_config::discover_and_load().tools.agent_timeout_secs;
+
+        let message_queue = Arc::clone(&self.message_queue);
+        let state_for_drain = Arc::clone(&self.state);
+
         let handle = tokio::spawn(async move {
+            let _permit = permit; // hold permit until task completes
             let ctx_ref = project_context.as_deref();
             let stats_ref = Some(session_stats.as_str());
-            let assistant_text = if stream_only {
-                run_streaming(
-                    &state,
-                    &run_id_clone,
-                    provider,
-                    &text,
-                    &provider_name,
-                    &history,
-                    &session_key_clone,
-                    ctx_ref,
-                    stats_ref,
-                    user_message_index,
-                    &discovered_skills,
+            let agent_fut = async {
+                if stream_only {
+                    run_streaming(
+                        &state,
+                        &run_id_clone,
+                        provider,
+                        &text,
+                        &provider_name,
+                        &history,
+                        &session_key_clone,
+                        ctx_ref,
+                        stats_ref,
+                        user_message_index,
+                        &discovered_skills,
+                    )
+                    .await
+                } else {
+                    run_with_tools(
+                        &state,
+                        &run_id_clone,
+                        provider,
+                        &tool_registry,
+                        &text,
+                        &provider_name,
+                        &history,
+                        &session_key_clone,
+                        ctx_ref,
+                        stats_ref,
+                        user_message_index,
+                        &discovered_skills,
+                        hook_registry,
+                        accept_language.clone(),
+                        Some(&session_store),
+                    )
+                    .await
+                }
+            };
+
+            let assistant_text = if agent_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(agent_timeout_secs),
+                    agent_fut,
                 )
                 .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            run_id = %run_id_clone,
+                            session = %session_key_clone,
+                            timeout_secs = agent_timeout_secs,
+                            "agent run timed out"
+                        );
+                        let error_obj = serde_json::json!({
+                            "type": "timeout",
+                            "message": format!(
+                                "Agent run timed out after {agent_timeout_secs}s"
+                            ),
+                        });
+                        broadcast(
+                            &state,
+                            "chat",
+                            serde_json::json!({
+                                "runId": run_id_clone,
+                                "sessionKey": session_key_clone,
+                                "state": "error",
+                                "error": error_obj,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                        None
+                    },
+                }
             } else {
-                run_with_tools(
-                    &state,
-                    &run_id_clone,
-                    provider,
-                    &tool_registry,
-                    &text,
-                    &provider_name,
-                    &history,
-                    &session_key_clone,
-                    ctx_ref,
-                    stats_ref,
-                    user_message_index,
-                    &discovered_skills,
-                    hook_registry,
-                    accept_language.clone(),
-                )
-                .await
+                agent_fut.await
             };
 
             // Persist assistant response.
@@ -561,6 +702,46 @@ impl ChatService for LiveChatService {
             }
 
             active_runs.write().await.remove(&run_id_clone);
+
+            // Drain queued messages for this session.
+            let queued = message_queue
+                .write()
+                .await
+                .remove(&session_key_clone)
+                .unwrap_or_default();
+            if !queued.is_empty() {
+                let queue_mode = moltis_config::discover_and_load().chat.message_queue_mode;
+                let chat = state_for_drain.chat().await;
+                match queue_mode {
+                    MessageQueueMode::Followup => {
+                        for msg in queued {
+                            info!(session = %session_key_clone, "replaying queued message (followup)");
+                            if let Err(e) = chat.send(msg.params).await {
+                                warn!(session = %session_key_clone, error = %e, "failed to replay queued message");
+                            }
+                        }
+                    },
+                    MessageQueueMode::Collect => {
+                        let combined: Vec<&str> = queued
+                            .iter()
+                            .filter_map(|m| m.params.get("text").and_then(|v| v.as_str()))
+                            .collect();
+                        if !combined.is_empty() {
+                            info!(
+                                session = %session_key_clone,
+                                count = combined.len(),
+                                "replaying collected messages"
+                            );
+                            // Use the last queued message as the base params, override text.
+                            let mut merged = queued.last().unwrap().params.clone();
+                            merged["text"] = serde_json::json!(combined.join("\n\n"));
+                            if let Err(e) = chat.send(merged).await {
+                                warn!(session = %session_key_clone, error = %e, "failed to replay collected messages");
+                            }
+                        }
+                    },
+                }
+            }
         });
 
         self.active_runs
@@ -1008,6 +1189,7 @@ async fn run_with_tools(
     skills: &[moltis_skills::types::SkillMetadata],
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
     accept_language: Option<String>,
+    session_store: Option<&Arc<SessionStore>>,
 ) -> Option<(String, u32, u32)> {
     // Load identity and user profile from config so the LLM knows who it is.
     let config = moltis_config::discover_and_load();
@@ -1112,6 +1294,30 @@ async fn run_with_tools(
                     "state": "iteration",
                     "iteration": n,
                 }),
+                RunnerEvent::SubAgentStart { task, model, depth } => serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": sk,
+                    "state": "sub_agent_start",
+                    "task": task,
+                    "model": model,
+                    "depth": depth,
+                }),
+                RunnerEvent::SubAgentEnd {
+                    task,
+                    model,
+                    depth,
+                    iterations,
+                    tool_calls_made,
+                } => serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": sk,
+                    "state": "sub_agent_end",
+                    "task": task,
+                    "model": model,
+                    "depth": depth,
+                    "iterations": iterations,
+                    "toolCallsMade": tool_calls_made,
+                }),
             };
             broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
         });
@@ -1133,18 +1339,104 @@ async fn run_with_tools(
 
     let provider_ref = provider.clone();
     let registry_guard = tool_registry.read().await;
-    match run_agent_loop_with_context(
+    let first_result = run_agent_loop_with_context(
         provider,
         &registry_guard,
         &system_prompt,
         text,
         Some(&on_event),
         hist,
-        Some(tool_context),
-        hook_registry,
+        Some(tool_context.clone()),
+        hook_registry.clone(),
     )
-    .await
-    {
+    .await;
+
+    // On context-window overflow, compact the session and retry once.
+    let result = match first_result {
+        Err(AgentRunError::ContextWindowExceeded(ref msg)) if session_store.is_some() => {
+            let store = session_store.unwrap();
+            info!(
+                run_id,
+                session = session_key,
+                error = %msg,
+                "context window exceeded — compacting and retrying"
+            );
+
+            broadcast(
+                state,
+                "chat",
+                serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "state": "auto_compact",
+                    "phase": "start",
+                    "reason": "context_window_exceeded",
+                }),
+                BroadcastOpts::default(),
+            )
+            .await;
+
+            // Inline compaction: summarize history, replace in store.
+            match compact_session(store, session_key, &provider_ref).await {
+                Ok(()) => {
+                    broadcast(
+                        state,
+                        "chat",
+                        serde_json::json!({
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "done",
+                            "reason": "context_window_exceeded",
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+
+                    // Reload compacted history and retry.
+                    let compacted_history = store.read(session_key).await.unwrap_or_default();
+                    let retry_hist = if compacted_history.is_empty() {
+                        None
+                    } else {
+                        Some(compacted_history)
+                    };
+
+                    run_agent_loop_with_context(
+                        provider_ref.clone(),
+                        &registry_guard,
+                        &system_prompt,
+                        text,
+                        Some(&on_event),
+                        retry_hist,
+                        Some(tool_context),
+                        hook_registry,
+                    )
+                    .await
+                },
+                Err(e) => {
+                    warn!(run_id, error = %e, "retry compaction failed");
+                    broadcast(
+                        state,
+                        "chat",
+                        serde_json::json!({
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "state": "auto_compact",
+                            "phase": "error",
+                            "error": e.to_string(),
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+                    // Return the original error.
+                    first_result
+                },
+            }
+        },
+        other => other,
+    };
+
+    match result {
         Ok(result) => {
             info!(
                 run_id,
@@ -1153,7 +1445,6 @@ async fn run_with_tools(
                 response = %result.text,
                 "agent run complete"
             );
-            // Assistant message index = user message index + 1.
             let assistant_message_index = user_message_index + 1;
             broadcast(
                 state,
@@ -1199,6 +1490,67 @@ async fn run_with_tools(
             None
         },
     }
+}
+
+/// Compact a session's history by summarizing it with the given provider.
+///
+/// This is a standalone helper so `run_with_tools` can call it without
+/// requiring `&self` on `LiveChatService`.
+async fn compact_session(
+    store: &Arc<SessionStore>,
+    session_key: &str,
+    provider: &Arc<dyn moltis_agents::model::LlmProvider>,
+) -> Result<(), String> {
+    let history = store.read(session_key).await.map_err(|e| e.to_string())?;
+    if history.is_empty() {
+        return Err("nothing to compact".into());
+    }
+
+    let mut summary_messages: Vec<serde_json::Value> = vec![serde_json::json!({
+        "role": "system",
+        "content": "You are a conversation summarizer. Summarize the following conversation into a concise form that preserves all key facts, decisions, and context. Output only the summary, no preamble."
+    })];
+
+    let mut conversation_text = String::new();
+    for msg in &history {
+        let role = msg
+            .get("role")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        conversation_text.push_str(&format!("{role}: {content}\n\n"));
+    }
+    summary_messages.push(serde_json::json!({
+        "role": "user",
+        "content": conversation_text,
+    }));
+
+    let mut stream = provider.stream(summary_messages);
+    let mut summary = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            StreamEvent::Delta(delta) => summary.push_str(&delta),
+            StreamEvent::Done(_) => break,
+            StreamEvent::Error(e) => return Err(format!("compact summarization failed: {e}")),
+        }
+    }
+
+    if summary.is_empty() {
+        return Err("compact produced empty summary".into());
+    }
+
+    let compacted = vec![serde_json::json!({
+        "role": "assistant",
+        "content": format!("[Conversation Summary]\n\n{summary}"),
+        "created_at": now_ms(),
+    })];
+
+    store
+        .replace_history(session_key, compacted)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 // ── Streaming mode (no tools) ───────────────────────────────────────────────
@@ -1350,5 +1702,244 @@ async fn deliver_channel_replies(state: &Arc<GatewayState>, session_key: &str, t
                 },
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bare session_locks map for testing the semaphore logic
+    /// without constructing a full LiveChatService.
+    fn make_session_locks() -> Arc<RwLock<HashMap<String, Arc<Semaphore>>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    async fn get_or_create_semaphore(
+        locks: &Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+        key: &str,
+    ) -> Arc<Semaphore> {
+        {
+            let map = locks.read().await;
+            if let Some(sem) = map.get(key) {
+                return Arc::clone(sem);
+            }
+        }
+        let mut map = locks.write().await;
+        Arc::clone(
+            map.entry(key.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
+    }
+
+    #[tokio::test]
+    async fn same_session_runs_are_serialized() {
+        let locks = make_session_locks();
+        let sem = get_or_create_semaphore(&locks, "s1").await;
+
+        // Acquire the permit — simulates a running task.
+        let permit = sem.clone().acquire_owned().await.unwrap();
+
+        // A second acquire should not resolve while the first is held.
+        let sem2 = sem.clone();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _p = sem2.acquire_owned().await.unwrap();
+            let _ = tx.send(());
+        });
+
+        // Give the second task a chance to run — it should be blocked.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "second run should be blocked while first holds permit"
+        );
+
+        // Release first permit.
+        drop(permit);
+
+        // Now the second task should complete.
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_sessions_run_in_parallel() {
+        let locks = make_session_locks();
+        let sem_a = get_or_create_semaphore(&locks, "a").await;
+        let sem_b = get_or_create_semaphore(&locks, "b").await;
+
+        let _pa = sem_a.clone().acquire_owned().await.unwrap();
+        // Session "b" should still be acquirable.
+        let _pb = sem_b.clone().acquire_owned().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_releases_permit() {
+        let locks = make_session_locks();
+        let sem = get_or_create_semaphore(&locks, "s").await;
+
+        let sem2 = sem.clone();
+        let task = tokio::spawn(async move {
+            let _p = sem2.acquire_owned().await.unwrap();
+            // Simulate long-running work.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        // Give the task time to acquire the permit.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Abort the task — this drops the permit.
+        task.abort();
+        let _ = task.await;
+
+        // The semaphore should now be acquirable.
+        let _p = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sem.clone().acquire_owned(),
+        )
+        .await
+        .expect("permit should be available after abort")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_timeout_cancels_slow_future() {
+        use std::time::Duration;
+
+        let timeout_secs: u64 = 1;
+        let slow_fut = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Some(("done".to_string(), 0u32, 0u32))
+        };
+
+        let result: Option<(String, u32, u32)> =
+            tokio::time::timeout(Duration::from_secs(timeout_secs), slow_fut)
+                .await
+                .unwrap_or_default();
+
+        assert!(
+            result.is_none(),
+            "slow future should have been cancelled by timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_timeout_zero_means_no_timeout() {
+        use std::time::Duration;
+
+        let timeout_secs: u64 = 0;
+        let fast_fut = async { Some(("ok".to_string(), 10u32, 5u32)) };
+
+        let result = if timeout_secs > 0 {
+            tokio::time::timeout(Duration::from_secs(timeout_secs), fast_fut)
+                .await
+                .unwrap_or_default()
+        } else {
+            fast_fut.await
+        };
+
+        assert_eq!(result, Some(("ok".to_string(), 10, 5)));
+    }
+
+    // ── Message queue tests ──────────────────────────────────────────────
+
+    fn make_message_queue() -> Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    #[tokio::test]
+    async fn queue_enqueue_and_drain() {
+        let queue = make_message_queue();
+        let key = "sess1";
+
+        // Enqueue two messages.
+        {
+            let mut q = queue.write().await;
+            q.entry(key.to_string()).or_default().push(QueuedMessage {
+                params: serde_json::json!({"text": "hello"}),
+            });
+            q.entry(key.to_string()).or_default().push(QueuedMessage {
+                params: serde_json::json!({"text": "world"}),
+            });
+        }
+
+        // Drain.
+        let drained = queue.write().await.remove(key).unwrap_or_default();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].params["text"], "hello");
+        assert_eq!(drained[1].params["text"], "world");
+
+        // Queue should be empty after drain.
+        assert!(queue.read().await.get(key).is_none());
+    }
+
+    #[tokio::test]
+    async fn queue_collect_concatenates_texts() {
+        let msgs = [
+            QueuedMessage {
+                params: serde_json::json!({"text": "first", "model": "gpt-4"}),
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "second"}),
+            },
+            QueuedMessage {
+                params: serde_json::json!({"text": "third", "_conn_id": "c1"}),
+            },
+        ];
+
+        let combined: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| m.params.get("text").and_then(|v| v.as_str()))
+            .collect();
+        let joined = combined.join("\n\n");
+        assert_eq!(joined, "first\n\nsecond\n\nthird");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_returns_err_when_held() {
+        let sem = Arc::new(Semaphore::new(1));
+        let _permit = sem.clone().try_acquire_owned().unwrap();
+
+        // Second try_acquire should fail.
+        assert!(sem.clone().try_acquire_owned().is_err());
+    }
+
+    #[tokio::test]
+    async fn try_acquire_succeeds_when_free() {
+        let sem = Arc::new(Semaphore::new(1));
+        assert!(sem.clone().try_acquire_owned().is_ok());
+    }
+
+    #[tokio::test]
+    async fn queue_drain_empty_is_noop() {
+        let queue = make_message_queue();
+        let drained = queue
+            .write()
+            .await
+            .remove("nonexistent")
+            .unwrap_or_default();
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn message_queue_mode_default_is_followup() {
+        let mode = MessageQueueMode::default();
+        assert_eq!(mode, MessageQueueMode::Followup);
+    }
+
+    #[test]
+    fn message_queue_mode_deserializes_from_toml() {
+        use serde::Deserialize;
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            mode: MessageQueueMode,
+        }
+
+        let followup: Wrapper = toml::from_str(r#"mode = "followup""#).unwrap();
+        assert_eq!(followup.mode, MessageQueueMode::Followup);
+
+        let collect: Wrapper = toml::from_str(r#"mode = "collect""#).unwrap();
+        assert_eq!(collect.mode, MessageQueueMode::Collect);
     }
 }

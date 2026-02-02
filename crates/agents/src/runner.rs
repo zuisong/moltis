@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Write, sync::Arc};
 
 use {
     anyhow::{Result, bail},
@@ -14,6 +14,36 @@ use crate::{
 
 /// Maximum number of tool-call loop iterations before giving up.
 const MAX_ITERATIONS: usize = 25;
+
+/// Error patterns that indicate the context window has been exceeded.
+const CONTEXT_WINDOW_PATTERNS: &[&str] = &[
+    "context_length_exceeded",
+    "max_tokens",
+    "too many tokens",
+    "request too large",
+    "maximum context length",
+    "context window",
+    "token limit",
+    "content_too_large",
+    "request_too_large",
+];
+
+/// Check if an error message indicates a context window overflow.
+fn is_context_window_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    CONTEXT_WINDOW_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Typed errors from the agent loop.
+#[derive(Debug, thiserror::Error)]
+pub enum AgentRunError {
+    /// The provider reported that the context window / token limit was exceeded.
+    #[error("context window exceeded: {0}")]
+    ContextWindowExceeded(String),
+    /// Any other error.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 /// Result of running the agent loop.
 #[derive(Debug)]
@@ -50,6 +80,18 @@ pub enum RunnerEvent {
     ThinkingText(String),
     TextDelta(String),
     Iteration(usize),
+    SubAgentStart {
+        task: String,
+        model: String,
+        depth: u64,
+    },
+    SubAgentEnd {
+        task: String,
+        model: String,
+        depth: u64,
+        iterations: usize,
+        tool_calls_made: usize,
+    },
 }
 
 /// Try to parse a tool call from the LLM's text response.
@@ -106,6 +148,103 @@ fn parse_tool_call_from_text(text: &str) -> Option<(ToolCall, Option<String>)> {
     ))
 }
 
+// ── Tool result sanitization ────────────────────────────────────────────
+
+/// Tag that starts a base64 data URI.
+const BASE64_TAG: &str = "data:";
+/// Marker between MIME type and base64 payload.
+const BASE64_MARKER: &str = ";base64,";
+/// Minimum length of a blob payload (base64 or hex) to be worth stripping.
+const BLOB_MIN_LEN: usize = 200;
+
+fn is_base64_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'='
+}
+
+/// Strip base64 data-URI blobs (e.g. `data:image/png;base64,AAAA...`) and
+/// replace them with a short placeholder. Only targets payloads ≥ 200 chars.
+fn strip_base64_blobs(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+
+    while let Some(start) = rest.find(BASE64_TAG) {
+        result.push_str(&rest[..start]);
+        let after_tag = &rest[start + BASE64_TAG.len()..];
+
+        if let Some(marker_pos) = after_tag.find(BASE64_MARKER) {
+            let payload_start = marker_pos + BASE64_MARKER.len();
+            let payload = &after_tag[payload_start..];
+            let payload_len = payload.bytes().take_while(|b| is_base64_byte(*b)).count();
+
+            if payload_len >= BLOB_MIN_LEN {
+                let total_uri_len = BASE64_TAG.len() + payload_start + payload_len;
+                write!(result, "[base64 data removed — {total_uri_len} bytes]").unwrap();
+                rest = &rest[start + total_uri_len..];
+                continue;
+            }
+        }
+
+        result.push_str(BASE64_TAG);
+        rest = after_tag;
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Strip long hex sequences (≥ 200 hex chars) that look like binary dumps.
+fn strip_hex_blobs(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.char_indices().peekable();
+
+    while let Some(&(start, ch)) = chars.peek() {
+        if ch.is_ascii_hexdigit() {
+            let mut end = start;
+            while let Some(&(i, c)) = chars.peek() {
+                if c.is_ascii_hexdigit() {
+                    end = i + c.len_utf8();
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            let run = end - start;
+            if run >= BLOB_MIN_LEN {
+                write!(result, "[hex data removed — {run} chars]").unwrap();
+            } else {
+                result.push_str(&input[start..end]);
+            }
+        } else {
+            result.push(ch);
+            chars.next();
+        }
+    }
+    result
+}
+
+/// Sanitize a tool result string before feeding it to the LLM.
+///
+/// 1. Strips base64 data URIs (≥ 200 char payloads).
+/// 2. Strips long hex sequences (≥ 200 hex chars).
+/// 3. Truncates the result to `max_bytes` (at a char boundary), appending a
+///    truncation marker.
+pub fn sanitize_tool_result(input: &str, max_bytes: usize) -> String {
+    let mut result = strip_base64_blobs(input);
+    result = strip_hex_blobs(&result);
+
+    if result.len() <= max_bytes {
+        return result;
+    }
+
+    let original_len = result.len();
+    let mut end = max_bytes;
+    while end > 0 && !result.is_char_boundary(end) {
+        end -= 1;
+    }
+    result.truncate(end);
+    write!(result, "\n\n[truncated — {original_len} bytes total]").unwrap();
+    result
+}
+
 /// Run the agent loop: send messages to the LLM, execute tool calls, repeat.
 ///
 /// If `history` is provided, those messages are inserted between the system
@@ -117,7 +256,7 @@ pub async fn run_agent_loop(
     user_message: &str,
     on_event: Option<&OnEvent>,
     history: Option<Vec<serde_json::Value>>,
-) -> Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentRunError> {
     run_agent_loop_with_context(
         provider,
         tools,
@@ -142,8 +281,11 @@ pub async fn run_agent_loop_with_context(
     history: Option<Vec<serde_json::Value>>,
     tool_context: Option<serde_json::Value>,
     hook_registry: Option<Arc<HookRegistry>>,
-) -> Result<AgentRunResult> {
+) -> Result<AgentRunResult, AgentRunError> {
     let native_tools = provider.supports_tools();
+    let max_tool_result_bytes = moltis_config::discover_and_load()
+        .tools
+        .max_tool_result_bytes;
     let tool_schemas = tools.list_schemas();
 
     info!(
@@ -185,7 +327,9 @@ pub async fn run_agent_loop_with_context(
         iterations += 1;
         if iterations > MAX_ITERATIONS {
             warn!("agent loop exceeded max iterations ({})", MAX_ITERATIONS);
-            bail!("agent loop exceeded max iterations");
+            return Err(AgentRunError::Other(anyhow::anyhow!(
+                "agent loop exceeded max iterations"
+            )));
         }
 
         if let Some(cb) = on_event {
@@ -203,8 +347,16 @@ pub async fn run_agent_loop_with_context(
             cb(RunnerEvent::Thinking);
         }
 
-        let mut response: CompletionResponse =
-            provider.complete(&messages, schemas_for_api).await?;
+        let mut response: CompletionResponse = provider
+            .complete(&messages, schemas_for_api)
+            .await
+            .map_err(|e| {
+                if is_context_window_error(&e.to_string()) {
+                    AgentRunError::ContextWindowExceeded(e.to_string())
+                } else {
+                    AgentRunError::Other(e)
+                }
+            })?;
 
         if let Some(cb) = on_event {
             cb(RunnerEvent::ThinkingDone);
@@ -444,7 +596,7 @@ pub async fn run_agent_loop_with_context(
                 });
             }
 
-            let tool_result_str = result.to_string();
+            let tool_result_str = sanitize_tool_result(&result.to_string(), max_tool_result_bytes);
             debug!(
                 tool = %tc.name,
                 id = %tc.id,
@@ -1241,5 +1393,70 @@ mod tests {
             "parallel execution took {:?}, expected < 250ms",
             elapsed
         );
+    }
+
+    // ── sanitize_tool_result tests ──────────────────────────────────
+
+    #[test]
+    fn test_sanitize_short_input_unchanged() {
+        let input = "hello world";
+        assert_eq!(sanitize_tool_result(input, 50_000), "hello world");
+    }
+
+    #[test]
+    fn test_sanitize_truncates_long_input() {
+        let input = "x".repeat(1000);
+        let result = sanitize_tool_result(&input, 100);
+        assert!(result.starts_with("xxxx"));
+        assert!(result.contains("[truncated"));
+        assert!(result.contains("1000 bytes total"));
+    }
+
+    #[test]
+    fn test_sanitize_truncate_respects_char_boundary() {
+        let input = "é".repeat(100); // 200 bytes
+        let result = sanitize_tool_result(&input, 51); // mid-char
+        assert!(result.contains("[truncated"));
+        let prefix_end = result.find("\n\n[truncated").unwrap();
+        assert!(prefix_end <= 51);
+        assert_eq!(prefix_end % 2, 0);
+    }
+
+    #[test]
+    fn test_sanitize_strips_base64_data_uri() {
+        let payload = "A".repeat(300);
+        let input = format!("before data:image/png;base64,{payload} after");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(!result.contains(&payload));
+        assert!(result.contains("[base64 data removed"));
+        assert!(result.contains("before"));
+        assert!(result.contains("after"));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_short_base64() {
+        let payload = "QUFB";
+        let input = format!("data:text/plain;base64,{payload}");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(result.contains(payload));
+    }
+
+    #[test]
+    fn test_sanitize_strips_long_hex() {
+        let hex = "a1b2c3d4".repeat(50); // 400 hex chars
+        let input = format!("prefix {hex} suffix");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(!result.contains(&hex));
+        assert!(result.contains("[hex data removed"));
+        assert!(result.contains("prefix"));
+        assert!(result.contains("suffix"));
+    }
+
+    #[test]
+    fn test_sanitize_preserves_short_hex() {
+        let hex = "deadbeef";
+        let input = format!("code: {hex}");
+        let result = sanitize_tool_result(&input, 50_000);
+        assert!(result.contains(hex));
     }
 }
