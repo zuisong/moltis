@@ -3,7 +3,10 @@ use std::{collections::HashMap, sync::Arc};
 use {
     async_trait::async_trait,
     serde_json::Value,
-    tokio::{sync::RwLock, task::AbortHandle},
+    tokio::{
+        sync::{RwLock, Semaphore},
+        task::AbortHandle,
+    },
     tokio_stream::StreamExt,
     tracing::{debug, info, warn},
 };
@@ -75,6 +78,8 @@ pub struct LiveChatService {
     session_store: Arc<SessionStore>,
     session_metadata: Arc<SqliteSessionMetadata>,
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
+    /// Per-session semaphore ensuring only one agent run executes per session at a time.
+    session_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
 }
 
 impl LiveChatService {
@@ -92,6 +97,7 @@ impl LiveChatService {
             session_store,
             session_metadata,
             hook_registry: None,
+            session_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -112,6 +118,24 @@ impl LiveChatService {
 
     fn has_tools(&self) -> bool {
         !self.tool_registry.list_schemas().is_empty()
+    }
+
+    /// Return the per-session semaphore, creating one if absent.
+    async fn session_semaphore(&self, key: &str) -> Arc<Semaphore> {
+        // Fast path: read lock.
+        {
+            let locks = self.session_locks.read().await;
+            if let Some(sem) = locks.get(key) {
+                return Arc::clone(sem);
+            }
+        }
+        // Slow path: write lock, insert.
+        let mut locks = self.session_locks.write().await;
+        Arc::clone(
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
     }
 
     /// Resolve a provider from session metadata, history, or first registered.
@@ -518,7 +542,17 @@ impl ChatService for LiveChatService {
             }
         }
 
+        // Acquire the per-session semaphore so concurrent sends to the same
+        // session are serialized.  The permit is moved into the spawned task
+        // and released on drop (including abort/panic).
+        let session_sem = self.session_semaphore(&session_key).await;
+        let permit = session_sem
+            .acquire_owned()
+            .await
+            .expect("session semaphore closed unexpectedly");
+
         let handle = tokio::spawn(async move {
+            let _permit = permit; // hold permit until task completes
             let ctx_ref = project_context.as_deref();
             let stats_ref = Some(session_stats.as_str());
             let assistant_text = if stream_only {
@@ -1343,5 +1377,103 @@ async fn deliver_channel_replies(state: &Arc<GatewayState>, session_key: &str, t
                 },
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a bare session_locks map for testing the semaphore logic
+    /// without constructing a full LiveChatService.
+    fn make_session_locks() -> Arc<RwLock<HashMap<String, Arc<Semaphore>>>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    async fn get_or_create_semaphore(
+        locks: &Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
+        key: &str,
+    ) -> Arc<Semaphore> {
+        {
+            let map = locks.read().await;
+            if let Some(sem) = map.get(key) {
+                return Arc::clone(sem);
+            }
+        }
+        let mut map = locks.write().await;
+        Arc::clone(
+            map.entry(key.to_string())
+                .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
+    }
+
+    #[tokio::test]
+    async fn same_session_runs_are_serialized() {
+        let locks = make_session_locks();
+        let sem = get_or_create_semaphore(&locks, "s1").await;
+
+        // Acquire the permit — simulates a running task.
+        let permit = sem.clone().acquire_owned().await.unwrap();
+
+        // A second acquire should not resolve while the first is held.
+        let sem2 = sem.clone();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _p = sem2.acquire_owned().await.unwrap();
+            let _ = tx.send(());
+        });
+
+        // Give the second task a chance to run — it should be blocked.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "second run should be blocked while first holds permit"
+        );
+
+        // Release first permit.
+        drop(permit);
+
+        // Now the second task should complete.
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_sessions_run_in_parallel() {
+        let locks = make_session_locks();
+        let sem_a = get_or_create_semaphore(&locks, "a").await;
+        let sem_b = get_or_create_semaphore(&locks, "b").await;
+
+        let _pa = sem_a.clone().acquire_owned().await.unwrap();
+        // Session "b" should still be acquirable.
+        let _pb = sem_b.clone().acquire_owned().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_releases_permit() {
+        let locks = make_session_locks();
+        let sem = get_or_create_semaphore(&locks, "s").await;
+
+        let sem2 = sem.clone();
+        let task = tokio::spawn(async move {
+            let _p = sem2.acquire_owned().await.unwrap();
+            // Simulate long-running work.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        // Give the task time to acquire the permit.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Abort the task — this drops the permit.
+        task.abort();
+        let _ = task.await;
+
+        // The semaphore should now be acquirable.
+        let _p = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sem.clone().acquire_owned(),
+        )
+        .await
+        .expect("permit should be available after abort")
+        .unwrap();
     }
 }

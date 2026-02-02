@@ -15,8 +15,8 @@ multiple LLM providers and communication channels, inspired by
 - **Communication channels** — Telegram integration with an extensible channel
   abstraction for adding others
 - **Web gateway** — HTTP and WebSocket server with a built-in web UI
-- **Session persistence** — SQLite-backed conversation history and session
-  management
+- **Session persistence** — SQLite-backed conversation history, session
+  management, and per-session run serialization to prevent history corruption
 - **Memory and knowledge base** — embeddings-powered long-term memory
 - **Skills and plugins** — extensible skill system and plugin architecture
 - **Hook system** — lifecycle hooks with priority ordering, parallel dispatch
@@ -157,7 +157,8 @@ env = { DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/..." }
 ```
 
 See `examples/hooks/` for ready-to-use scripts (logging, blocking dangerous
-commands, Slack/Discord notifications, secret redaction, session saving).
+commands, content filtering, agent metrics, message audit trail,
+Slack/Discord notifications, secret redaction, session saving).
 
 ### Sandbox Image Management
 
