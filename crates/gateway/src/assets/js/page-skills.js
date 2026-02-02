@@ -454,7 +454,8 @@ function EnabledSkillsTable() {
 			showToast("Cannot disable: unknown source for skill.", "error");
 			return;
 		}
-		sendRpc("skills.skill.disable", { source: source, skill: skill.name }).then((res) => {
+		var method = skill.kind === "plugin" ? "plugins.skill.disable" : "skills.skill.disable";
+		sendRpc(method, { source: source, skill: skill.name }).then((res) => {
 			if (res?.ok) {
 				showToast(`Disabled ${skill.name}`, "success");
 				fetchAll();

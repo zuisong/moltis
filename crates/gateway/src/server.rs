@@ -1650,6 +1650,7 @@ async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse 
                                 serde_json::json!({
                                     "name": s.name,
                                     "source": source,
+                                    "kind": "skill",
                                     "enabled": true,
                                 })
                             })
@@ -1672,6 +1673,7 @@ async fn api_skills_handler(State(state): State<AppState>) -> impl IntoResponse 
                         enabled_skills.push(serde_json::json!({
                             "name": s.name,
                             "source": source,
+                            "kind": "plugin",
                             "enabled": true,
                         }));
                     }
