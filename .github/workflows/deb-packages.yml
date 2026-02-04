@@ -41,6 +41,7 @@ jobs:
     name: Build .deb (${{ matrix.arch }})
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -55,6 +56,9 @@ jobs:
 
       - name: Install cargo-deb
         run: cargo install cargo-deb
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
       - name: Install cross-compilation tools
         if: matrix.arch == 'arm64'
@@ -74,37 +78,17 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: cargo deb -p moltis-cli --no-build --target "$BUILD_TARGET"
 
-      - name: Import GPG key
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          echo "GPG_TTY=$(tty)" >> "$GITHUB_ENV"
-
-      - name: Sign .deb package
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          # Install dpkg-sig for signing
-          sudo apt-get install -y dpkg-sig
-          # Sign the .deb package
-          for deb in target/"$BUILD_TARGET"/debian/*.deb; do
-            echo "$GPG_PASSPHRASE" | dpkg-sig --sign builder -g "--batch --pinentry-mode loopback --passphrase-fd 0" "$deb"
-          done
-
-      - name: Generate checksums
+      - name: Sign with Sigstore and generate checksums
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: |
           cd target/"$BUILD_TARGET"/debian
           for deb in *.deb; do
+            # Generate checksums
             sha256sum "$deb" > "${deb}.sha256"
             sha512sum "$deb" > "${deb}.sha512"
+            # Sign with Sigstore (keyless)
+            cosign sign-blob --yes --output-signature "${deb}.sig" --output-certificate "${deb}.crt" "$deb"
           done
 
       - name: Upload .deb artifact
@@ -115,6 +99,8 @@ jobs:
             target/${{ matrix.target }}/debian/*.deb
             target/${{ matrix.target }}/debian/*.sha256
             target/${{ matrix.target }}/debian/*.sha512
+            target/${{ matrix.target }}/debian/*.sig
+            target/${{ matrix.target }}/debian/*.crt
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -124,6 +110,8 @@ jobs:
             target/${{ matrix.target }}/debian/*.deb
             target/${{ matrix.target }}/debian/*.sha256
             target/${{ matrix.target }}/debian/*.sha512
+            target/${{ matrix.target }}/debian/*.sig
+            target/${{ matrix.target }}/debian/*.crt
 
   build-rpm:
     needs: zizmor
@@ -139,6 +127,7 @@ jobs:
     name: Build .rpm (${{ matrix.arch }})
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -153,6 +142,9 @@ jobs:
 
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
       - name: Install cross-compilation tools
         if: matrix.arch == 'aarch64'
@@ -183,40 +175,17 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
         run: cargo generate-rpm -p crates/cli --target "$BUILD_TARGET"
 
-      - name: Import GPG key
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-        run: |
-          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-          # Export the key ID for RPM signing
-          GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | head -1 | awk '{print $2}' | cut -d'/' -f2)
-          echo "GPG_KEY_ID=$GPG_KEY_ID" >> "$GITHUB_ENV"
-
-      - name: Sign .rpm package
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
-          BUILD_TARGET: ${{ matrix.target }}
-        run: |
-          # Configure RPM to use our GPG key
-          echo "%_gpg_name $GPG_KEY_ID" >> ~/.rpmmacros
-          echo "%__gpg_sign_cmd %{__gpg} gpg --batch --no-armor --pinentry-mode loopback --passphrase-fd 0 -u \"%{_gpg_name}\" -sbo %{__signature_filename} %{__plaintext_filename}" >> ~/.rpmmacros
-          # Sign each RPM
-          for rpm in target/"$BUILD_TARGET"/generate-rpm/*.rpm; do
-            echo "$GPG_PASSPHRASE" | rpm --addsign "$rpm"
-          done
-
-      - name: Generate checksums
+      - name: Sign with Sigstore and generate checksums
         env:
           BUILD_TARGET: ${{ matrix.target }}
         run: |
           cd target/"$BUILD_TARGET"/generate-rpm
           for rpm in *.rpm; do
+            # Generate checksums
             sha256sum "$rpm" > "${rpm}.sha256"
             sha512sum "$rpm" > "${rpm}.sha512"
+            # Sign with Sigstore (keyless)
+            cosign sign-blob --yes --output-signature "${rpm}.sig" --output-certificate "${rpm}.crt" "$rpm"
           done
 
       - name: Upload .rpm artifact
@@ -227,6 +196,8 @@ jobs:
             target/${{ matrix.target }}/generate-rpm/*.rpm
             target/${{ matrix.target }}/generate-rpm/*.sha256
             target/${{ matrix.target }}/generate-rpm/*.sha512
+            target/${{ matrix.target }}/generate-rpm/*.sig
+            target/${{ matrix.target }}/generate-rpm/*.crt
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -236,6 +207,8 @@ jobs:
             target/${{ matrix.target }}/generate-rpm/*.rpm
             target/${{ matrix.target }}/generate-rpm/*.sha256
             target/${{ matrix.target }}/generate-rpm/*.sha512
+            target/${{ matrix.target }}/generate-rpm/*.sig
+            target/${{ matrix.target }}/generate-rpm/*.crt
 
   build-arch:
     needs: zizmor
@@ -251,6 +224,7 @@ jobs:
     name: Build .pkg.tar.zst (${{ matrix.arch }})
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -265,6 +239,9 @@ jobs:
 
       - name: Install packaging tools
         run: sudo apt-get update && sudo apt-get install -y fakeroot zstd
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
       - name: Install cross-compilation tools
         if: matrix.arch == 'aarch64'
@@ -307,27 +284,17 @@ jobs:
           cd "$PKG_DIR"
           fakeroot -- tar --zstd -cf "../moltis-${VERSION}-1-${MATRIX_ARCH}.pkg.tar.zst" .PKGINFO usr/
 
-      - name: Import GPG key
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-
-      - name: Sign .pkg.tar.zst and generate checksums
+      - name: Sign with Sigstore and generate checksums
         env:
           VERSION: ${{ steps.version.outputs.version }}
           MATRIX_ARCH: ${{ matrix.arch }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           PKG="moltis-${VERSION}-1-${MATRIX_ARCH}.pkg.tar.zst"
           # Generate checksums
           sha256sum "$PKG" > "${PKG}.sha256"
           sha512sum "$PKG" > "${PKG}.sha512"
-          # Sign with GPG if key is available
-          if [ -n "$GPG_PRIVATE_KEY" ]; then
-            echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor "$PKG"
-          fi
+          # Sign with Sigstore (keyless)
+          cosign sign-blob --yes --output-signature "${PKG}.sig" --output-certificate "${PKG}.crt" "$PKG"
 
       - name: Upload .pkg.tar.zst artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -335,9 +302,10 @@ jobs:
           name: moltis-${{ matrix.arch }}.pkg.tar.zst
           path: |
             *.pkg.tar.zst
-            *.pkg.tar.zst.asc
             *.pkg.tar.zst.sha256
             *.pkg.tar.zst.sha512
+            *.pkg.tar.zst.sig
+            *.pkg.tar.zst.crt
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -345,9 +313,10 @@ jobs:
         with:
           files: |
             *.pkg.tar.zst
-            *.pkg.tar.zst.asc
             *.pkg.tar.zst.sha256
             *.pkg.tar.zst.sha512
+            *.pkg.tar.zst.sig
+            *.pkg.tar.zst.crt
 
   build-appimage:
     needs: zizmor
@@ -363,6 +332,7 @@ jobs:
     name: Build AppImage (${{ matrix.arch }})
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -374,6 +344,9 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
       - name: Install cross-compilation tools
         if: matrix.arch == 'aarch64'
@@ -439,27 +412,17 @@ jobs:
           # Package - use --appimage-extract-and-run to avoid FUSE requirement in CI
           ARCH="$MATRIX_ARCH" ./appimagetool --appimage-extract-and-run "$APP_DIR" "moltis-${VERSION}-${MATRIX_ARCH}.AppImage"
 
-      - name: Import GPG key
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-
-      - name: Sign AppImage and generate checksums
+      - name: Sign with Sigstore and generate checksums
         env:
           VERSION: ${{ steps.version.outputs.version }}
           MATRIX_ARCH: ${{ matrix.arch }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           APPIMAGE="moltis-${VERSION}-${MATRIX_ARCH}.AppImage"
           # Generate checksums
           sha256sum "$APPIMAGE" > "${APPIMAGE}.sha256"
           sha512sum "$APPIMAGE" > "${APPIMAGE}.sha512"
-          # Sign with GPG if key is available
-          if [ -n "$GPG_PRIVATE_KEY" ]; then
-            echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor "$APPIMAGE"
-          fi
+          # Sign with Sigstore (keyless)
+          cosign sign-blob --yes --output-signature "${APPIMAGE}.sig" --output-certificate "${APPIMAGE}.crt" "$APPIMAGE"
 
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -467,9 +430,10 @@ jobs:
           name: moltis-${{ matrix.arch }}.AppImage
           path: |
             *.AppImage
-            *.AppImage.asc
             *.AppImage.sha256
             *.AppImage.sha512
+            *.AppImage.sig
+            *.AppImage.crt
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -477,9 +441,10 @@ jobs:
         with:
           files: |
             *.AppImage
-            *.AppImage.asc
             *.AppImage.sha256
             *.AppImage.sha512
+            *.AppImage.sig
+            *.AppImage.crt
 
   build-snap:
     needs: zizmor
@@ -487,21 +452,26 @@ jobs:
     name: Build Snap
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
       - uses: snapcore/action-build@b391f430cb2650fd359ed4d2cfe88b2c481800e0 # v1
         id: build-snap
 
-      - name: Generate checksums
+      - name: Sign with Sigstore and generate checksums
         env:
           SNAP_PATH: ${{ steps.build-snap.outputs.snap }}
         run: |
           sha256sum "$SNAP_PATH" > "${SNAP_PATH}.sha256"
           sha512sum "$SNAP_PATH" > "${SNAP_PATH}.sha512"
+          cosign sign-blob --yes --output-signature "${SNAP_PATH}.sig" --output-certificate "${SNAP_PATH}.crt" "$SNAP_PATH"
 
       - name: Upload Snap artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -511,6 +481,8 @@ jobs:
             ${{ steps.build-snap.outputs.snap }}
             ${{ steps.build-snap.outputs.snap }}.sha256
             ${{ steps.build-snap.outputs.snap }}.sha512
+            ${{ steps.build-snap.outputs.snap }}.sig
+            ${{ steps.build-snap.outputs.snap }}.crt
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -520,6 +492,8 @@ jobs:
             ${{ steps.build-snap.outputs.snap }}
             ${{ steps.build-snap.outputs.snap }}.sha256
             ${{ steps.build-snap.outputs.snap }}.sha512
+            ${{ steps.build-snap.outputs.snap }}.sig
+            ${{ steps.build-snap.outputs.snap }}.crt
 
   build-homebrew-binaries:
     needs: zizmor
@@ -539,6 +513,7 @@ jobs:
     name: Build binary (${{ matrix.target }})
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -550,6 +525,9 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -578,27 +556,17 @@ jobs:
           cp "target/$BUILD_TARGET/release/moltis" moltis
           tar czf "moltis-${VERSION}-${BUILD_TARGET}.tar.gz" moltis
 
-      - name: Import GPG key
-        if: startsWith(github.ref, 'refs/tags/') && env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-
-      - name: Sign tarball and generate checksums
+      - name: Sign with Sigstore and generate checksums
         env:
           VERSION: ${{ steps.version.outputs.version }}
           BUILD_TARGET: ${{ matrix.target }}
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           TARBALL="moltis-${VERSION}-${BUILD_TARGET}.tar.gz"
           # Generate checksums
-          sha256sum "$TARBALL" > "${TARBALL}.sha256"
-          sha512sum "$TARBALL" > "${TARBALL}.sha512"
-          # Sign with GPG if key is available
-          if [ -n "$GPG_PRIVATE_KEY" ]; then
-            echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor "$TARBALL"
-          fi
+          sha256sum "$TARBALL" > "${TARBALL}.sha256" || shasum -a 256 "$TARBALL" > "${TARBALL}.sha256"
+          sha512sum "$TARBALL" > "${TARBALL}.sha512" || shasum -a 512 "$TARBALL" > "${TARBALL}.sha512"
+          # Sign with Sigstore (keyless)
+          cosign sign-blob --yes --output-signature "${TARBALL}.sig" --output-certificate "${TARBALL}.crt" "$TARBALL"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -606,9 +574,10 @@ jobs:
           name: moltis-${{ matrix.target }}
           path: |
             *.tar.gz
-            *.tar.gz.asc
             *.tar.gz.sha256
             *.tar.gz.sha512
+            *.tar.gz.sig
+            *.tar.gz.crt
 
       - name: Upload to release
         if: startsWith(github.ref, 'refs/tags/')
@@ -616,9 +585,10 @@ jobs:
         with:
           files: |
             *.tar.gz
-            *.tar.gz.asc
             *.tar.gz.sha256
             *.tar.gz.sha512
+            *.tar.gz.sig
+            *.tar.gz.crt
 
   build-docker:
     needs: zizmor
@@ -627,7 +597,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-      id-token: write # Required for cosign signing
+      id-token: write # Required for Sigstore keyless signing
       attestations: write # Required for provenance attestations
 
     outputs:
@@ -718,36 +688,29 @@ jobs:
     name: Generate Release SBOM
     permissions:
       contents: write
+      id-token: write # Required for Sigstore keyless signing
 
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d7d6bc7722e3daa8354c50bcb52f4837da5e9b6a # v3.8.1
+
       - name: Install cargo-sbom
         run: cargo install cargo-sbom
 
-      - name: Generate SBOM (CycloneDX)
+      - name: Generate SBOM (CycloneDX and SPDX)
         run: |
           cargo sbom --output-format cyclonedx_json_1_4 > moltis-sbom.cdx.json
           cargo sbom --output-format spdx_json_2_3 > moltis-sbom.spdx.json
 
-      - name: Import GPG key
-        if: env.GPG_PRIVATE_KEY != ''
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-        run: echo "$GPG_PRIVATE_KEY" | gpg --batch --import
-
-      - name: Sign SBOM files
-        env:
-          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
-          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+      - name: Sign SBOMs with Sigstore and generate checksums
         run: |
           for sbom in moltis-sbom.cdx.json moltis-sbom.spdx.json; do
             sha256sum "$sbom" > "${sbom}.sha256"
-            if [ -n "$GPG_PRIVATE_KEY" ]; then
-              echo "$GPG_PASSPHRASE" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 --detach-sign --armor "$sbom"
-            fi
+            cosign sign-blob --yes --output-signature "${sbom}.sig" --output-certificate "${sbom}.crt" "$sbom"
           done
 
       - name: Upload SBOM to release
@@ -755,8 +718,10 @@ jobs:
         with:
           files: |
             moltis-sbom.cdx.json
-            moltis-sbom.cdx.json.asc
             moltis-sbom.cdx.json.sha256
+            moltis-sbom.cdx.json.sig
+            moltis-sbom.cdx.json.crt
             moltis-sbom.spdx.json
-            moltis-sbom.spdx.json.asc
             moltis-sbom.spdx.json.sha256
+            moltis-sbom.spdx.json.sig
+            moltis-sbom.spdx.json.crt
