@@ -262,7 +262,7 @@ jobs:
           pkgname = moltis
           pkgver = ${VERSION}-1
           pkgdesc = Rust version of moltbot
-          url = https://docs.molt.bot/
+          url = https://www.moltis.org/
           arch = $MATRIX_ARCH
           license = MIT
           PKGINFO

@@ -1,7 +1,7 @@
 [package]
 description       = "Rust version of moltbot"
 edition.workspace = true
-homepage          = "https://docs.molt.bot/"
+homepage          = "https://www.moltis.org/"
 license           = "MIT"
 name              = "moltis-cli"
 repository        = "https://github.com/moltis-org/moltis"
@@ -26,7 +26,7 @@ assets  = [{ dest = "/usr/bin/moltis", mode = "0755", source = "target/release/m
 license = "MIT"
 name    = "moltis"
 summary = "Rust version of moltbot"
-url     = "https://docs.molt.bot/"
+url     = "https://www.moltis.org/"
 
 [[bin]]
 name = "moltis"

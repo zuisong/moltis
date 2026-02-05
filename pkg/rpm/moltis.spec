@@ -3,7 +3,7 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Rust version of moltbot
 License:        MIT
-URL:            https://docs.molt.bot/
+URL:            https://www.moltis.org/
 
 %description
 Moltis is a Rust implementation of moltbot, a multi-feature bot system.

@@ -54,7 +54,7 @@ arch-pkg: build-release
     pkgname = moltis
     pkgver = ${VERSION}-1
     pkgdesc = Rust version of moltbot
-    url = https://docs.molt.bot/
+    url = https://www.moltis.org/
     arch = ${ARCH}
     license = MIT
     PKGINFO
@@ -77,7 +77,7 @@ arch-pkg-x86_64:
     pkgname = moltis
     pkgver = ${VERSION}-1
     pkgdesc = Rust version of moltbot
-    url = https://docs.molt.bot/
+    url = https://www.moltis.org/
     arch = x86_64
     license = MIT
     PKGINFO
@@ -100,7 +100,7 @@ arch-pkg-aarch64:
     pkgname = moltis
     pkgver = ${VERSION}-1
     pkgdesc = Rust version of moltbot
-    url = https://docs.molt.bot/
+    url = https://www.moltis.org/
     arch = aarch64
     license = MIT
     PKGINFO

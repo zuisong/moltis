@@ -21,7 +21,7 @@
 
           meta = with pkgs.lib; {
             description = "Rust version of moltbot";
-            homepage = "https://docs.molt.bot/";
+            homepage = "https://www.moltis.org/";
             license = licenses.mit;
             mainProgram = "moltis";
           };
