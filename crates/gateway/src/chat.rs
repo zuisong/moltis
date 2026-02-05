@@ -24,7 +24,7 @@ use {
         model::StreamEvent,
         prompt::{build_system_prompt_minimal, build_system_prompt_with_session},
         providers::ProviderRegistry,
-        runner::{RunnerEvent, run_agent_loop_with_context},
+        runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::ToolRegistry,
     },
     moltis_sessions::{metadata::SqliteSessionMetadata, store::SessionStore},
@@ -1174,6 +1174,10 @@ impl ChatService for LiveChatService {
                 StreamEvent::Delta(delta) => summary.push_str(&delta),
                 StreamEvent::Done(_) => break,
                 StreamEvent::Error(e) => return Err(format!("compact summarization failed: {e}")),
+                // Tool events not expected in summarization stream.
+                StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgumentsDelta { .. }
+                | StreamEvent::ToolCallComplete { .. } => {},
             }
         }
 
@@ -1646,7 +1650,7 @@ async fn run_with_tools(
 
     let provider_ref = provider.clone();
     let registry_guard = tool_registry.read().await;
-    let first_result = run_agent_loop_with_context(
+    let first_result = run_agent_loop_streaming(
         provider,
         &registry_guard,
         &system_prompt,
@@ -1708,7 +1712,7 @@ async fn run_with_tools(
                         Some(compacted_history)
                     };
 
-                    run_agent_loop_with_context(
+                    run_agent_loop_streaming(
                         provider_ref.clone(),
                         &registry_guard,
                         &system_prompt,
@@ -1841,6 +1845,10 @@ async fn compact_session(
             StreamEvent::Delta(delta) => summary.push_str(&delta),
             StreamEvent::Done(_) => break,
             StreamEvent::Error(e) => return Err(format!("compact summarization failed: {e}")),
+            // Tool events not expected in summarization stream.
+            StreamEvent::ToolCallStart { .. }
+            | StreamEvent::ToolCallArgumentsDelta { .. }
+            | StreamEvent::ToolCallComplete { .. } => {},
         }
     }
 
@@ -1971,6 +1979,10 @@ async fn run_streaming(
                 .await;
                 return None;
             },
+            // Tool events not expected in stream-only mode.
+            StreamEvent::ToolCallStart { .. }
+            | StreamEvent::ToolCallArgumentsDelta { .. }
+            | StreamEvent::ToolCallComplete { .. } => {},
         }
     }
     None

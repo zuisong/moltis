@@ -33,7 +33,7 @@ unsafe_code = "deny"
 edition    = "2024"
 license    = "MIT"
 repository = "https://github.com/penso/moltis"
-version    = "0.1.0"
+version    = "0.1.3"
 
 [workspace.dependencies]
 # Async runtime
