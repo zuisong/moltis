@@ -941,10 +941,7 @@ impl PluginsService for NoopPluginsService {
     }
 
     async fn skill_disable(&self, params: Value) -> ServiceResult {
-        let source = params
-            .get("source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let source = params.get("source").and_then(|v| v.as_str()).unwrap_or("");
 
         // Personal/project skills live as files — delete the directory to disable.
         if source == "personal" || source == "project" {
