@@ -108,9 +108,58 @@ test.describe("Sandboxes page – Shared home settings", () => {
 	});
 });
 
+/**
+ * Make the sandbox runtime appear available in the e2e environment.
+ *
+ * CI has no container daemon so gon/bootstrap report `backend: "none"`,
+ * which disables buttons (changing their accessible name to a long hint).
+ * This helper patches three layers:
+ *   1. `window.__MOLTIS__` (gon data embedded in HTML) — via addInitScript
+ *   2. `/api/gon` responses — via route interception
+ *   3. `/api/bootstrap` responses — via route interception
+ */
+async function mockSandboxAvailable(page) {
+	await page.addInitScript(() => {
+		var m = window.__MOLTIS__ || {};
+		m.sandbox = Object.assign(m.sandbox || {}, { backend: "docker" });
+		window.__MOLTIS__ = m;
+	});
+
+	await page.route("**/api/gon*", async (route) => {
+		var response = await route.fetch();
+		var json = await response.json();
+		json.sandbox = Object.assign(json.sandbox || {}, { backend: "docker" });
+		return route.fulfill({ response, json });
+	});
+
+	await page.route("**/api/bootstrap*", async (route) => {
+		var response = await route.fetch();
+		var json = await response.json();
+		json.sandbox = Object.assign(json.sandbox || {}, { backend: "docker" });
+		return route.fulfill({ response, json });
+	});
+}
+
 test.describe("Sandboxes page – Running Containers", () => {
+	test.beforeEach(async ({ page }) => {
+		await mockSandboxAvailable(page);
+	});
+
 	test("running containers section renders with heading and refresh button", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
+
+		// Mock containers so the loading state resolves immediately.
+		await page.route("**/api/sandbox/containers", (route, request) => {
+			if (request.method() === "GET") {
+				return route.fulfill({
+					status: 200,
+					contentType: "application/json",
+					body: JSON.stringify({ containers: [] }),
+				});
+			}
+			return route.continue();
+		});
+
 		await navigateAndWait(page, "/settings/sandboxes");
 
 		await expect(page.getByRole("heading", { name: "Sandboxes", exact: true })).toBeVisible();
@@ -122,7 +171,24 @@ test.describe("Sandboxes page – Running Containers", () => {
 
 	test("refresh button triggers container list fetch", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
+		var fetchCount = 0;
+
+		// Mock containers endpoint — tracks call count to verify refresh triggers a fetch.
+		await page.route("**/api/sandbox/containers", (route, request) => {
+			if (request.method() === "GET") {
+				fetchCount++;
+				return route.fulfill({
+					status: 200,
+					contentType: "application/json",
+					body: JSON.stringify({ containers: [] }),
+				});
+			}
+			return route.continue();
+		});
+
 		await navigateAndWait(page, "/settings/sandboxes");
+		await expect(page.getByRole("button", { name: "Refresh", exact: true })).toBeVisible();
+		const mountCount = fetchCount;
 
 		const fetchPromise = page.waitForResponse((r) => r.url().includes("/api/sandbox/containers") && r.status() === 200);
 		await page.getByRole("button", { name: "Refresh", exact: true }).click();
@@ -130,6 +196,7 @@ test.describe("Sandboxes page – Running Containers", () => {
 		const data = await response.json();
 		expect(data).toHaveProperty("containers");
 		expect(Array.isArray(data.containers)).toBe(true);
+		expect(fetchCount).toBeGreaterThan(mountCount);
 
 		expect(pageErrors).toEqual([]);
 	});
@@ -194,6 +261,18 @@ test.describe("Sandboxes page – Running Containers", () => {
 		const pageErrors = watchPageErrors(page);
 		var diskFetchCount = 0;
 
+		// Mock containers so the loading state resolves and "Refresh" button appears.
+		await page.route("**/api/sandbox/containers", (route, request) => {
+			if (request.method() === "GET") {
+				return route.fulfill({
+					status: 200,
+					contentType: "application/json",
+					body: JSON.stringify({ containers: [] }),
+				});
+			}
+			return route.continue();
+		});
+
 		// Track disk-usage fetches so we can assert the refresh triggered one.
 		await page.route("**/api/sandbox/disk-usage", (route) => {
 			diskFetchCount++;
@@ -217,9 +296,22 @@ test.describe("Sandboxes page – Running Containers", () => {
 
 	test("clean all endpoint responds correctly", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
+
+		// Mock the clean-all endpoint so the test doesn't depend on a real sandbox daemon.
+		await page.route("**/api/sandbox/containers/clean", (route, request) => {
+			if (request.method() === "POST") {
+				return route.fulfill({
+					status: 200,
+					contentType: "application/json",
+					body: JSON.stringify({ ok: true, removed: 0 }),
+				});
+			}
+			return route.continue();
+		});
+
 		await navigateAndWait(page, "/settings/sandboxes");
 
-		// Call the clean all API directly to verify the endpoint works
+		// Call the clean all API via page.evaluate; the route mock intercepts it.
 		const result = await page.evaluate(async () => {
 			const r = await fetch("/api/sandbox/containers/clean", { method: "POST" });
 			return { status: r.status, data: await r.json() };
@@ -233,6 +325,10 @@ test.describe("Sandboxes page – Running Containers", () => {
 });
 
 test.describe("Sandboxes page – Container error handling", () => {
+	test.beforeEach(async ({ page }) => {
+		await mockSandboxAvailable(page);
+	});
+
 	test("delete failure shows error message that clears on refresh", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 
