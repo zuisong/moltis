@@ -441,6 +441,7 @@ enable_agent_sidecar_files = false # Allow agents to write supplementary text fi
 # See https://modelcontextprotocol.io for available servers.
 
 [mcp]
+request_timeout_secs = 30        # Default timeout for MCP requests
 # Each server has a name and configuration:
 #
 # [mcp.servers.server-name]
@@ -448,6 +449,7 @@ enable_agent_sidecar_files = false # Allow agents to write supplementary text fi
 # args = ["-y", "@package/name"]  # Command arguments
 # env = {{ KEY = "value" }}         # Environment variables for the process
 # enabled = true                  # Whether this server is enabled
+# request_timeout_secs = 90       # Optional timeout override for this server
 # transport = "stdio"             # Transport: "stdio" (default) or "sse"
 # url = "http://..."              # URL for SSE transport
 # headers = {{ Authorization = "Bearer ${{TOKEN}}" }}  # Optional HTTP headers for SSE transport

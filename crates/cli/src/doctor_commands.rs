@@ -866,6 +866,7 @@ mod tests {
             url: None,
             oauth: None,
             display_name: None,
+            request_timeout_secs: None,
         };
         config.mcp.servers.insert("test".to_string(), entry);
 
@@ -888,6 +889,7 @@ mod tests {
             url: None,
             oauth: None,
             display_name: None,
+            request_timeout_secs: None,
         };
         config.mcp.servers.insert("broken".to_string(), entry);
 
@@ -910,6 +912,7 @@ mod tests {
             url: Some("http://localhost:3000/sse".to_string()),
             oauth: None,
             display_name: None,
+            request_timeout_secs: None,
         };
         config.mcp.servers.insert("remote".to_string(), entry);
 
@@ -932,6 +935,7 @@ mod tests {
             url: None,
             oauth: None,
             display_name: None,
+            request_timeout_secs: None,
         };
         config.mcp.servers.insert("broken-sse".to_string(), entry);
 
@@ -957,6 +961,7 @@ mod tests {
             url: None,
             oauth: None,
             display_name: None,
+            request_timeout_secs: None,
         };
         config.mcp.servers.insert("bad".to_string(), entry);
 

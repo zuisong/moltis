@@ -540,6 +540,10 @@ pub trait McpService: Send + Sync {
     async fn oauth_start(&self, params: Value) -> ServiceResult;
     /// Complete an MCP OAuth callback.
     async fn oauth_complete(&self, params: Value) -> ServiceResult;
+    /// Update the runtime MCP request timeout default.
+    async fn update_request_timeout(&self, _request_timeout_secs: u64) -> ServiceResult {
+        Ok(serde_json::json!({ "ok": true }))
+    }
 }
 
 pub struct NoopMcpService;

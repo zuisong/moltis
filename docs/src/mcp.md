@@ -33,6 +33,9 @@ After saving a remote server, Moltis only shows a sanitized URL plus header name
 Add servers to `moltis.toml`:
 
 ```toml
+[mcp]
+request_timeout_secs = 30
+
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"]
@@ -41,6 +44,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/projects"]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-github"]
 env = { GITHUB_TOKEN = "ghp_..." }
+request_timeout_secs = 90
 
 [mcp.servers.remote_api]
 transport = "sse"
@@ -70,6 +74,9 @@ Explore more at [mcp.so](https://mcp.so) and [GitHub MCP Servers](https://github
 ## Configuration Options
 
 ```toml
+[mcp]
+request_timeout_secs = 30       # Global default timeout for MCP requests
+
 [mcp.servers.my_server]
 command = "node"                # Required for stdio transport
 args = ["server.js"]            # Optional arguments
@@ -77,11 +84,35 @@ args = ["server.js"]            # Optional arguments
 # Optional environment variables
 env = { API_KEY = "secret", DEBUG = "true" }
 
+# Optional: per-server timeout override
+request_timeout_secs = 90
+
 # Optional: remote transport
 transport = "sse"               # "stdio" (default) or "sse"
 url = "https://mcp.example.com/mcp"  # Required when transport = "sse"
 headers = { "x-api-key" = "$REMOTE_MCP_KEY" }  # Optional request headers
 ```
+
+## Request Timeouts
+
+Moltis applies MCP request timeouts in two layers:
+
+- `mcp.request_timeout_secs` sets the global default for every MCP server
+- `mcp.servers.<name>.request_timeout_secs` optionally overrides that default for a specific server
+
+This is useful when most local MCP servers respond quickly, but one remote SSE server or one expensive tool server needs a longer timeout.
+
+```toml
+[mcp]
+request_timeout_secs = 30
+
+[mcp.servers.remote_api]
+transport = "sse"
+url = "https://mcp.example.com/mcp"
+request_timeout_secs = 120
+```
+
+In the web UI, the MCP settings page lets you edit both the global default timeout and the optional timeout override for each configured server.
 
 ## Remote SSE Secrets and Placeholders
 

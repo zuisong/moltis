@@ -1247,12 +1247,28 @@ fn default_true() -> bool {
 }
 
 /// MCP (Model Context Protocol) server configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpConfig {
+    /// Default timeout for MCP requests in seconds.
+    #[serde(default = "default_mcp_request_timeout_secs")]
+    pub request_timeout_secs: u64,
     /// Configured MCP servers, keyed by server name.
     #[serde(default)]
     pub servers: HashMap<String, McpServerEntry>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout_secs: default_mcp_request_timeout_secs(),
+            servers: HashMap::new(),
+        }
+    }
+}
+
+fn default_mcp_request_timeout_secs() -> u64 {
+    30
 }
 
 /// Configuration for a single MCP server.
@@ -1270,6 +1286,9 @@ pub struct McpServerEntry {
     /// Whether this server is enabled. Defaults to true.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Optional per-server MCP request timeout override in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_secs: Option<u64>,
     /// Transport type: "stdio" (default) or "sse".
     #[serde(default)]
     pub transport: String,
@@ -2425,6 +2444,33 @@ OPENROUTER_API_KEY = "sk-or-test"
         let config: MoltisConfig = toml::from_str("").unwrap();
         assert!(config.agents.default_preset.is_none());
         assert!(config.agents.presets.is_empty());
+    }
+
+    #[test]
+    fn mcp_config_defaults_request_timeout() {
+        let config: MoltisConfig = toml::from_str("").unwrap();
+        assert_eq!(config.mcp.request_timeout_secs, 30);
+    }
+
+    #[test]
+    fn mcp_server_entry_parses_request_timeout_override() {
+        let config: MoltisConfig = toml::from_str(
+            r#"
+[mcp.servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+request_timeout_secs = 75
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .mcp
+                .servers
+                .get("memory")
+                .and_then(|entry| entry.request_timeout_secs),
+            Some(75)
+        );
     }
 
     #[test]

@@ -206,10 +206,13 @@ Connect to Model Context Protocol servers:
 
 ```toml
 [mcp]
+request_timeout_secs = 30
+                                    # Default timeout for MCP requests (seconds)
 
 [mcp.servers.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed"]
+request_timeout_secs = 90        # Optional override for this server
 
 [mcp.servers.github]
 command = "npx"

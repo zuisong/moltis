@@ -12,7 +12,10 @@ use {
     moltis_protocol::{ErrorShape, error_codes},
 };
 
-use crate::broadcast::{BroadcastOpts, broadcast};
+use crate::{
+    broadcast::{BroadcastOpts, broadcast},
+    services::ServiceError,
+};
 
 use super::{MethodContext, MethodRegistry};
 
@@ -2827,6 +2830,70 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .update(ctx.params.clone())
                     .await
                     .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "mcp.config.get",
+        Box::new(|_ctx| {
+            Box::pin(async move {
+                let config = moltis_config::discover_and_load();
+                Ok(serde_json::json!({
+                    "request_timeout_secs": config.mcp.request_timeout_secs,
+                }))
+            })
+        }),
+    );
+    reg.register(
+        "mcp.config.update",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let request_timeout_secs = match ctx.params.get("request_timeout_secs") {
+                    None => {
+                        return Err(ServiceError::message(
+                            "missing 'request_timeout_secs' parameter",
+                        )
+                        .into());
+                    },
+                    Some(value) => value.as_u64().ok_or_else(|| {
+                        ServiceError::message(
+                            "invalid 'request_timeout_secs' parameter: expected a positive integer",
+                        )
+                    })?,
+                };
+
+                if request_timeout_secs == 0 {
+                    return Err(ServiceError::message(
+                        "request_timeout_secs must be greater than 0",
+                    )
+                    .into());
+                }
+
+                // Update in-memory first (infallible atomic store), then persist
+                // to disk.  This ordering means a crash between the two steps
+                // leaves the runtime correct and only the file stale — the next
+                // restart reads the file anyway.
+                ctx.state
+                    .services
+                    .mcp
+                    .update_request_timeout(request_timeout_secs)
+                    .await
+                    .map_err(ErrorShape::from)?;
+
+                if let Err(e) = moltis_config::update_config(|cfg| {
+                    cfg.mcp.request_timeout_secs = request_timeout_secs;
+                }) {
+                    tracing::warn!(error = %e, "failed to persist MCP config");
+                    return Err(ServiceError::message(format!(
+                        "failed to persist MCP config: {e}"
+                    ))
+                    .into());
+                }
+
+                Ok(serde_json::json!({
+                    "request_timeout_secs": request_timeout_secs,
+                    "restart_required": true,
+                }))
             })
         }),
     );

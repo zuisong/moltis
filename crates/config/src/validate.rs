@@ -273,6 +273,7 @@ fn build_schema_map() -> KnownKeys {
             ("args", Leaf),
             ("env", Map(Box::new(Leaf))),
             ("enabled", Leaf),
+            ("request_timeout_secs", Leaf),
             ("transport", Leaf),
             ("url", Leaf),
             ("headers", Map(Box::new(Leaf))),
@@ -390,10 +391,10 @@ fn build_schema_map() -> KnownKeys {
         ),
         (
             "mcp",
-            Struct(HashMap::from([(
-                "servers",
-                Map(Box::new(mcp_server_entry())),
-            )])),
+            Struct(HashMap::from([
+                ("request_timeout_secs", Leaf),
+                ("servers", Map(Box::new(mcp_server_entry()))),
+            ])),
         ),
         ("channels", MapWithFields {
             // Dynamic keys: extra channel types via #[serde(flatten)]
@@ -1071,6 +1072,26 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             path: "tools.agent_max_iterations".into(),
             message: "tools.agent_max_iterations must be at least 1".into(),
         });
+    }
+
+    if config.mcp.request_timeout_secs == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "mcp.request_timeout_secs".into(),
+            message: "mcp.request_timeout_secs must be at least 1".into(),
+        });
+    }
+
+    for (name, server) in &config.mcp.servers {
+        if server.request_timeout_secs == Some(0) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                category: "invalid-value",
+                path: format!("mcp.servers.{name}.request_timeout_secs"),
+                message: "mcp server request_timeout_secs must be at least 1".into(),
+            });
+        }
     }
 
     // agents.default_preset should reference an existing preset key.
@@ -2323,6 +2344,45 @@ agent_max_iterations = 0
         assert!(
             invalid.is_some(),
             "expected tools.agent_max_iterations invalid-value error, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn mcp_request_timeout_must_be_positive() {
+        let toml = r#"
+[mcp]
+request_timeout_secs = 0
+"#;
+        let result = validate_toml_str(toml);
+        let invalid = result.diagnostics.iter().find(|d| {
+            d.path == "mcp.request_timeout_secs"
+                && d.severity == Severity::Error
+                && d.category == "invalid-value"
+        });
+        assert!(
+            invalid.is_some(),
+            "expected mcp.request_timeout_secs invalid-value error, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn mcp_server_request_timeout_override_must_be_positive() {
+        let toml = r#"
+[mcp.servers.memory]
+command = "npx"
+request_timeout_secs = 0
+"#;
+        let result = validate_toml_str(toml);
+        let invalid = result.diagnostics.iter().find(|d| {
+            d.path == "mcp.servers.memory.request_timeout_secs"
+                && d.severity == Severity::Error
+                && d.category == "invalid-value"
+        });
+        assert!(
+            invalid.is_some(),
+            "expected mcp server request_timeout_secs invalid-value error, got: {:?}",
             result.diagnostics
         );
     }
