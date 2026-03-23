@@ -1349,6 +1349,36 @@ fn log_startup_config_storage_diagnostics() {
     }
 }
 
+async fn maybe_deliver_cron_output(
+    outbound: Option<Arc<dyn moltis_channels::ChannelOutbound>>,
+    req: &moltis_cron::service::AgentTurnRequest,
+    delivery_text: &str,
+) {
+    if !req.deliver || delivery_text.trim().is_empty() {
+        return;
+    }
+
+    let (Some(channel_account), Some(chat_id)) = (&req.channel, &req.to) else {
+        return;
+    };
+
+    if let Some(outbound) = outbound {
+        if let Err(error) = outbound
+            .send_text(channel_account, chat_id, delivery_text, None)
+            .await
+        {
+            tracing::warn!(
+                channel = %channel_account,
+                to = %chat_id,
+                error = %error,
+                "cron job channel delivery failed"
+            );
+        }
+    } else {
+        tracing::debug!("cron job delivery requested but no channel outbound configured");
+    }
+}
+
 /// A fully wired gateway (app router + shared state), ready to be served.
 ///
 /// Created by [`prepare_gateway`]. Callers bind their own TCP listener and
@@ -1392,6 +1422,25 @@ pub(crate) struct BannerMeta {
     pub tailscale_mode: TailscaleMode,
     #[cfg(feature = "tailscale")]
     pub tailscale_reset_on_exit: bool,
+}
+
+fn restore_saved_local_llm_models(
+    registry: &mut ProviderRegistry,
+    providers_config: &moltis_config::schema::ProvidersConfig,
+) {
+    #[cfg(feature = "local-llm")]
+    {
+        if !providers_config.is_enabled("local") {
+            return;
+        }
+
+        crate::local_llm_setup::register_saved_local_models(registry, providers_config);
+    }
+
+    #[cfg(not(feature = "local-llm"))]
+    {
+        let _ = (registry, providers_config);
+    }
 }
 
 /// Prepare the full gateway: load config, run migrations, wire services,
@@ -1511,6 +1560,10 @@ pub async fn prepare_gateway(
             &config_env_overrides,
         ),
     ));
+    {
+        let mut reg = registry.write().await;
+        restore_saved_local_llm_models(&mut reg, &effective_providers);
+    }
     let (provider_summary, providers_available_at_startup) = {
         let reg = registry.read().await;
         log_startup_model_inventory(&reg);
@@ -2260,29 +2313,8 @@ pub async fn prepare_gateway(
                 text.clone()
             };
 
-            // Deliver output to a channel if requested.
-            if req.deliver
-                && !delivery_text.trim().is_empty()
-                && let (Some(channel_account), Some(chat_id)) = (&req.channel, &req.to)
-            {
-                if let Some(outbound) = state.services.channel_outbound_arc() {
-                    if let Err(e) = outbound
-                        .send_text(channel_account, chat_id, &delivery_text, None)
-                        .await
-                    {
-                        tracing::warn!(
-                            channel = %channel_account,
-                            to = %chat_id,
-                            error = %e,
-                            "cron job channel delivery failed"
-                        );
-                    }
-                } else {
-                    tracing::debug!(
-                        "cron job delivery requested but no channel outbound configured"
-                    );
-                }
-            }
+            maybe_deliver_cron_output(state.services.channel_outbound_arc(), &req, &delivery_text)
+                .await;
 
             Ok(moltis_cron::service::AgentTurnResult {
                 output: text,
@@ -3437,6 +3469,7 @@ pub async fn prepare_gateway(
         let registry_for_startup_discovery = Arc::clone(&registry);
         let state_for_startup_discovery = Arc::clone(&state);
         let provider_config_for_startup_discovery = effective_providers.clone();
+        let provider_config_for_registry_rebuild = provider_config_for_startup_discovery.clone();
         let env_overrides_for_startup_discovery = config_env_overrides.clone();
         tokio::spawn(async move {
             let startup_discovery_started = std::time::Instant::now();
@@ -3456,9 +3489,9 @@ pub async fn prepare_gateway(
             };
 
             let prefetched_models: usize = prefetched.values().map(Vec::len).sum();
-            let new_registry = match tokio::task::spawn_blocking(move || {
+            let mut new_registry = match tokio::task::spawn_blocking(move || {
                 ProviderRegistry::from_config_with_prefetched(
-                    &provider_config_for_startup_discovery,
+                    &provider_config_for_registry_rebuild,
                     &env_overrides_for_startup_discovery,
                     &prefetched,
                 )
@@ -3475,6 +3508,10 @@ pub async fn prepare_gateway(
                 },
             };
 
+            restore_saved_local_llm_models(
+                &mut new_registry,
+                &provider_config_for_startup_discovery,
+            );
             let provider_summary = new_registry.provider_summary();
             let model_count = new_registry.list_models().len();
             {
@@ -3825,6 +3862,11 @@ pub async fn prepare_gateway(
             tool_registry.register(Box::new(moltis_tools::skill_tools::DeleteSkillTool::new(
                 data_dir.clone(),
             )));
+            if config.skills.enable_agent_sidecar_files {
+                tool_registry.register(Box::new(
+                    moltis_tools::skill_tools::WriteSkillFilesTool::new(data_dir.clone()),
+                ));
+            }
         }
 
         // Register branch session tool for session forking.
@@ -6312,8 +6354,156 @@ pub(crate) async fn discover_and_build_hooks(
 mod tests {
     use {
         super::*,
-        std::collections::{HashMap, HashSet},
+        async_trait::async_trait,
+        moltis_common::types::ReplyPayload,
+        moltis_providers::raw_model_id,
+        secrecy::Secret,
+        std::{
+            collections::{HashMap, HashSet},
+            sync::OnceLock,
+        },
+        tokio::sync::Mutex,
     };
+
+    fn local_model_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
+    struct LocalModelConfigTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl LocalModelConfigTestGuard {
+        fn new() -> Self {
+            Self {
+                _lock: local_model_config_test_lock(),
+            }
+        }
+    }
+
+    impl Drop for LocalModelConfigTestGuard {
+        fn drop(&mut self) {
+            moltis_config::clear_config_dir();
+            moltis_config::clear_data_dir();
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct DeliveredMessage {
+        account_id: String,
+        to: String,
+        text: String,
+        reply_to: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct RecordingChannelOutbound {
+        delivered: Mutex<Vec<DeliveredMessage>>,
+    }
+
+    #[async_trait]
+    impl moltis_channels::ChannelOutbound for RecordingChannelOutbound {
+        async fn send_text(
+            &self,
+            account_id: &str,
+            to: &str,
+            text: &str,
+            reply_to: Option<&str>,
+        ) -> moltis_channels::Result<()> {
+            self.delivered.lock().await.push(DeliveredMessage {
+                account_id: account_id.to_string(),
+                to: to.to_string(),
+                text: text.to_string(),
+                reply_to: reply_to.map(ToString::to_string),
+            });
+            Ok(())
+        }
+
+        async fn send_media(
+            &self,
+            _account_id: &str,
+            _to: &str,
+            _payload: &ReplyPayload,
+            _reply_to: Option<&str>,
+        ) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn cron_delivery_request() -> moltis_cron::service::AgentTurnRequest {
+        moltis_cron::service::AgentTurnRequest {
+            message: "Run background summary".to_string(),
+            model: None,
+            timeout_secs: None,
+            deliver: true,
+            channel: Some("bot-main".to_string()),
+            to: Some("123456".to_string()),
+            session_target: moltis_cron::types::SessionTarget::Isolated,
+            sandbox: moltis_cron::types::CronSandboxConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn maybe_deliver_cron_output_sends_to_configured_channel() {
+        let outbound = Arc::new(RecordingChannelOutbound::default());
+        let req = cron_delivery_request();
+
+        maybe_deliver_cron_output(
+            Some(outbound.clone() as Arc<dyn moltis_channels::ChannelOutbound>),
+            &req,
+            "Daily digest ready",
+        )
+        .await;
+
+        let delivered = outbound.delivered.lock().await.clone();
+        assert_eq!(delivered, vec![DeliveredMessage {
+            account_id: "bot-main".to_string(),
+            to: "123456".to_string(),
+            text: "Daily digest ready".to_string(),
+            reply_to: None,
+        }]);
+    }
+
+    #[tokio::test]
+    async fn maybe_deliver_cron_output_skips_blank_messages() {
+        let outbound = Arc::new(RecordingChannelOutbound::default());
+        let req = cron_delivery_request();
+
+        maybe_deliver_cron_output(
+            Some(outbound.clone() as Arc<dyn moltis_channels::ChannelOutbound>),
+            &req,
+            "   ",
+        )
+        .await;
+
+        assert!(outbound.delivered.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_deliver_cron_output_skips_when_deliver_is_false() {
+        let outbound = Arc::new(RecordingChannelOutbound::default());
+        let mut req = cron_delivery_request();
+        req.deliver = false;
+
+        maybe_deliver_cron_output(
+            Some(outbound.clone() as Arc<dyn moltis_channels::ChannelOutbound>),
+            &req,
+            "should not be sent",
+        )
+        .await;
+
+        assert!(outbound.delivered.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_deliver_cron_output_skips_when_no_outbound_configured() {
+        let req = cron_delivery_request();
+
+        maybe_deliver_cron_output(None, &req, "Daily digest ready").await;
+    }
 
     #[test]
     fn summarize_model_ids_for_logs_returns_all_when_within_limit() {
@@ -6364,6 +6554,107 @@ mod tests {
         let manager = approval_manager_from_config(&cfg);
         assert_eq!(manager.mode, ApprovalMode::OnMiss);
         assert_eq!(manager.security_level, SecurityLevel::Allowlist);
+    }
+
+    #[cfg(feature = "local-llm")]
+    #[test]
+    fn restore_saved_local_llm_models_rehydrates_custom_models_after_registry_rebuild() {
+        let _guard = LocalModelConfigTestGuard::new();
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+
+        let saved_entry = crate::local_llm_setup::LocalModelEntry {
+            model_id: "custom-qwen".into(),
+            model_path: Some(PathBuf::from("/tmp/custom-qwen.gguf")),
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        crate::local_llm_setup::LocalLlmConfig {
+            models: vec![saved_entry.clone()],
+        }
+        .save()
+        .unwrap();
+
+        let mut rebuilt_registry = ProviderRegistry::empty();
+        let remote_provider = Arc::new(moltis_providers::openai::OpenAiProvider::new(
+            Secret::new("test-key".into()),
+            "remote-model".into(),
+            "https://example.com".into(),
+        ));
+        rebuilt_registry.register(
+            moltis_providers::ModelInfo {
+                id: "remote-model".into(),
+                provider: "openai".into(),
+                display_name: "Remote Model".into(),
+                created_at: None,
+            },
+            remote_provider,
+        );
+
+        restore_saved_local_llm_models(
+            &mut rebuilt_registry,
+            &moltis_config::schema::ProvidersConfig::default(),
+        );
+
+        assert!(
+            rebuilt_registry
+                .list_models()
+                .iter()
+                .any(|model| model.provider == "openai")
+        );
+        assert!(
+            rebuilt_registry
+                .list_models()
+                .iter()
+                .any(|model| raw_model_id(&model.id) == saved_entry.model_id)
+        );
+    }
+
+    #[cfg(feature = "local-llm")]
+    #[test]
+    fn restore_saved_local_llm_models_skips_when_local_provider_is_disabled() {
+        let _guard = LocalModelConfigTestGuard::new();
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+
+        let saved_entry = crate::local_llm_setup::LocalModelEntry {
+            model_id: "custom-qwen".into(),
+            model_path: Some(PathBuf::from("/tmp/custom-qwen.gguf")),
+            hf_repo: Some("Qwen/Qwen3-4B-GGUF".into()),
+            hf_filename: Some("Qwen3-4B-Q4_K_M.gguf".into()),
+            gpu_layers: 0,
+            backend: "GGUF".into(),
+        };
+        crate::local_llm_setup::LocalLlmConfig {
+            models: vec![saved_entry.clone()],
+        }
+        .save()
+        .unwrap();
+
+        let mut providers_config = moltis_config::schema::ProvidersConfig::default();
+        providers_config.providers.insert(
+            "local-llm".into(),
+            moltis_config::schema::ProviderEntry {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let mut rebuilt_registry = ProviderRegistry::empty();
+        restore_saved_local_llm_models(&mut rebuilt_registry, &providers_config);
+
+        assert!(
+            !rebuilt_registry
+                .list_models()
+                .iter()
+                .any(|model| raw_model_id(&model.id) == saved_entry.model_id)
+        );
     }
 
     #[tokio::test]
