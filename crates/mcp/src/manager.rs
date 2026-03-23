@@ -39,7 +39,7 @@ pub struct ServerStatus {
     pub env: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_timeout_secs: Option<u64>,
-    pub effective_request_timeout_secs: u64,
+    pub configured_request_timeout_secs: u64,
     pub transport: crate::registry::TransportType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -448,7 +448,7 @@ impl McpManager {
                     config.env.clone()
                 },
                 request_timeout_secs: config.request_timeout_secs,
-                effective_request_timeout_secs: self.effective_timeout_secs_for(config),
+                configured_request_timeout_secs: self.effective_timeout_secs_for(config),
                 transport: config.transport,
                 url: config
                     .url
@@ -740,7 +740,7 @@ mod tests {
 
         let statuses = mgr.status_all().await;
         assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].effective_request_timeout_secs, 1);
+        assert_eq!(statuses[0].configured_request_timeout_secs, 1);
     }
 
     #[tokio::test]
@@ -756,7 +756,7 @@ mod tests {
 
         let statuses = mgr.status_all().await;
         assert_eq!(statuses.len(), 1);
-        assert_eq!(statuses[0].effective_request_timeout_secs, 75);
+        assert_eq!(statuses[0].configured_request_timeout_secs, 75);
     }
 
     #[tokio::test]

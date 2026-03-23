@@ -912,7 +912,7 @@ function ServerCard({ server }) {
         <${renderServerName} server=${server} />
         <span class="text-[0.62rem] px-1.5 py-px rounded-full bg-[var(--surface2)] text-[var(--muted)] font-medium">${server.state || "stopped"}</span>
         <span class="text-[0.62rem] px-1.5 py-px rounded-full bg-[var(--surface2)] text-[var(--muted)] font-medium">${transportLabel(server.transport)}</span>
-        <span class="text-[0.62rem] px-1.5 py-px rounded-full bg-[var(--surface2)] text-[var(--muted)] font-medium">timeout ${server.effective_request_timeout_secs}s</span>
+        <span class="text-[0.62rem] px-1.5 py-px rounded-full bg-[var(--surface2)] text-[var(--muted)] font-medium">timeout ${server.configured_request_timeout_secs}s</span>
         <span class="text-xs text-[var(--muted)]">${server.tool_count} tool${server.tool_count !== 1 ? "s" : ""}${server.state === "running" && server.tool_count > 0 ? ` · ~${server.tool_count * 300} tokens` : ""}</span>
       </div>
       <div class="flex items-center gap-1.5">
@@ -1071,7 +1071,7 @@ function ServerCard({ server }) {
 	        <span class="text-[var(--text)]">
 	          ${
 							server.request_timeout_secs == null
-								? `${server.effective_request_timeout_secs}s (global default)`
+								? `${server.configured_request_timeout_secs}s (global default)`
 								: `${server.request_timeout_secs}s override`
 						}
 	        </span>
@@ -1086,7 +1086,7 @@ function ServerCard({ server }) {
         <span class="text-[var(--text)]">
           ${
 						server.request_timeout_secs == null
-							? `${server.effective_request_timeout_secs}s (global default)`
+							? `${server.configured_request_timeout_secs}s (global default)`
 							: `${server.request_timeout_secs}s override`
 					}
         </span>

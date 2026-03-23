@@ -485,10 +485,10 @@ impl McpTransport for SseTransport {
                 if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
                     return true;
                 }
-                if !resp.status().is_success() {
-                    return false;
-                }
-                Self::response_is_event_stream(&resp)
+                // Any successful response means the server is reachable —
+                // Streamable HTTP servers may reply with application/json
+                // rather than text/event-stream, which is equally valid.
+                resp.status().is_success()
             },
             Err(_) => false,
         }
