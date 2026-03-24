@@ -118,14 +118,10 @@ fn normalize_schedule_kind(raw: &str) -> Option<&'static str> {
 }
 
 fn normalize_schedule_value(schedule: &mut Value) -> Result<()> {
-    // Rescue double-serialised objects before interpreting plain strings as cron
-    // expressions.  A bare cron expression like "0 9 * * 1" will fail JSON
+    // Rescue double-serialised objects before interpreting plain strings as
+    // cron expressions.  A bare cron expr like "0 9 * * 1" will fail JSON
     // parsing and fall through to the String arm below.
-    if let Value::String(s) = &*schedule {
-        if let Ok(parsed @ Value::Object(_)) = serde_json::from_str(s.trim()) {
-            *schedule = parsed;
-        }
-    }
+    rescue_stringified_object(schedule);
     match schedule {
         Value::String(expr) => {
             let expr = expr.trim();
@@ -285,11 +281,7 @@ fn prefers_system_event(session_target_hint: Option<&str>) -> bool {
 fn normalize_payload_value(payload: &mut Value, session_target_hint: Option<&str>) -> Result<()> {
     // Rescue double-serialised objects before interpreting plain strings as
     // shorthand message text.
-    if let Value::String(s) = &*payload {
-        if let Ok(parsed @ Value::Object(_)) = serde_json::from_str(s.trim()) {
-            *payload = parsed;
-        }
-    }
+    rescue_stringified_object(payload);
     match payload {
         Value::String(message) => {
             let message = message.trim();
@@ -448,11 +440,7 @@ fn parse_sandbox_enabled(value: &Value, field: &str) -> Result<bool> {
 }
 
 fn normalize_sandbox_value(sandbox: &mut Value, field: &str) -> Result<()> {
-    if let Value::String(s) = &*sandbox {
-        if let Ok(parsed @ Value::Object(_)) = serde_json::from_str(s.trim()) {
-            *sandbox = parsed;
-        }
-    }
+    rescue_stringified_object(sandbox);
     match sandbox {
         Value::Bool(enabled) => {
             *sandbox = json!({ "enabled": enabled });
@@ -578,20 +566,21 @@ fn normalize_sandbox_field(obj: &mut Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
-/// If `value` is a JSON string that parses to an object, return the parsed
-/// object.  Otherwise return the value unchanged.  This rescues the common
-/// LLM mistake of double-serialising an object parameter.
-fn try_parse_stringified_object(value: Value) -> Value {
-    if let Value::String(ref s) = value {
+/// If `v` is a JSON string that parses to an object, replace it in-place.
+/// This rescues the common LLM mistake of double-serialising an object
+/// parameter.
+fn rescue_stringified_object(v: &mut Value) {
+    if let Value::String(s) = &*v {
         if let Ok(parsed @ Value::Object(_)) = serde_json::from_str(s.trim()) {
-            return parsed;
+            tracing::debug!(original = %s, "rescued double-serialised object parameter");
+            *v = parsed;
         }
     }
-    value
 }
 
 fn normalize_job_value(job: &Value) -> Result<Value> {
-    let mut normalized = try_parse_stringified_object(job.clone());
+    let mut normalized = job.clone();
+    rescue_stringified_object(&mut normalized);
     let obj = normalized
         .as_object_mut()
         .ok_or_else(|| Error::message("job must be an object"))?;
@@ -618,7 +607,8 @@ fn normalize_job_value(job: &Value) -> Result<Value> {
 }
 
 fn normalize_patch_value(patch: &Value) -> Result<Value> {
-    let mut normalized = try_parse_stringified_object(patch.clone());
+    let mut normalized = patch.clone();
+    rescue_stringified_object(&mut normalized);
     let obj = normalized
         .as_object_mut()
         .ok_or_else(|| Error::message("patch must be an object"))?;
@@ -796,8 +786,9 @@ impl AgentTool for CronTool {
                             .ok_or_else(|| Error::message("missing 'job' parameter for add"))?;
                         if obj.contains_key("schedule") || obj.contains_key("payload") {
                             let mut job_obj = Map::new();
+                            const ACTION_KEYS: &[&str] = &["action", "force", "id", "limit"];
                             for (k, v) in obj {
-                                if k != "action" && k != "force" {
+                                if !ACTION_KEYS.contains(&k.as_str()) {
                                     job_obj.insert(k.clone(), v.clone());
                                 }
                             }
