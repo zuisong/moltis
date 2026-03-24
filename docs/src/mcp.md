@@ -312,7 +312,7 @@ args = [
   "run", "--rm", "-i",
   "-v", "/data:/data",
   "--entrypoint", "npx",
-  "node:20-alpine",
+  "node:22-alpine",
   "-y", "@modelcontextprotocol/server-filesystem", "/data",
 ]
 

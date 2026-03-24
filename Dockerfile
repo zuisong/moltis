@@ -56,7 +56,7 @@ FROM debian:bookworm-slim
 # - ca-certificates: for HTTPS connections to LLM providers
 # - chromium: headless browser for the browser tool (web search/fetch)
 # - curl: makes it possible to run healthchecks from docker
-# - nodejs + npm: run stdio-based MCP servers (most are npm packages)
+# - nodejs (Node 22 LTS via NodeSource): run stdio-based MCP servers (most are npm packages)
 # - sudo: allows moltis user to install packages at runtime (passwordless)
 # - docker-ce-cli + docker-buildx-plugin: Docker CLI for sandbox execution
 #   (talks to mounted socket, no daemon in-container)
@@ -70,11 +70,11 @@ RUN apt-get update -qq && \
         curl \
         gnupg \
         libgomp1 \
-        nodejs \
-        npm \
         sudo \
         tmux \
         vim-tiny && \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -yqq --no-install-recommends nodejs && \
     install -m 0755 -d /etc/apt/keyrings && \
     curl -fsSL https://download.docker.com/linux/debian/gpg \
         | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
@@ -102,11 +102,11 @@ COPY --from=builder /build/target/wasm32-wasip2/release/moltis_wasm_web_fetch.wa
 COPY --from=builder /build/target/wasm32-wasip2/release/moltis_wasm_web_search.wasm /usr/share/moltis/wasm/
 
 # Create config and data directories
-RUN mkdir -p /home/moltis/.config/moltis /home/moltis/.moltis && \
-    chown -R moltis:moltis /home/moltis/.config /home/moltis/.moltis
+RUN mkdir -p /home/moltis/.config/moltis /home/moltis/.moltis /home/moltis/.npm && \
+    chown -R moltis:moltis /home/moltis/.config /home/moltis/.moltis /home/moltis/.npm
 
 # Volume mount points for persistence and container runtime
-VOLUME ["/home/moltis/.config/moltis", "/home/moltis/.moltis", "/var/run/docker.sock"]
+VOLUME ["/home/moltis/.config/moltis", "/home/moltis/.moltis", "/home/moltis/.npm", "/var/run/docker.sock"]
 
 USER moltis
 WORKDIR /home/moltis
