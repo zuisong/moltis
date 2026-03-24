@@ -7005,10 +7005,11 @@ mod tests {
                 panic!("failed to parse bind address '{bind}': {e}");
             });
             let addr = SocketAddr::new(ip, port);
-            assert!(
-                addr.is_ipv6() || addr.is_ipv4(),
-                "expected a valid SocketAddr for bind={bind}"
-            );
+            if bind.contains(':') {
+                assert!(addr.is_ipv6(), "expected IPv6 SocketAddr for bind={bind}");
+            } else {
+                assert!(addr.is_ipv4(), "expected IPv4 SocketAddr for bind={bind}");
+            }
         }
     }
 
