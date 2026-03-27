@@ -1084,6 +1084,7 @@
         // Intercept nav tab clicks to prevent default hash jump
         document.querySelectorAll('.nav-tab').forEach(function(tab) {
             tab.addEventListener('click', function(e) {
+                if (!tab.dataset.page) return; // let non-SPA links navigate normally
                 e.preventDefault();
                 navigateTo(tab.dataset.page);
             });
