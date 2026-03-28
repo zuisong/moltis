@@ -4874,7 +4874,9 @@ mod tests {
             std::sync::atomic::{AtomicBool, Ordering},
         };
 
-        static COMPLETIONS_CALLED: AtomicBool = AtomicBool::new(false);
+        let completions_called = Arc::new(AtomicBool::new(false));
+        let cc1 = completions_called.clone();
+        let cc2 = completions_called.clone();
 
         let app = Router::new()
             .route(
@@ -4889,15 +4891,15 @@ mod tests {
             )
             .route(
                 "/chat/completions",
-                post(|| async {
-                    COMPLETIONS_CALLED.store(true, Ordering::SeqCst);
+                post(move || async move {
+                    cc1.store(true, Ordering::SeqCst);
                     StatusCode::INTERNAL_SERVER_ERROR
                 }),
             )
             .route(
                 "/v1/chat/completions",
-                post(|| async {
-                    COMPLETIONS_CALLED.store(true, Ordering::SeqCst);
+                post(move || async move {
+                    cc2.store(true, Ordering::SeqCst);
                     StatusCode::INTERNAL_SERVER_ERROR
                 }),
             );
@@ -4909,8 +4911,6 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-
-        COMPLETIONS_CALLED.store(false, Ordering::SeqCst);
 
         let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
             &ProvidersConfig::default(),
@@ -4932,7 +4932,7 @@ mod tests {
             "should return discovered models"
         );
         assert!(
-            !COMPLETIONS_CALLED.load(Ordering::SeqCst),
+            !completions_called.load(Ordering::SeqCst),
             "chat completions endpoint must NOT be called when model is unset — \
              the discovery path should return models directly (issue #502)"
         );
