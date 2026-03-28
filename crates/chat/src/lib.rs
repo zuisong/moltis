@@ -4387,12 +4387,19 @@ impl ChatService for LiveChatService {
             return Err("compact produced empty summary".into());
         }
 
-        // Replace history with a single system message containing the summary.
-        // Using the system role (not assistant) avoids breaking providers like
-        // llama.cpp that require every assistant message to follow a user message.
-        let compacted_msg = PersistedMessage::System {
-            content: format!("[Conversation Summary]\n\n{summary}"),
+        // Replace history with a single user message containing the summary.
+        // Using the user role (not assistant) avoids breaking providers like
+        // llama.cpp that require every assistant message to follow a user message,
+        // and ensures the summary stays in the conversation turn array for
+        // providers using the Responses API (which promotes system messages to
+        // instructions).
+        let compacted_msg = PersistedMessage::User {
+            content: MessageContent::Text(format!("[Conversation Summary]\n\n{summary}")),
             created_at: Some(now_ms()),
+            audio: None,
+            channel: None,
+            seq: None,
+            run_id: None,
         };
         let compacted = vec![compacted_msg.to_value()];
 
@@ -6893,11 +6900,18 @@ async fn compact_session(
         return Err(error::Error::message("compact produced empty summary"));
     }
 
-    // Use system role so strict providers (e.g. llama.cpp) don't reject the
+    // Use user role so strict providers (e.g. llama.cpp) don't reject the
     // history for having an assistant message without a preceding user message.
-    let compacted_msg = PersistedMessage::System {
-        content: format!("[Conversation Summary]\n\n{summary}"),
+    // User role also keeps the summary in the conversation turn array for
+    // providers using the Responses API (system messages get promoted to
+    // instructions and disappear from turns).
+    let compacted_msg = PersistedMessage::User {
+        content: MessageContent::Text(format!("[Conversation Summary]\n\n{summary}")),
         created_at: Some(now_ms()),
+        audio: None,
+        channel: None,
+        seq: None,
+        run_id: None,
     };
     let compacted = vec![compacted_msg.to_value()];
 
@@ -10017,12 +10031,13 @@ mod tests {
         .expect("assistant reply should be persisted");
 
         assert_eq!(history.len(), 3);
-        // Compacted summary must be a system message so that strict providers
+        // Compacted summary must be a user message so that strict providers
         // (e.g. llama.cpp) don't reject the history for having an assistant
-        // message without a preceding user message.  See GitHub issue #501.
+        // message without a preceding user message, and so the summary stays
+        // in the conversation turn array for the Responses API.  See #501.
         assert_eq!(
             history[0].get("role").and_then(Value::as_str),
-            Some("system")
+            Some("user")
         );
         assert!(
             history[0]
@@ -10043,11 +10058,12 @@ mod tests {
         );
     }
 
-    /// Regression test for GitHub issue #501: compaction must produce a system
+    /// Regression test for GitHub issue #501: compaction must produce a user
     /// message, not an assistant message, so that strict providers (llama.cpp)
-    /// don't reject the history for having an orphan assistant turn.
+    /// don't reject the history for having an orphan assistant turn, and the
+    /// summary stays in the conversation turn array for the Responses API.
     #[tokio::test]
-    async fn compact_session_produces_system_role() {
+    async fn compact_session_produces_user_role() {
         use moltis_agents::model::values_to_chat_messages;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -10080,11 +10096,11 @@ mod tests {
         let history = store.read(session_key).await.expect("read compacted");
         assert_eq!(history.len(), 1, "compaction should leave exactly one message");
 
-        // The compacted message must be a system message.
+        // The compacted message must be a user message.
         assert_eq!(
             history[0].get("role").and_then(Value::as_str),
-            Some("system"),
-            "compacted summary must use system role, not assistant (issue #501)"
+            Some("user"),
+            "compacted summary must use user role, not assistant (issue #501)"
         );
         assert!(
             history[0]
@@ -10093,16 +10109,15 @@ mod tests {
                 .is_some_and(|c| c.starts_with("[Conversation Summary]")),
         );
 
-        // Simulate a follow-up: the compacted history converted to ChatMessages
-        // must not start with an assistant message.
+        // Verify the compacted history converts to a User ChatMessage.
         let chat_msgs = values_to_chat_messages(&history);
         assert!(
             !chat_msgs.is_empty(),
             "compacted history should convert to at least one ChatMessage"
         );
         assert!(
-            !matches!(chat_msgs[0], ChatMessage::Assistant { .. }),
-            "first ChatMessage after compaction must not be Assistant (issue #501)"
+            matches!(chat_msgs[0], ChatMessage::User { .. }),
+            "first ChatMessage after compaction must be User (issue #501)"
         );
     }
 
