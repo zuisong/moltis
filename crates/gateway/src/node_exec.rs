@@ -694,10 +694,10 @@ impl moltis_tools::exec::NodeExecProvider for GatewayNodeExecProvider {
             }
         }
 
-        if let Some(target) = &self.legacy_ssh_target {
-            if ssh_target_matches(node_ref, target) {
-                return Some(ssh_node_id(target));
-            }
+        if let Some(target) = &self.legacy_ssh_target
+            && ssh_target_matches(node_ref, target)
+        {
+            return Some(ssh_node_id(target));
         }
 
         resolve_node_id(&self.state, node_ref).await
