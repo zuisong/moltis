@@ -7,6 +7,7 @@ use {
         http::StatusCode,
         response::{IntoResponse, Response},
     },
+    secrecy::{ExposeSecret, SecretString},
     serde::Serialize,
     tokio::process::Command,
 };
@@ -219,8 +220,8 @@ pub struct GenerateKeyRequest {
 #[derive(serde::Deserialize)]
 pub struct ImportKeyRequest {
     name: String,
-    private_key: String,
-    passphrase: Option<String>,
+    private_key: SecretString,
+    passphrase: Option<SecretString>,
 }
 
 #[derive(serde::Deserialize)]
@@ -284,7 +285,7 @@ pub async fn ssh_generate_key(
         .await
         .map_err(|err| ApiError::internal(SSH_KEY_GENERATE_FAILED, err))?;
     let id = store
-        .create_ssh_key(name, &private_key, &public_key, &fingerprint)
+        .create_ssh_key(name, private_key.expose_secret(), &public_key, &fingerprint)
         .await
         .map_err(|err| ApiError::internal(SSH_KEY_GENERATE_FAILED, err))?;
 
@@ -306,7 +307,7 @@ pub async fn ssh_import_key(
             "ssh key name is required",
         ));
     }
-    if body.private_key.trim().is_empty() {
+    if body.private_key.expose_secret().trim().is_empty() {
         return Err(ApiError::bad_request(
             SSH_PRIVATE_KEY_REQUIRED,
             "private key is required",
@@ -315,15 +316,14 @@ pub async fn ssh_import_key(
 
     let import_passphrase = body
         .passphrase
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .as_ref()
+        .filter(|value| !value.expose_secret().trim().is_empty());
     let (private_key, public_key, fingerprint) =
         inspect_imported_private_key(&body.private_key, import_passphrase)
             .await
             .map_err(|err| ApiError::bad_request(SSH_KEY_IMPORT_FAILED, err.to_string()))?;
     let id = store
-        .create_ssh_key(name, &private_key, &public_key, &fingerprint)
+        .create_ssh_key(name, private_key.expose_secret(), &public_key, &fingerprint)
         .await
         .map_err(|err| ApiError::internal(SSH_KEY_IMPORT_FAILED, err))?;
 
@@ -766,7 +766,7 @@ fn build_ssh_test_response(
     }
 }
 
-async fn generate_ssh_key_material(name: &str) -> anyhow::Result<(String, String, String)> {
+async fn generate_ssh_key_material(name: &str) -> anyhow::Result<(SecretString, String, String)> {
     let dir = tempfile::tempdir()?;
     let key_path = dir.path().join("moltis_deploy_key");
     let output = Command::new("ssh-keygen")
@@ -784,19 +784,19 @@ async fn generate_ssh_key_material(name: &str) -> anyhow::Result<(String, String
         anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
-    let private_key: String = tokio::fs::read_to_string(&key_path).await?;
+    let private_key = SecretString::new(tokio::fs::read_to_string(&key_path).await?);
     let public_key: String = tokio::fs::read_to_string(key_path.with_extension("pub")).await?;
     let fingerprint = ssh_keygen_fingerprint(&key_path).await?;
     Ok((private_key, public_key.trim().to_string(), fingerprint))
 }
 
 async fn inspect_imported_private_key(
-    private_key: &str,
-    passphrase: Option<&str>,
-) -> anyhow::Result<(String, String, String)> {
+    private_key: &SecretString,
+    passphrase: Option<&SecretString>,
+) -> anyhow::Result<(SecretString, String, String)> {
     let dir = tempfile::tempdir()?;
     let key_path = dir.path().join("imported_key");
-    tokio::fs::write(&key_path, private_key).await?;
+    tokio::fs::write(&key_path, private_key.expose_secret()).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -845,7 +845,7 @@ async fn inspect_imported_private_key(
     }
 
     let fingerprint = ssh_keygen_fingerprint(&key_path).await?;
-    let decrypted_private_key = tokio::fs::read_to_string(&key_path).await?;
+    let decrypted_private_key = SecretString::new(tokio::fs::read_to_string(&key_path).await?);
     let public_key = String::from_utf8(public_output.stdout)?.trim().to_string();
     Ok((decrypted_private_key, public_key, fingerprint))
 }
@@ -867,12 +867,12 @@ fn looks_like_passphrase_error(stderr: &str) -> bool {
 
 fn configure_ssh_askpass(
     command: &mut Command,
-    passphrase: &str,
+    passphrase: &SecretString,
 ) -> anyhow::Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     let askpass_path = dir.path().join("askpass.sh");
     let passphrase_path = dir.path().join("askpass.sh.pass");
-    std::fs::write(&passphrase_path, passphrase)?;
+    std::fs::write(&passphrase_path, passphrase.expose_secret())?;
     std::fs::write(&askpass_path, "#!/bin/sh\nexec cat \"$0.pass\"\n")?;
     #[cfg(unix)]
     {
@@ -1220,7 +1220,11 @@ mod tests {
     async fn generated_key_material_round_trips() {
         let (private_key, public_key, fingerprint) =
             generate_ssh_key_material("test-key").await.unwrap();
-        assert!(private_key.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(
+            private_key
+                .expose_secret()
+                .contains("BEGIN OPENSSH PRIVATE KEY")
+        );
         assert!(public_key.starts_with("ssh-ed25519 "));
         assert!(fingerprint.contains("SHA256:"));
     }
@@ -1255,11 +1259,17 @@ mod tests {
         assert!(output.status.success());
 
         let private_key = tokio::fs::read_to_string(&key_path).await.unwrap();
+        let private_key = SecretString::new(private_key);
+        let passphrase = SecretString::new("correct horse battery staple".to_string());
         let (decrypted_private_key, public_key, fingerprint) =
-            inspect_imported_private_key(&private_key, Some("correct horse battery staple"))
+            inspect_imported_private_key(&private_key, Some(&passphrase))
                 .await
                 .unwrap();
-        assert!(decrypted_private_key.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(
+            decrypted_private_key
+                .expose_secret()
+                .contains("BEGIN OPENSSH PRIVATE KEY")
+        );
         assert!(public_key.starts_with("ssh-ed25519 "));
         assert!(fingerprint.contains("SHA256:"));
     }
