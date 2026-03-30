@@ -21,7 +21,7 @@ use moltis_channels::{
 };
 
 use crate::{
-    config::MatrixAccountConfig,
+    config::{MatrixAccountConfig, RedactedConfig},
     handler,
     outbound::MatrixOutbound,
     state::{AccountState, AccountStateMap},
@@ -66,6 +66,16 @@ impl Default for MatrixPlugin {
     }
 }
 
+fn parse_account_config(config: serde_json::Value) -> ChannelResult<MatrixAccountConfig> {
+    if config.get("e2ee").is_some() {
+        return Err(ChannelError::invalid_input(
+            "matrix `e2ee` config has been removed because encrypted rooms are not configurable per account",
+        ));
+    }
+
+    Ok(serde_json::from_value(config)?)
+}
+
 #[async_trait]
 impl ChannelPlugin for MatrixPlugin {
     fn id(&self) -> &str {
@@ -81,7 +91,7 @@ impl ChannelPlugin for MatrixPlugin {
         account_id: &str,
         config: serde_json::Value,
     ) -> ChannelResult<()> {
-        let cfg: MatrixAccountConfig = serde_json::from_value(config)?;
+        let cfg = parse_account_config(config)?;
         if cfg.homeserver.is_empty() {
             return Err(ChannelError::invalid_input("homeserver URL is required"));
         }
@@ -131,7 +141,15 @@ impl ChannelPlugin for MatrixPlugin {
             .await
             .map_err(|e| ChannelError::external("matrix session restore", e))?;
 
-        let bot_user_id = client.user_id().unwrap().to_owned();
+        let bot_user_id = client
+            .user_id()
+            .ok_or_else(|| {
+                ChannelError::external(
+                    "matrix session restore",
+                    std::io::Error::other("user_id not set after restore_session"),
+                )
+            })?
+            .to_owned();
         info!(account_id, user_id = %bot_user_id, "matrix session restored");
 
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -253,7 +271,7 @@ impl ChannelPlugin for MatrixPlugin {
         let accounts = self.accounts.read().unwrap_or_else(|e| e.into_inner());
         accounts
             .get(account_id)
-            .and_then(|s| serde_json::to_value(&s.config).ok())
+            .and_then(|s| serde_json::to_value(RedactedConfig(&s.config)).ok())
     }
 
     fn update_account_config(
@@ -261,7 +279,7 @@ impl ChannelPlugin for MatrixPlugin {
         account_id: &str,
         config: serde_json::Value,
     ) -> ChannelResult<()> {
-        let parsed: MatrixAccountConfig = serde_json::from_value(config)?;
+        let parsed = parse_account_config(config)?;
         let mut accounts = self.accounts.write().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = accounts.get_mut(account_id) {
             state.config = parsed;

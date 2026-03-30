@@ -3,8 +3,9 @@ use {
         config_view::ChannelConfigView,
         gating::{DmPolicy, GroupPolicy},
     },
-    secrecy::{ExposeSecret, Secret},
-    serde::{Deserialize, Serialize},
+    moltis_common::secret_serde,
+    secrecy::Secret,
+    serde::{Deserialize, Serialize, ser::SerializeStruct},
 };
 
 /// Configuration for a single Matrix account.
@@ -15,7 +16,7 @@ pub struct MatrixAccountConfig {
     pub homeserver: String,
 
     /// Access token for authentication.
-    #[serde(serialize_with = "serialize_secret")]
+    #[serde(serialize_with = "secret_serde::serialize_secret")]
     pub access_token: Secret<String>,
 
     /// Matrix user ID (auto-detected from whoami if not set).
@@ -56,9 +57,6 @@ pub struct MatrixAccountConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ack_reaction: Option<String>,
 
-    /// Enable end-to-end encryption support.
-    pub e2ee: bool,
-
     /// OTP self-approval for non-allowlisted DM users.
     pub otp_self_approval: bool,
 
@@ -82,7 +80,6 @@ impl Default for MatrixAccountConfig {
             model_provider: None,
             reply_to_message: true,
             ack_reaction: Some("\u{1f440}".into()), // 👀
-            e2ee: true,
             otp_self_approval: true,
             otp_cooldown_secs: 300,
         }
@@ -105,8 +102,52 @@ impl std::fmt::Debug for MatrixAccountConfig {
             .field("model_provider", &self.model_provider)
             .field("reply_to_message", &self.reply_to_message)
             .field("ack_reaction", &self.ack_reaction)
-            .field("e2ee", &self.e2ee)
+            .field("otp_self_approval", &self.otp_self_approval)
+            .field("otp_cooldown_secs", &self.otp_cooldown_secs)
             .finish()
+    }
+}
+
+/// Wrapper that serializes secret fields as `"[REDACTED]"` for API responses.
+pub struct RedactedConfig<'a>(pub &'a MatrixAccountConfig);
+
+impl Serialize for RedactedConfig<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let c = self.0;
+        let mut count = 10;
+        count += c.user_id.is_some() as usize;
+        count += c.device_id.is_some() as usize;
+        count += c.model.is_some() as usize;
+        count += c.model_provider.is_some() as usize;
+        count += c.ack_reaction.is_some() as usize;
+
+        let mut s = serializer.serialize_struct("MatrixAccountConfig", count)?;
+        s.serialize_field("homeserver", &c.homeserver)?;
+        s.serialize_field("access_token", secret_serde::REDACTED)?;
+        if c.user_id.is_some() {
+            s.serialize_field("user_id", &c.user_id)?;
+        }
+        if c.device_id.is_some() {
+            s.serialize_field("device_id", &c.device_id)?;
+        }
+        s.serialize_field("dm_policy", &c.dm_policy)?;
+        s.serialize_field("room_policy", &c.room_policy)?;
+        s.serialize_field("room_allowlist", &c.room_allowlist)?;
+        s.serialize_field("user_allowlist", &c.user_allowlist)?;
+        s.serialize_field("auto_join", &c.auto_join)?;
+        if c.model.is_some() {
+            s.serialize_field("model", &c.model)?;
+        }
+        if c.model_provider.is_some() {
+            s.serialize_field("model_provider", &c.model_provider)?;
+        }
+        s.serialize_field("reply_to_message", &c.reply_to_message)?;
+        if c.ack_reaction.is_some() {
+            s.serialize_field("ack_reaction", &c.ack_reaction)?;
+        }
+        s.serialize_field("otp_self_approval", &c.otp_self_approval)?;
+        s.serialize_field("otp_cooldown_secs", &c.otp_cooldown_secs)?;
+        s.end()
     }
 }
 
@@ -136,13 +177,6 @@ impl ChannelConfigView for MatrixAccountConfig {
     }
 }
 
-fn serialize_secret<S: serde::Serializer>(
-    secret: &Secret<String>,
-    serializer: S,
-) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(secret.expose_secret())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,7 +193,8 @@ mod tests {
             "auto_join": true,
             "reply_to_message": true,
             "ack_reaction": "\u{1f440}",
-            "e2ee": true,
+            "otp_self_approval": true,
+            "otp_cooldown_secs": 300,
         });
         let cfg: MatrixAccountConfig = serde_json::from_value(json).expect("parse failed");
         assert_eq!(cfg.homeserver, "https://matrix.example.com");
@@ -167,6 +202,7 @@ mod tests {
         assert_eq!(cfg.room_allowlist, vec!["!room:example.com"]);
 
         let value = serde_json::to_value(&cfg).expect("serialize failed");
+        assert_eq!(value["access_token"], "syt_test_token");
         let _: MatrixAccountConfig = serde_json::from_value(value).expect("re-parse failed");
     }
 
@@ -178,7 +214,8 @@ mod tests {
         assert!(cfg.auto_join);
         assert!(cfg.reply_to_message);
         assert_eq!(cfg.ack_reaction.as_deref(), Some("\u{1f440}"));
-        assert!(cfg.e2ee);
+        assert!(cfg.otp_self_approval);
+        assert_eq!(cfg.otp_cooldown_secs, 300);
     }
 
     #[test]
@@ -190,5 +227,18 @@ mod tests {
         let debug = format!("{cfg:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret"));
+    }
+
+    #[test]
+    fn redacted_config_hides_access_token() {
+        let cfg = MatrixAccountConfig {
+            access_token: Secret::new("super-secret".into()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(RedactedConfig(&cfg)).expect("serialize failed");
+
+        assert_eq!(value["access_token"], "[REDACTED]");
+        assert!(!value.to_string().contains("super-secret"));
     }
 }

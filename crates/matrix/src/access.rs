@@ -51,15 +51,6 @@ fn check_room_access(config: &MatrixAccountConfig, room_id: &str) -> Result<(), 
     }
 }
 
-/// Detect whether a room is a DM based on joined member count.
-pub fn is_dm_room(joined_member_count: u64) -> ChatType {
-    if joined_member_count <= 2 {
-        ChatType::Dm
-    } else {
-        ChatType::Group
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AccessDenied {
     DmsDisabled,
@@ -139,12 +130,5 @@ mod tests {
             ),
             Err(AccessDenied::RoomNotOnAllowlist)
         );
-    }
-
-    #[test]
-    fn is_dm_detection() {
-        assert_eq!(is_dm_room(2), ChatType::Dm);
-        assert_eq!(is_dm_room(1), ChatType::Dm);
-        assert_eq!(is_dm_room(3), ChatType::Group);
     }
 }

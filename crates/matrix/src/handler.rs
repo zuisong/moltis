@@ -14,18 +14,18 @@ use {
     tracing::{debug, info, warn},
 };
 
-use moltis_channels::{
-    ChannelEvent, ChannelType,
-    gating::DmPolicy,
-    message_log::MessageLogEntry,
-    otp::{OtpInitResult, OtpVerifyResult},
-    plugin::{ChannelEventSink, ChannelMessageKind, ChannelMessageMeta, ChannelReplyTarget},
+use {
+    moltis_channels::{
+        ChannelEvent, ChannelType,
+        gating::DmPolicy,
+        message_log::MessageLogEntry,
+        otp::{OtpInitResult, OtpVerifyResult},
+        plugin::{ChannelEventSink, ChannelMessageKind, ChannelMessageMeta, ChannelReplyTarget},
+    },
+    moltis_common::types::ChatType,
 };
 
-use crate::{
-    access::{self, is_dm_room},
-    state::AccountStateMap,
-};
+use crate::{access, state::AccountStateMap};
 
 pub async fn handle_room_message(
     ev: OriginalSyncRoomMessageEvent,
@@ -73,11 +73,21 @@ pub async fn handle_room_message(
         }
     };
 
-    let member_count = room.joined_members_count();
-    let chat_type = is_dm_room(member_count);
+    let chat_type = match room.is_direct().await {
+        Ok(true) => ChatType::Dm,
+        Ok(false) => ChatType::Group,
+        Err(error) => {
+            warn!(
+                account_id,
+                room = %room_id,
+                "failed to determine Matrix DM state, treating room as group: {error}"
+            );
+            ChatType::Group
+        },
+    };
 
     if let Err(reason) = access::check_access(&config, &chat_type, &sender_id, &room_id) {
-        if matches!(chat_type, moltis_common::types::ChatType::Dm)
+        if matches!(chat_type, ChatType::Dm)
             && matches!(reason, access::AccessDenied::NotOnAllowlist)
             && config.otp_self_approval
             && config.dm_policy == DmPolicy::Allowlist
@@ -128,7 +138,7 @@ pub async fn handle_room_message(
                 username: Some(sender_id.clone()),
                 sender_name: sender_name.clone(),
                 chat_id: room_id.clone(),
-                chat_type: if matches!(chat_type, moltis_common::types::ChatType::Dm) {
+                chat_type: if matches!(chat_type, ChatType::Dm) {
                     "dm"
                 } else {
                     "group"
@@ -231,11 +241,14 @@ async fn handle_otp(
         }
     }
 
-    let result = {
+    let (result, otp_cooldown_secs) = {
         let guard = accounts.read().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = guard.get(account_id) {
             let mut otp = state.otp.lock().unwrap_or_else(|e| e.into_inner());
-            otp.initiate(sender_id, Some(sender_id.into()), None)
+            (
+                otp.initiate(sender_id, Some(sender_id.into()), None),
+                state.config.otp_cooldown_secs,
+            )
         } else {
             return;
         }
@@ -243,7 +256,8 @@ async fn handle_otp(
 
     match result {
         OtpInitResult::Created(code) => {
-            let expires_at = unix_now() + 300;
+            let expires_at =
+                unix_now().saturating_add(i64::try_from(otp_cooldown_secs).unwrap_or(i64::MAX));
             let msg = format!(
                 "You're not on the allowlist. A verification code has been generated.\n\
                  Ask the admin to approve code: **{code}**\n\
