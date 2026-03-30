@@ -5,7 +5,6 @@ import { html } from "htm/preact";
 import { render } from "preact";
 import { useEffect } from "preact/hooks";
 import { onEvent } from "./events.js";
-import * as gon from "./gon.js";
 import { sendRpc } from "./helpers.js";
 import { navigate } from "./router.js";
 import { settingsPath } from "./routes.js";
