@@ -26,8 +26,12 @@ drawings:
   </div>
 
   <h1 class="mt-5 max-w-4xl text-6xl leading-[1.05] font-semibold tracking-tight text-gray-950">
-    A Rust-native claw you can trust
+    One binary. Sandboxed. Yours.
   </h1>
+
+  <div class="mt-5 max-w-4xl text-2xl leading-9 text-gray-600">
+    A secure persistent agent server for real-world AI workflows.
+  </div>
 
   <div class="mt-8 text-3xl font-semibold text-gray-900">
     Fabien Penso · @fabienpenso
@@ -64,21 +68,31 @@ Shorter version if you want to move faster:
 
 ---
 
-# Why I built Moltis
+# Why Moltis exists
 
-<div class="mt-5 text-base leading-7">
-  <ul>
-    <li>I was in San Francisco starting mid January</li>
-    <li>I was lucky enough to be at the first OpenClaw conference organized by Dave Morin, in the presence of Peter Steinberger</li>
-    <li>I loved the energy and the idea immediately</li>
-    <li>I wanted my own version of that future in Rust, with different safety and architecture tradeoffs</li>
-    <li>I also thought OpenClaw was still too hard to install for a lot of people</li>
-    <li>So I went heads down for two to three weeks and built the first public version of Moltis</li>
-  </ul>
+<div class="grid grid-cols-3 gap-6 mt-8">
+  <div class="rounded-xl border border-gray-200 px-5 py-4">
+    <div class="text-xl font-semibold text-orange-600">Same direction</div>
+    <div class="mt-3 text-sm leading-6">
+      I loved what OpenClaw unlocked. Moltis exists because I wanted to run my own version of that future.
+    </div>
+  </div>
+  <div class="rounded-xl border border-gray-200 px-5 py-4">
+    <div class="text-xl font-semibold text-orange-600">Different tradeoffs</div>
+    <div class="mt-3 text-sm leading-6">
+      I wanted Rust, stronger safety boundaries, and a more defense-in-depth architecture once agents get real permissions.
+    </div>
+  </div>
+  <div class="rounded-xl border border-gray-200 px-5 py-4">
+    <div class="text-xl font-semibold text-orange-600">Less friction</div>
+    <div class="mt-3 text-sm leading-6">
+      I wanted installation and setup to take minutes, not a side quest, so more people could actually try it.
+    </div>
+  </div>
 </div>
 
-<div class="mt-6 rounded-xl border border-orange-300 bg-orange-50 px-5 py-4 text-base">
-This project started from admiration, not rejection: OpenClaw proved how important this space is, and Moltis is my opinionated Rust-native take on the same future.
+<div class="mt-8 rounded-xl border border-orange-300 bg-orange-50 px-5 py-4 text-lg">
+This project started from admiration, not rejection. Moltis is my opinionated Rust-native take on the same future.
 </div>
 
 <!--
@@ -87,12 +101,15 @@ The OpenClaw conference in SF had > 1,000 people who wanted to come, but only ~2
 
 About 75 seconds.
 
-Make this personal and direct.
-This is not generic founder mythology, it is a very concrete origin story:
-you were physically there when the idea clicked, you liked the direction, and
-you wanted a Rust-native version badly enough to build one fast.
-If you want a strong closing line here: "I wasn't trying to make a clone, I was
-trying to build the version I personally wanted to run."
+Make this personal out loud rather than on the slide.
+The slide should answer the room's question:
+why does this project exist at all?
+
+Your spoken version:
+- you were in San Francisco in mid January
+- you were at the first OpenClaw conference with Peter / Dave Morin
+- you loved the energy immediately
+- you wanted your own Rust-native version badly enough to build it fast
 -->
 
 ---
@@ -124,31 +141,31 @@ installation has to be fast enough that curiosity survives the setup process.
 
 ---
 
-# Can you trust it?
+# The moment agents get real permissions, the architecture changes
 
-<div class="grid grid-cols-2 gap-5 mt-6">
+<div class="grid grid-cols-3 gap-6 mt-8">
   <div class="rounded-xl border border-gray-200 px-5 py-4">
-    <div class="text-lg font-semibold text-orange-600">Most demos optimize for</div>
-    <div class="mt-2 text-sm">
-      <ul>
-        <li>flashy one-off moments</li>
-        <li>plugin sprawl</li>
-      </ul>
+    <div class="text-xl font-semibold text-orange-600">Code</div>
+    <div class="mt-3 text-sm leading-6">
+      If an agent can edit code and run shell commands, isolation stops being optional.
     </div>
   </div>
   <div class="rounded-xl border border-gray-200 px-5 py-4">
-    <div class="text-lg font-semibold text-orange-600">Real usage forces you to ask</div>
-    <div class="mt-2 text-sm">
-      <ul>
-        <li>where do the credentials live?</li>
-        <li>where does the code run?</li>
-      </ul>
+    <div class="text-xl font-semibold text-orange-600">Secrets</div>
+    <div class="mt-3 text-sm leading-6">
+      If an agent can touch credentials, auth and secret handling become product features.
+    </div>
+  </div>
+  <div class="rounded-xl border border-gray-200 px-5 py-4">
+    <div class="text-xl font-semibold text-orange-600">Continuity</div>
+    <div class="mt-3 text-sm leading-6">
+      If the agent is persistent, memory, sessions, and recovery matter as much as model quality.
     </div>
   </div>
 </div>
 
-<div class="mt-10 max-w-4xl text-2xl leading-10 text-gray-700">
-Moltis starts from the trust model, then builds the agent around that.
+<div class="mt-8 rounded-xl border border-orange-300 bg-orange-50 px-5 py-4 text-lg">
+That is the design center for Moltis: not just "can it do something cool?", but "can I safely let it keep running?"
 </div>
 
 <!--
