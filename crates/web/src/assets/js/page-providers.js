@@ -5,7 +5,7 @@ import { html } from "htm/preact";
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
 import { onEvent } from "./events.js";
-import { sendRpc } from "./helpers.js";
+import { modelVersionScore, sendRpc } from "./helpers.js";
 import { t } from "./i18n.js";
 import { fetchModels } from "./models.js";
 import { updateNavCount } from "./nav-counts.js";
@@ -182,7 +182,7 @@ function groupProviderRows(models, metaMap) {
 	});
 	for (var providerGroup of result) {
 		providerGroup.models.sort((a, b) => {
-			// Preferred models always come first, then recommended, then by date.
+			// Preferred > recommended > newest date > highest version number > alpha.
 			var aPref = a.preferred ? 1 : 0;
 			var bPref = b.preferred ? 1 : 0;
 			if (aPref !== bPref) return bPref - aPref;
@@ -192,6 +192,9 @@ function groupProviderRows(models, metaMap) {
 			var aTime = a.createdAt || 0;
 			var bTime = b.createdAt || 0;
 			if (aTime !== bTime) return bTime - aTime;
+			var aVer = modelVersionScore(a.id);
+			var bVer = modelVersionScore(b.id);
+			if (aVer !== bVer) return bVer - aVer;
 			return (a.displayName || a.id).localeCompare(b.displayName || b.id);
 		});
 	}

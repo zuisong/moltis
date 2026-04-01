@@ -2,6 +2,22 @@
 import { hasTranslation, t } from "./i18n.js";
 import * as S from "./state.js";
 
+/**
+ * Extract the highest version number from a model ID for sorting.
+ * e.g. "gpt-5.4-mini" → 5.4, "claude-opus-4-6-20260301" → 4.6, "o4-mini" → 4
+ * Returns 0 when no number is found.
+ */
+export function modelVersionScore(id) {
+	var matches = (id || "").match(/\d+(?:\.\d+)?/g);
+	if (!matches) return 0;
+	var max = 0;
+	for (var m of matches) {
+		var v = Number.parseFloat(m);
+		if (v > max) max = v;
+	}
+	return max;
+}
+
 function translatedOrFallback(key, opts, fallback) {
 	if (!key) return fallback;
 	if (!hasTranslation(key, opts)) return fallback;

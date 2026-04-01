@@ -18,7 +18,7 @@ import {
 import { EmojiPicker } from "./emoji-picker.js";
 import { eventListeners, onEvent } from "./events.js";
 import { get as getGon, refresh as refreshGon } from "./gon.js";
-import { sendRpc } from "./helpers.js";
+import { modelVersionScore, sendRpc } from "./helpers.js";
 import { t } from "./i18n.js";
 import { updateIdentity, validateIdentityFields } from "./identity-utils.js";
 import { detectPasskeyName } from "./passkey-detect.js";
@@ -779,7 +779,7 @@ function OnboardingProviderRow({
 	var [showAllModels, setShowAllModels] = useState(false);
 	var DEFAULT_VISIBLE = 3;
 
-	// Sort models: recommended first, then by createdAt descending.
+	// Sort models: recommended > newest date > highest version > alpha.
 	var sortedModels = (providerModels || []).slice().sort((a, b) => {
 		var aRec = a.recommended ? 1 : 0;
 		var bRec = b.recommended ? 1 : 0;
@@ -787,6 +787,9 @@ function OnboardingProviderRow({
 		var aTime = a.createdAt || 0;
 		var bTime = b.createdAt || 0;
 		if (aTime !== bTime) return bTime - aTime;
+		var aVer = modelVersionScore(a.id);
+		var bVer = modelVersionScore(b.id);
+		if (aVer !== bVer) return bVer - aVer;
 		return (a.displayName || a.id).localeCompare(b.displayName || b.id);
 	});
 
