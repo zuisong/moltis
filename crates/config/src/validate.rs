@@ -198,6 +198,18 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let firecrawl = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("api_key", Leaf),
+            ("base_url", Leaf),
+            ("only_main_content", Leaf),
+            ("timeout_seconds", Leaf),
+            ("cache_ttl_minutes", Leaf),
+            ("web_fetch_fallback", Leaf),
+        ]))
+    };
+
     let exec = || {
         Struct(HashMap::from([
             ("default_timeout_secs", Leaf),
@@ -253,6 +265,7 @@ fn build_schema_map() -> KnownKeys {
                 Struct(HashMap::from([
                     ("search", web_search()),
                     ("fetch", web_fetch()),
+                    ("firecrawl", firecrawl()),
                 ])),
             ),
             ("maps", Struct(HashMap::from([("provider", Leaf)]))),
@@ -1105,6 +1118,21 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
                 message: "mcp server request_timeout_secs must be at least 1".into(),
             });
         }
+    }
+
+    // Firecrawl as search provider requires an API key.
+    if config.tools.web.search.provider == crate::schema::SearchProvider::Firecrawl
+        && config.tools.web.firecrawl.api_key.is_none()
+        && !config.tools.web.search.duckduckgo_fallback
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "unknown-provider",
+            path: "tools.web.search.provider".into(),
+            message: "search provider is 'firecrawl' but no firecrawl API key is configured \
+                      (set tools.web.firecrawl.api_key or FIRECRAWL_API_KEY env var)"
+                .into(),
+        });
     }
 
     // agents.default_preset should reference an existing preset key.
