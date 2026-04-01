@@ -290,6 +290,14 @@ type GatewayBase = (Router<AppState>, AppState, Arc<NgrokController>);
 #[cfg(not(feature = "ngrok"))]
 type GatewayBase = (Router<AppState>, AppState);
 
+#[cfg(feature = "ngrok")]
+fn attach_ngrok_controller_owner(
+    app_state: &mut AppState,
+    ngrok_controller: &Arc<NgrokController>,
+) {
+    app_state.ngrok_controller_owner = Some(Arc::clone(ngrok_controller));
+}
+
 // ── Server startup ───────────────────────────────────────────────────────────
 
 /// Build the API routes (shared between both build_gateway_app versions).
@@ -512,9 +520,7 @@ pub fn build_gateway_base(
     let (router, mut app_state, ngrok_controller) =
         build_gateway_base_internal(state, methods, push_service, webauthn_registry);
     #[cfg(feature = "ngrok")]
-    {
-        app_state.ngrok_controller_owner = Some(ngrok_controller);
-    }
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
     #[cfg(not(feature = "ngrok"))]
     let (router, app_state) =
         build_gateway_base_internal(state, methods, push_service, webauthn_registry);
@@ -614,9 +620,7 @@ pub fn build_gateway_base(
     let (router, mut app_state, ngrok_controller) =
         build_gateway_base_internal(state, methods, webauthn_registry);
     #[cfg(feature = "ngrok")]
-    {
-        app_state.ngrok_controller_owner = Some(ngrok_controller);
-    }
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
     #[cfg(not(feature = "ngrok"))]
     let (router, app_state) = build_gateway_base_internal(state, methods, webauthn_registry);
     (router, app_state)
@@ -810,12 +814,15 @@ pub async fn prepare_gateway(
 
     #[cfg(feature = "push-notifications")]
     #[cfg(feature = "ngrok")]
-    let (router, app_state, ngrok_controller) = build_gateway_base_internal(
+    let (router, mut app_state, ngrok_controller) = build_gateway_base_internal(
         Arc::clone(&state),
         Arc::clone(&methods),
         push_service,
         webauthn_registry.clone(),
     );
+    #[cfg(feature = "push-notifications")]
+    #[cfg(feature = "ngrok")]
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
     #[cfg(all(feature = "push-notifications", not(feature = "ngrok")))]
     let (router, app_state) = build_gateway_base(
         Arc::clone(&state),
@@ -825,11 +832,14 @@ pub async fn prepare_gateway(
     );
     #[cfg(not(feature = "push-notifications"))]
     #[cfg(feature = "ngrok")]
-    let (router, app_state, ngrok_controller) = build_gateway_base_internal(
+    let (router, mut app_state, ngrok_controller) = build_gateway_base_internal(
         Arc::clone(&state),
         Arc::clone(&methods),
         webauthn_registry.clone(),
     );
+    #[cfg(not(feature = "push-notifications"))]
+    #[cfg(feature = "ngrok")]
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
     #[cfg(all(not(feature = "push-notifications"), not(feature = "ngrok")))]
     let (router, app_state) = build_gateway_base(
         Arc::clone(&state),
@@ -2863,5 +2873,53 @@ mod tests {
 
         assert!(app_state.ngrok_controller_owner.is_some());
         assert!(app_state.ngrok_controller.upgrade().is_some());
+    }
+
+    #[cfg(feature = "ngrok")]
+    #[test]
+    fn attaching_owner_keeps_internal_ngrok_controller_alive_after_local_arc_drop() {
+        let state = GatewayState::new(
+            auth::resolve_auth(None, None),
+            moltis_gateway::services::GatewayServices::noop(),
+        );
+        let methods = Arc::new(MethodRegistry::new());
+        #[cfg(feature = "push-notifications")]
+        let (_router, app_state, ngrok_controller) =
+            build_gateway_base_internal(state, methods, None, None);
+        #[cfg(not(feature = "push-notifications"))]
+        let (_router, mut app_state, ngrok_controller) =
+            build_gateway_base_internal(state, methods, None);
+
+        assert!(app_state.ngrok_controller.upgrade().is_some());
+
+        let weak = app_state.ngrok_controller.clone();
+        drop(ngrok_controller);
+        assert!(weak.upgrade().is_none());
+
+        #[cfg(feature = "push-notifications")]
+        let (_router, mut app_state, ngrok_controller) = build_gateway_base_internal(
+            GatewayState::new(
+                auth::resolve_auth(None, None),
+                moltis_gateway::services::GatewayServices::noop(),
+            ),
+            Arc::new(MethodRegistry::new()),
+            None,
+            None,
+        );
+        #[cfg(not(feature = "push-notifications"))]
+        let (_router, mut app_state, ngrok_controller) = build_gateway_base_internal(
+            GatewayState::new(
+                auth::resolve_auth(None, None),
+                moltis_gateway::services::GatewayServices::noop(),
+            ),
+            Arc::new(MethodRegistry::new()),
+            None,
+        );
+
+        attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
+        let weak = app_state.ngrok_controller.clone();
+        drop(ngrok_controller);
+        assert!(weak.upgrade().is_some());
+        assert!(app_state.ngrok_controller_owner.is_some());
     }
 }
