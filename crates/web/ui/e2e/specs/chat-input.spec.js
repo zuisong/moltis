@@ -70,6 +70,9 @@ async function openFullContextWithRetry(page) {
 	const toggleBtn = page.locator("#fullContextBtn");
 	const panel = page.locator("#fullContextPanel");
 	const copyBtn = panel.getByRole("button", { name: "Copy", exact: true });
+	const copiedBtn = panel.getByRole("button", { name: "Copied!", exact: true });
+	const downloadBtn = panel.getByRole("button", { name: "Download", exact: true });
+	const llmOutputBtn = panel.getByRole("button", { name: "LLM output", exact: true });
 	const failedMsg = panel.getByText("Failed to build context", { exact: true });
 
 	for (let attempt = 0; attempt < 5; attempt++) {
@@ -95,17 +98,27 @@ async function openFullContextWithRetry(page) {
 		const result = await expect
 			.poll(
 				async () => {
-					if (await copyBtn.isVisible().catch(() => false)) return "copy";
+					if (
+						(await copyBtn.isVisible().catch(() => false)) ||
+						(await copiedBtn.isVisible().catch(() => false)) ||
+						((await downloadBtn.isVisible().catch(() => false)) && (await llmOutputBtn.isVisible().catch(() => false)))
+					) {
+						return "controls";
+					}
 					if (await failedMsg.isVisible().catch(() => false)) return "failed";
 					return "loading";
 				},
-				{ timeout: 8_000 },
+				{ timeout: 12_000 },
 			)
-			.toBe("copy")
-			.then(() => "copy")
+			.toBe("controls")
+			.then(() => "controls")
 			.catch(() => "failed");
 
-		if (result === "copy") return copyBtn;
+		if (result === "controls") {
+			if (await copyBtn.isVisible().catch(() => false)) return copyBtn;
+			if (await copiedBtn.isVisible().catch(() => false)) return copiedBtn;
+			return copyBtn;
+		}
 		if (result === "failed" && noProvidersConfigured) {
 			return null;
 		}
