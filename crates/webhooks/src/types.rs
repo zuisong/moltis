@@ -65,6 +65,23 @@ pub struct Webhook {
     pub updated_at: String,
 }
 
+impl Webhook {
+    /// Return a copy with secrets redacted for API responses.
+    ///
+    /// Replaces `auth_config` and `source_config` with a `"[REDACTED]"`
+    /// sentinel so the UI can see that a secret exists without exposing it.
+    #[must_use]
+    pub fn redacted(mut self) -> Self {
+        if self.auth_config.is_some() {
+            self.auth_config = Some(serde_json::json!("[REDACTED]"));
+        }
+        if self.source_config.is_some() {
+            self.source_config = Some(serde_json::json!("[REDACTED]"));
+        }
+        self
+    }
+}
+
 /// Input for creating a new webhook.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

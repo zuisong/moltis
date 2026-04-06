@@ -35,10 +35,17 @@ impl LiveWebhooksService {
 #[async_trait]
 impl WebhooksServiceTrait for LiveWebhooksService {
     async fn list(&self) -> ServiceResult {
-        let webhooks = self.store.list_webhooks().await.map_err(|e| {
-            error!(error = %e, "webhooks list failed");
-            ServiceError::message(e)
-        })?;
+        let webhooks: Vec<_> = self
+            .store
+            .list_webhooks()
+            .await
+            .map_err(|e| {
+                error!(error = %e, "webhooks list failed");
+                ServiceError::message(e)
+            })?
+            .into_iter()
+            .map(|w| w.redacted())
+            .collect();
         Ok(serde_json::to_value(webhooks)?)
     }
 
@@ -47,20 +54,30 @@ impl WebhooksServiceTrait for LiveWebhooksService {
             .get("id")
             .and_then(|v| v.as_i64())
             .ok_or_else(|| ServiceError::message("missing 'id'"))?;
-        let webhook = self.store.get_webhook(id).await.map_err(|e| {
-            error!(error = %e, "webhooks get failed");
-            ServiceError::message(e)
-        })?;
+        let webhook = self
+            .store
+            .get_webhook(id)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "webhooks get failed");
+                ServiceError::message(e)
+            })?
+            .redacted();
         Ok(serde_json::to_value(webhook)?)
     }
 
     async fn create(&self, params: Value) -> ServiceResult {
         let create: WebhookCreate = serde_json::from_value(params)
             .map_err(|e| ServiceError::message(format!("invalid webhook spec: {e}")))?;
-        let webhook = self.store.create_webhook(create).await.map_err(|e| {
-            error!(error = %e, "webhooks create failed");
-            ServiceError::message(e)
-        })?;
+        let webhook = self
+            .store
+            .create_webhook(create)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "webhooks create failed");
+                ServiceError::message(e)
+            })?
+            .redacted();
         Ok(serde_json::to_value(webhook)?)
     }
 
@@ -76,10 +93,15 @@ impl WebhooksServiceTrait for LiveWebhooksService {
                 .unwrap_or(Value::Object(Default::default())),
         )
         .map_err(|e| ServiceError::message(format!("invalid patch: {e}")))?;
-        let webhook = self.store.update_webhook(id, patch).await.map_err(|e| {
-            error!(error = %e, "webhooks update failed");
-            ServiceError::message(e)
-        })?;
+        let webhook = self
+            .store
+            .update_webhook(id, patch)
+            .await
+            .map_err(|e| {
+                error!(error = %e, "webhooks update failed");
+                ServiceError::message(e)
+            })?
+            .redacted();
         Ok(serde_json::to_value(webhook)?)
     }
 
