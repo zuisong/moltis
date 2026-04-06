@@ -1,6 +1,6 @@
 //! SPA templates, gon data, and template rendering.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, path::Path};
 
 use {
     askama::Template,
@@ -369,13 +369,14 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let (heartbeat_config, channels_offered) = {
+    let (heartbeat_config, cached_channels_offered) = {
         let inner = gw.inner.read().await;
         (
             inner.heartbeat_config.clone(),
             inner.channels_offered.clone(),
         )
     };
+    let channels_offered = resolve_channels_offered(cached_channels_offered);
     let channel_descriptors: Vec<moltis_channels::ChannelDescriptor> = channels_offered
         .iter()
         .filter_map(|s| s.parse::<moltis_channels::ChannelType>().ok())
@@ -464,6 +465,28 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
             } else {
                 "disabled".to_owned()
             }
+        },
+    }
+}
+
+fn load_channels_offered_from_config_path(path: &Path) -> crate::Result<Vec<String>> {
+    Ok(moltis_config::loader::load_config(path)?.channels.offered)
+}
+
+fn resolve_channels_offered(cached_channels_offered: Vec<String>) -> Vec<String> {
+    let Some(path) = moltis_config::loader::find_config_file() else {
+        return cached_channels_offered;
+    };
+
+    match load_channels_offered_from_config_path(&path) {
+        Ok(channels_offered) => channels_offered,
+        Err(error) => {
+            warn!(
+                path = %path.display(),
+                error = %error,
+                "failed to reload channels.offered for gon data, using startup value"
+            );
+            cached_channels_offered
         },
     }
 }
@@ -769,7 +792,7 @@ pub(crate) async fn onboarding_completed(gw: &GatewayState) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
+    use {super::*, std::io::Write};
 
     #[test]
     fn parse_git_branch_filters_defaults() {
@@ -845,5 +868,25 @@ mod tests {
         assert!(!should_redirect_from_onboarding(true, true));
         assert!(!should_redirect_from_onboarding(false, false));
         assert!(!should_redirect_from_onboarding(false, true));
+    }
+
+    #[test]
+    fn load_channels_offered_from_config_path_reads_matrix_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("moltis.toml");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            "[channels]\noffered = [\"telegram\", \"matrix\", \"whatsapp\"]"
+        )
+        .unwrap();
+
+        let offered = load_channels_offered_from_config_path(&path).unwrap();
+
+        assert_eq!(offered, vec![
+            "telegram".to_owned(),
+            "matrix".to_owned(),
+            "whatsapp".to_owned(),
+        ]);
     }
 }

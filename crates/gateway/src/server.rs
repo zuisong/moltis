@@ -1217,6 +1217,10 @@ pub async fn prepare_gateway_core(
 
     // Load config file (moltis.toml / .yaml / .json) if present.
     let mut config = moltis_config::discover_and_load();
+    info!(
+        offered_channels = ?config.channels.offered,
+        "loaded offered channels from config"
+    );
     let config_env_overrides = config.env.clone();
     let instance_slug_value = instance_slug(&config);
     let browser_container_prefix = browser_container_prefix(&instance_slug_value);
