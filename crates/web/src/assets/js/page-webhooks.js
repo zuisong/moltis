@@ -209,8 +209,22 @@ function WebhookCard({ webhook }) {
         </div>
       </div>
 
-      <div class="text-xs text-[var(--muted)] mt-1 font-mono select-all">
-        ${publicBaseUrl.value || window.location.origin}/api/webhooks/ingest/${wh.publicId}
+      <div class="flex items-center gap-2 mt-1">
+        <div class="text-xs text-[var(--muted)] font-mono select-all flex-1 min-w-0 truncate">
+          ${publicBaseUrl.value || window.location.origin}/api/webhooks/ingest/${wh.publicId}
+        </div>
+        <button
+          class="provider-btn provider-btn-sm provider-btn-secondary"
+          style="white-space:nowrap;"
+          title="Copy curl test command"
+          onClick=${() => {
+            var url = (publicBaseUrl.value || window.location.origin) + "/api/webhooks/ingest/" + wh.publicId;
+            var cmd = "curl -sk -X POST " + url + " -H 'Content-Type: application/json' -d '{\"test\": true}'";
+            navigator.clipboard.writeText(cmd);
+          }}
+        >
+          Copy curl
+        </button>
       </div>
     </div>
   `;

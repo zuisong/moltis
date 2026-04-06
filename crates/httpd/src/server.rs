@@ -1122,6 +1122,26 @@ pub async fn prepare_gateway(
 
     // ── Generic webhook ingress ────────────────────────────────────────────
     {
+        fn webhook_cors_headers(mut resp: axum::response::Response) -> axum::response::Response {
+            use axum::http::HeaderValue;
+            let h = resp.headers_mut();
+            if let Ok(v) = HeaderValue::from_static("*").try_into() { h.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, v); }
+            if let Ok(v) = HeaderValue::from_str("POST, OPTIONS") { h.insert(axum::http::header::ACCESS_CONTROL_ALLOW_METHODS, v); }
+            if let Ok(v) = HeaderValue::from_str("Content-Type, Authorization, X-Hub-Signature-256, X-GitHub-Event, X-GitHub-Delivery, X-Gitlab-Token, X-Gitlab-Event, Stripe-Signature, X-Webhook-Secret, X-Event-Type, X-Delivery-Id, Idempotency-Key, Linear-Signature, X-PagerDuty-Signature, Sentry-Hook-Signature") { h.insert(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS, v); }
+            if let Ok(v) = HeaderValue::from_str("86400") { h.insert(axum::http::header::ACCESS_CONTROL_MAX_AGE, v); }
+            resp
+        }
+
+        // OPTIONS preflight handler.
+        app = app.route(
+            "/api/webhooks/ingest/{public_id}",
+            axum::routing::options(
+                move |_: axum::extract::Path<String>| async move {
+                    webhook_cors_headers(StatusCode::NO_CONTENT.into_response())
+                },
+            ),
+        );
+
         let state_for_webhook_ingest = Arc::clone(&state);
         app = app.route(
             "/api/webhooks/ingest/{public_id}",
@@ -1131,6 +1151,7 @@ pub async fn prepare_gateway(
                       body: axum::body::Bytes| {
                     let gw = Arc::clone(&state_for_webhook_ingest);
                     async move {
+                        let resp = async {
                         let Some(store) = gw.webhook_store.get() else {
                             return (
                                 StatusCode::NOT_FOUND,
@@ -1350,6 +1371,8 @@ pub async fn prepare_gateway(
                             })),
                         )
                             .into_response()
+                        }.await;
+                        webhook_cors_headers(resp)
                     }
                 },
             ),
