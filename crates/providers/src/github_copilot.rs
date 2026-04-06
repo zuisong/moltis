@@ -1897,6 +1897,115 @@ mod tests {
         assert!(resp.tool_calls.is_empty());
     }
 
+    #[tokio::test]
+    async fn enterprise_complete_returns_error_on_http_failure() {
+        // Start a mock that returns 500 for /chat/completions.
+        let app = Router::new().route(
+            "/chat/completions",
+            post(|| async {
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error",
+                )
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let auth = CopilotAuth {
+            token: Secret::new("ent-token".into()),
+            base_url: format!("http://{addr}"),
+            is_enterprise: true,
+        };
+
+        let client = reqwest::Client::new();
+        let messages = vec![ChatMessage::user("hi")];
+        let result = collect_streamed_completion(&client, &auth, "gpt-4o", &messages, &[]).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("500"),
+            "error should mention HTTP status: {err}"
+        );
+    }
+
+    #[test]
+    fn copilot_token_response_debug_redacts_token() {
+        let resp = CopilotTokenResponse {
+            token: "super-secret-token".into(),
+            expires_at: 1700000000,
+            proxy_ep: Some("proxy.enterprise.githubcopilot.com".into()),
+        };
+        let debug_str = format!("{resp:?}");
+        assert!(
+            !debug_str.contains("super-secret-token"),
+            "token must not appear in Debug output: {debug_str}"
+        );
+        assert!(
+            debug_str.contains("[REDACTED]"),
+            "Debug output should contain [REDACTED]: {debug_str}"
+        );
+        // Other fields should still be visible.
+        assert!(debug_str.contains("1700000000"));
+        assert!(debug_str.contains("proxy.enterprise.githubcopilot.com"));
+    }
+
+    #[test]
+    fn stream_events_to_completion_with_tool_calls() {
+        let events = vec![
+            StreamEvent::ToolCallStart {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                index: 0,
+            },
+            StreamEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: r#"{"path":"/tmp/x"}"#.into(),
+            },
+            StreamEvent::ToolCallComplete { index: 0 },
+            StreamEvent::Done(Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            }),
+        ];
+        let resp = stream_events_to_completion(events);
+        assert!(resp.text.is_none());
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.tool_calls[0].id, "call_1");
+        assert_eq!(resp.tool_calls[0].name, "read_file");
+        assert_eq!(resp.tool_calls[0].arguments["path"], "/tmp/x");
+    }
+
+    #[tokio::test]
+    async fn enterprise_complete_handles_stream_without_done() {
+        // SSE stream that ends without [DONE] — events should still be collected.
+        let sse = [
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":"partial"}}]}"#,
+            r#"data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1}}"#,
+            "",
+        ]
+        .join("\n\n");
+        let (base_url, _) = start_streaming_mock_with_capture(sse).await;
+
+        let auth = CopilotAuth {
+            token: Secret::new("ent-token".into()),
+            base_url,
+            is_enterprise: true,
+        };
+
+        let client = reqwest::Client::new();
+        let messages = vec![ChatMessage::user("hi")];
+        let resp = collect_streamed_completion(&client, &auth, "gpt-4o", &messages, &[])
+            .await
+            .unwrap();
+        assert_eq!(resp.text.as_deref(), Some("partial"));
+    }
+
     // ── Responses API tests ─────────────────────────────────────────────────
 
     #[test]
