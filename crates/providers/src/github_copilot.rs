@@ -611,10 +611,12 @@ async fn collect_streamed_completion(
 
             match process_openai_sse_line(data, &mut state) {
                 SseLineResult::Done => {
-                    events.extend(finalize_stream(&mut state));
+                    extend_events_or_error(&mut events, finalize_stream(&mut state))?;
                     return Ok(stream_events_to_completion(events));
                 },
-                SseLineResult::Events(evts) => events.extend(evts),
+                SseLineResult::Events(new_events) => {
+                    extend_events_or_error(&mut events, new_events)?;
+                },
                 SseLineResult::Skip => {},
             }
         }
@@ -632,18 +634,20 @@ async fn collect_streamed_completion(
     {
         match process_openai_sse_line(data, &mut state) {
             SseLineResult::Done => {
-                events.extend(finalize_stream(&mut state));
+                extend_events_or_error(&mut events, finalize_stream(&mut state))?;
                 return Ok(stream_events_to_completion(events));
             },
-            SseLineResult::Events(evts) => events.extend(evts),
+            SseLineResult::Events(new_events) => {
+                extend_events_or_error(&mut events, new_events)?;
+            },
             SseLineResult::Skip => {},
         }
     }
-    events.extend(finalize_stream(&mut state));
+    extend_events_or_error(&mut events, finalize_stream(&mut state))?;
     Ok(stream_events_to_completion(events))
 }
 
-fn extend_responses_events_or_error(
+fn extend_events_or_error(
     events: &mut Vec<StreamEvent>,
     new_events: Vec<StreamEvent>,
 ) -> anyhow::Result<()> {
@@ -733,14 +737,11 @@ async fn collect_streamed_responses_completion(
 
             match process_responses_sse_line(data, &mut state) {
                 SseLineResult::Done => {
-                    extend_responses_events_or_error(
-                        &mut events,
-                        finalize_responses_stream(&mut state),
-                    )?;
+                    extend_events_or_error(&mut events, finalize_responses_stream(&mut state))?;
                     return Ok(stream_events_to_completion(events));
                 },
                 SseLineResult::Events(new_events) => {
-                    extend_responses_events_or_error(&mut events, new_events)?;
+                    extend_events_or_error(&mut events, new_events)?;
                 },
                 SseLineResult::Skip => {},
             }
@@ -759,20 +760,17 @@ async fn collect_streamed_responses_completion(
     {
         match process_responses_sse_line(data, &mut state) {
             SseLineResult::Done => {
-                extend_responses_events_or_error(
-                    &mut events,
-                    finalize_responses_stream(&mut state),
-                )?;
+                extend_events_or_error(&mut events, finalize_responses_stream(&mut state))?;
                 return Ok(stream_events_to_completion(events));
             },
             SseLineResult::Events(new_events) => {
-                extend_responses_events_or_error(&mut events, new_events)?;
+                extend_events_or_error(&mut events, new_events)?;
             },
             SseLineResult::Skip => {},
         }
     }
 
-    extend_responses_events_or_error(&mut events, finalize_responses_stream(&mut state))?;
+    extend_events_or_error(&mut events, finalize_responses_stream(&mut state))?;
     Ok(stream_events_to_completion(events))
 }
 
