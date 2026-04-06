@@ -258,6 +258,11 @@
 
 .session-item:hover { background: var(--bg-hover); }
 
+.session-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .session-item.active {
   background: var(--accent-subtle);
   border-left: 3px solid var(--accent);

@@ -216,14 +216,20 @@ test.describe("Session management", () => {
 		const currentUrl = page.url();
 
 		const mainItem = page.locator('#sessionList .session-item[data-session-key="main"]');
-		await expect(mainItem).toBeVisible();
+		await expect(mainItem).toBeVisible({ timeout: 5_000 });
 
-		const newPagePromise = page.context().waitForEvent("page");
+		const newPagePromise = new Promise((resolve) => {
+			page.context().once("page", (openedPage) => {
+				resolve({
+					newPage: openedPage,
+					newPageErrors: watchPageErrors(openedPage),
+				});
+			});
+		});
 		await mainItem.click({
 			modifiers: [process.platform === "darwin" ? "Meta" : "Control"],
 		});
-		const newPage = await newPagePromise;
-		const newPageErrors = watchPageErrors(newPage);
+		const { newPage, newPageErrors } = await newPagePromise;
 
 		await newPage.waitForLoadState("domcontentloaded");
 		await expectPageContentMounted(newPage);
