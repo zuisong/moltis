@@ -3285,6 +3285,9 @@ pub async fn prepare_gateway_core(
                     if let Some(ref model) = req.model {
                         params["model"] = serde_json::Value::String(model.clone());
                     }
+                    if let Some(ref agent_id) = req.agent_id {
+                        params["agent_id"] = serde_json::Value::String(agent_id.clone());
+                    }
                     let result = chat.send_sync(params).await.map_err(|e| anyhow::anyhow!("{e}"))?;
                     let input_tokens = result.get("inputTokens").and_then(|v| v.as_i64());
                     let output_tokens = result.get("outputTokens").and_then(|v| v.as_i64());
