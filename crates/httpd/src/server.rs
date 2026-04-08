@@ -1479,7 +1479,8 @@ pub async fn prepare_gateway(
         } else if tls_config.auto_generate {
             // Auto-generate certificates.
             let mgr = moltis_tls::FsCertManager::new()?;
-            let (ca, cert, key) = mgr.ensure_certs()?;
+            let runtime_sans = tls_runtime_sans(bind);
+            let (ca, cert, key) = mgr.ensure_certs(&runtime_sans)?;
             (Some(ca), cert, key)
         } else {
             anyhow::bail!(
@@ -2453,7 +2454,8 @@ pub async fn start_gateway(
         } else if tls_config.auto_generate {
             // Auto-generate certificates.
             let mgr = moltis_tls::FsCertManager::new()?;
-            let (ca, cert, key) = mgr.ensure_certs()?;
+            let runtime_sans = tls_runtime_sans(bind);
+            let (ca, cert, key) = mgr.ensure_certs(&runtime_sans)?;
             (Some(ca), cert, key)
         } else {
             anyhow::bail!(
@@ -2935,6 +2937,36 @@ fn resolve_outbound_ip(ipv6: bool) -> Option<std::net::IpAddr> {
     let socket = UdpSocket::bind(bind).ok()?;
     socket.connect(target).ok()?;
     Some(socket.local_addr().ok()?.ip())
+}
+
+#[cfg(feature = "tls")]
+fn tls_runtime_sans(bind: &str) -> Vec<moltis_tls::ServerSan> {
+    let normalized = bind.trim().trim_end_matches('.');
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+        if ip.is_unspecified() {
+            return resolve_outbound_ip(ip.is_ipv6())
+                .filter(|resolved| !resolved.is_loopback() && !resolved.is_unspecified())
+                .map(moltis_tls::ServerSan::Ip)
+                .into_iter()
+                .collect();
+        }
+
+        if !ip.is_loopback() {
+            return vec![moltis_tls::ServerSan::Ip(ip)];
+        }
+
+        return Vec::new();
+    }
+
+    if matches!(normalized, "localhost") || normalized.ends_with(".localhost") {
+        Vec::new()
+    } else {
+        vec![moltis_tls::ServerSan::Dns(normalized.to_ascii_lowercase())]
+    }
 }
 
 fn startup_bind_line(addr: SocketAddr) -> String {
