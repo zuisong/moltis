@@ -2948,6 +2948,9 @@ fn tls_runtime_sans(bind: &str) -> Vec<moltis_tls::ServerSan> {
 
     if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
         if ip.is_unspecified() {
+            // For wildcard binds we can only infer one "best" reachable IP
+            // from the current routing table, which fixes the common single-LAN
+            // case but still cannot cover every interface on multi-homed hosts.
             return resolve_outbound_ip(ip.is_ipv6())
                 .filter(|resolved| !resolved.is_loopback() && !resolved.is_unspecified())
                 .map(moltis_tls::ServerSan::Ip)
@@ -3201,6 +3204,41 @@ mod tests {
             let display = SocketAddr::new(ip, addr.port());
             assert!(!display.ip().is_unspecified());
             assert_eq!(display.port(), 9999);
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_uses_dns_for_non_localhost_names() {
+        assert_eq!(tls_runtime_sans("gateway.local"), vec![
+            moltis_tls::ServerSan::Dns("gateway.local".to_string())
+        ]);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_uses_ip_for_concrete_non_loopback_bind() {
+        assert_eq!(tls_runtime_sans("192.168.1.9"), vec![
+            moltis_tls::ServerSan::Ip("192.168.1.9".parse().unwrap())
+        ]);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_skips_loopback_hosts() {
+        assert!(tls_runtime_sans("127.0.0.1").is_empty());
+        assert!(tls_runtime_sans("localhost").is_empty());
+        assert!(tls_runtime_sans("moltis.localhost").is_empty());
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_wildcard_bind_uses_resolved_outbound_ip_when_available() {
+        let sans = tls_runtime_sans("0.0.0.0");
+        if let Some(ip) = resolve_outbound_ip(false) {
+            assert_eq!(sans, vec![moltis_tls::ServerSan::Ip(ip)]);
+        } else {
+            assert!(sans.is_empty());
         }
     }
 

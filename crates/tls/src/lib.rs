@@ -264,13 +264,13 @@ fn needs_san_update(path: &Path, san_metadata_path: &Path, required_sans: &[Serv
 fn read_san_metadata(path: &Path) -> Option<Vec<ServerSan>> {
     let contents = std::fs::read_to_string(path).ok()?;
     let mut sans = Vec::new();
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        sans.push(ServerSan::from_metadata_line(line)?);
-    }
+    sans.extend(
+        contents
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .filter_map(ServerSan::from_metadata_line),
+    );
     Some(normalize_sans(sans))
 }
 
@@ -720,21 +720,39 @@ mod tests {
 
         let runtime_a = [ServerSan::Ip("192.168.1.9".parse().unwrap())];
         let (_, cert1, _) = mgr.ensure_certs(&runtime_a).unwrap();
-        let mtime1 = std::fs::metadata(&cert1).unwrap().modified().unwrap();
+        let cert1_pem = std::fs::read_to_string(&cert1).unwrap();
 
         let (_, cert2, _) = mgr.ensure_certs(&runtime_a).unwrap();
-        let mtime2 = std::fs::metadata(&cert2).unwrap().modified().unwrap();
-        assert_eq!(mtime1, mtime2, "same SAN set should not regenerate certs");
-
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        let cert2_pem = std::fs::read_to_string(&cert2).unwrap();
+        assert_eq!(
+            cert1_pem, cert2_pem,
+            "same SAN set should not regenerate certs"
+        );
 
         let runtime_b = [ServerSan::Ip("192.168.1.10".parse().unwrap())];
         let (_, cert3, _) = mgr.ensure_certs(&runtime_b).unwrap();
-        let mtime3 = std::fs::metadata(&cert3).unwrap().modified().unwrap();
+        let cert3_pem = std::fs::read_to_string(&cert3).unwrap();
         assert!(
-            mtime3 > mtime2,
+            cert3_pem != cert2_pem,
             "changing runtime SANs should regenerate certs"
         );
+    }
+
+    #[test]
+    fn read_san_metadata_ignores_invalid_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let metadata_path = tmp.path().join("server-sans.txt");
+        std::fs::write(
+            &metadata_path,
+            "dns:gateway.local\nbogus line\nip:192.168.1.8\n\nip:not-an-ip\n",
+        )
+        .unwrap();
+
+        let sans = read_san_metadata(&metadata_path).unwrap();
+        assert_eq!(sans, vec![
+            ServerSan::Dns("gateway.local".to_string()),
+            ServerSan::Ip("192.168.1.8".parse().unwrap()),
+        ]);
     }
 
     #[test]
