@@ -1136,7 +1136,8 @@ pub async fn run_agent_loop_with_context(
         if response.tool_calls.is_empty() {
             // Auto-continue: if the model made tool calls earlier in this run
             // and we haven't exhausted nudges, ask it to keep going.
-            if total_tool_calls >= auto_continue_min_tool_calls
+            if total_tool_calls > 0
+                && total_tool_calls >= auto_continue_min_tool_calls
                 && auto_continue_count < max_auto_continues
             {
                 auto_continue_count += 1;
@@ -1837,7 +1838,8 @@ pub async fn run_agent_loop_streaming(
         if tool_calls.is_empty() {
             // Auto-continue: if the model made tool calls earlier in this run
             // and we haven't exhausted nudges, ask it to keep going.
-            if total_tool_calls >= auto_continue_min_tool_calls
+            if total_tool_calls > 0
+                && total_tool_calls >= auto_continue_min_tool_calls
                 && auto_continue_count < max_auto_continues
             {
                 auto_continue_count += 1;
