@@ -538,7 +538,9 @@ impl OpenAiProvider {
             || capability.starts_with("o3")
             || capability.starts_with("o4");
         if uses_max_completion_tokens {
-            body["max_completion_tokens"] = serde_json::json!(1);
+            // GPT-5 and reasoning models need a higher minimum output cap.
+            // Values below ~10 can trigger 400 errors on some models.
+            body["max_completion_tokens"] = serde_json::json!(16);
         } else {
             body["max_tokens"] = serde_json::json!(1);
         }
@@ -552,7 +554,7 @@ impl OpenAiProvider {
             "model": self.model,
             "messages": openai_messages,
         });
-        self.apply_top_level_system_prompt(&mut body);
+        self.apply_system_prompt_rewrite(&mut body);
         // Probes only answer "can this model respond at all?".
         // Keep them cheap instead of mirroring full reasoning budgets.
         self.apply_probe_output_cap_chat(&mut body);
@@ -711,9 +713,9 @@ impl OpenAiProvider {
     }
 
     /// Some providers (e.g. MiniMax) reject `role: "system"` in the messages
-    /// array and require system content in a top-level `"system"` field instead.
-    /// Add new providers here when they have the same constraint.
-    fn requires_top_level_system_prompt(&self) -> bool {
+    /// array. System content must be extracted and prepended to the first user
+    /// message instead (MiniMax silently ignores a top-level `"system"` field).
+    fn rejects_system_role(&self) -> bool {
         self.model.starts_with("MiniMax-")
             || self.provider_name.eq_ignore_ascii_case("minimax")
             || self.base_url.to_ascii_lowercase().contains("minimax")
@@ -721,13 +723,16 @@ impl OpenAiProvider {
 
     /// For providers that reject `role: "system"` in the messages array,
     /// extract all system messages from `body["messages"]`, join their
-    /// content with `\n\n`, and place the result in `body["system"]`.
+    /// content, and prepend it to the first user message.
+    ///
+    /// MiniMax's `/v1/chat/completions` endpoint returns error 2013 for
+    /// `role: "system"` entries and silently ignores a top-level `"system"`
+    /// field. The only reliable way to deliver the system prompt is to
+    /// inline it into the first user message.
     ///
     /// Must be called on the request body **after** it is fully assembled.
-    /// This is intentionally a single body-level mutation so call sites
-    /// cannot forget to apply it (previously reverted by accident in #586).
-    fn apply_top_level_system_prompt(&self, body: &mut serde_json::Value) {
-        if !self.requires_top_level_system_prompt() {
+    fn apply_system_prompt_rewrite(&self, body: &mut serde_json::Value) {
+        if !self.rejects_system_role() {
             return;
         }
         let Some(messages) = body
@@ -750,8 +755,43 @@ impl OpenAiProvider {
             }
             true
         });
-        if !system_parts.is_empty() {
-            body["system"] = serde_json::Value::String(system_parts.join("\n\n"));
+        if system_parts.is_empty() {
+            return;
+        }
+        let system_text = system_parts.join("\n\n");
+
+        // Find the first user message and prepend system content to it.
+        let system_block =
+            format!("[System Instructions]\n{system_text}\n[End System Instructions]\n\n");
+        if let Some(first_user) = messages
+            .iter_mut()
+            .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        {
+            match first_user.get("content").cloned() {
+                Some(serde_json::Value::String(s)) => {
+                    first_user["content"] = serde_json::Value::String(format!("{system_block}{s}"));
+                },
+                Some(serde_json::Value::Array(mut arr)) => {
+                    // Multimodal content (text + images): prepend as a text block.
+                    arr.insert(
+                        0,
+                        serde_json::json!({ "type": "text", "text": system_block }),
+                    );
+                    first_user["content"] = serde_json::Value::Array(arr);
+                },
+                _ => {
+                    first_user["content"] = serde_json::Value::String(system_block);
+                },
+            }
+        } else {
+            // No user message yet (e.g. probe); insert a synthetic user message.
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "user",
+                    "content": format!("[System Instructions]\n{system_text}\n[End System Instructions]")
+                }),
+            );
         }
     }
 
@@ -1097,7 +1137,7 @@ impl OpenAiProvider {
                 "stream": true,
                 "stream_options": { "include_usage": true },
             });
-            self.apply_top_level_system_prompt(&mut body);
+            self.apply_system_prompt_rewrite(&mut body);
 
             if !tools.is_empty() {
                 body["tools"] = serde_json::Value::Array(to_openai_tools(&tools));
@@ -1731,7 +1771,7 @@ impl LlmProvider for OpenAiProvider {
             "model": self.model,
             "messages": openai_messages,
         });
-        self.apply_top_level_system_prompt(&mut body);
+        self.apply_system_prompt_rewrite(&mut body);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(to_openai_tools(tools));
@@ -2015,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_body_extracts_system_messages_to_top_level() {
+    fn minimax_body_prepends_system_content_to_first_user_message() {
         let provider = OpenAiProvider::new_with_name(
             Secret::new("test-key".to_string()),
             "MiniMax-M2.1".to_string(),
@@ -2028,12 +2068,81 @@ mod tests {
             ChatMessage::system("sys b"),
         ]);
         let mut body = serde_json::json!({ "model": "MiniMax-M2.1", "messages": serialized });
-        provider.apply_top_level_system_prompt(&mut body);
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "system messages should be removed");
+        assert_eq!(messages[0]["role"], "user");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("sys a") && content.contains("sys b"),
+            "both system parts should be in user message: {content}"
+        );
+        assert!(content.contains("hi"), "original user content preserved");
+        // No top-level system field (MiniMax ignores it)
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn minimax_body_without_user_message_creates_synthetic_user_message() {
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.1".to_string(),
+            "https://api.minimax.io/v1".to_string(),
+            "minimax".to_string(),
+        );
+        let serialized =
+            provider.serialize_messages_for_request(&[ChatMessage::system("be helpful")]);
+        let mut body = serde_json::json!({ "model": "MiniMax-M2.1", "messages": serialized });
+        provider.apply_system_prompt_rewrite(&mut body);
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
-        assert_eq!(body["system"], "sys a\n\nsys b");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("be helpful")
+        );
+    }
+
+    #[test]
+    fn minimax_body_preserves_multimodal_user_content() {
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.1".to_string(),
+            "https://api.minimax.io/v1".to_string(),
+            "minimax".to_string(),
+        );
+        // Simulate a multimodal user message (text + image) serialized as an array
+        let mut body = serde_json::json!({
+            "model": "MiniMax-M2.1",
+            "messages": [
+                { "role": "system", "content": "be helpful" },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "describe this" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+                    ]
+                }
+            ]
+        });
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "system message removed");
+        assert_eq!(messages[0]["role"], "user");
+
+        // Content should be an array with system block prepended
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3, "system text + original text + image");
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().contains("be helpful"));
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe this");
+        assert_eq!(content[2]["type"], "image_url");
     }
 
     #[test]
@@ -2048,7 +2157,7 @@ mod tests {
             ChatMessage::user("hi"),
         ]);
         let mut body = serde_json::json!({ "model": "gpt-4o", "messages": serialized });
-        provider.apply_top_level_system_prompt(&mut body);
+        provider.apply_system_prompt_rewrite(&mut body);
 
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
@@ -2151,7 +2260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn minimax_stream_request_extracts_system_role_messages() {
+    async fn minimax_stream_prepends_system_to_first_user_message() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
                    data: [DONE]\n\n";
         let (base_url, captured) = start_sse_mock(sse.to_string()).await;
@@ -2172,17 +2281,24 @@ mod tests {
         let reqs = captured.lock().unwrap();
         assert_eq!(reqs.len(), 1);
         let body = reqs[0].body.as_ref().expect("request should have a body");
-        assert_eq!(body["system"], "stay deterministic");
+        // No top-level system field (MiniMax ignores it)
+        assert!(body.get("system").is_none());
 
         let history = body["messages"]
             .as_array()
             .expect("messages should be an array");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["role"], "user");
+        let content = history[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("stay deterministic"),
+            "system text in user msg"
+        );
+        assert!(content.contains("ping"), "original user text preserved");
     }
 
     #[tokio::test]
-    async fn minimax_complete_request_extracts_system_role_messages_regression_578() {
+    async fn minimax_complete_prepends_system_to_user_message_regression_578() {
         let payload = serde_json::json!({
             "choices": [{
                 "message": {
@@ -2217,20 +2333,22 @@ mod tests {
 
         let reqs = captured.lock().unwrap();
         let body = reqs[0].body.as_ref().expect("request should have a body");
-        assert_eq!(
-            body["system"],
-            "you are a helpful assistant\n\nextra context"
-        );
+        // No top-level system field
+        assert!(body.get("system").is_none());
 
         let history = body["messages"]
             .as_array()
             .expect("messages should be an array");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["role"], "user");
+        let content = history[0]["content"].as_str().unwrap();
+        assert!(content.contains("you are a helpful assistant"));
+        assert!(content.contains("extra context"));
+        assert!(content.contains("hello"));
     }
 
     #[tokio::test]
-    async fn minimax_stream_extracts_multiple_system_messages_regression_578() {
+    async fn minimax_stream_multiple_system_messages_prepended_regression_578() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
                    data: [DONE]\n\n";
         let (base_url, captured) = start_sse_mock(sse.to_string()).await;
@@ -2252,16 +2370,18 @@ mod tests {
 
         let reqs = captured.lock().unwrap();
         let body = reqs[0].body.as_ref().expect("request should have a body");
-        assert_eq!(
-            body["system"],
-            "you are a helpful assistant\n\nextra context"
-        );
+        // No top-level system field
+        assert!(body.get("system").is_none());
 
         let history = body["messages"]
             .as_array()
             .expect("messages should be an array");
         assert_eq!(history.len(), 1);
         assert_eq!(history[0]["role"], "user");
+        let content = history[0]["content"].as_str().unwrap();
+        assert!(content.contains("you are a helpful assistant"));
+        assert!(content.contains("extra context"));
+        assert!(content.contains("hello"));
     }
 
     #[tokio::test]
@@ -2298,7 +2418,7 @@ mod tests {
         let reqs = captured.lock().unwrap();
         assert_eq!(reqs.len(), 1);
         let body = reqs[0].body.as_ref().expect("request should have a body");
-        assert_eq!(body["max_completion_tokens"], 1);
+        assert_eq!(body["max_completion_tokens"], 16);
         assert!(body.get("max_tokens").is_none());
     }
 
