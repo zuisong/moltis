@@ -729,8 +729,21 @@ pub struct KnownProvider {
     pub default_base_url: Option<&'static str>,
     /// Whether this provider requires a model to be specified.
     pub requires_model: bool,
-    /// Whether the API key is optional (e.g. Ollama runs locally without auth).
+    /// Whether the API key is optional (e.g. Ollama and LM Studio run locally
+    /// without auth).
     pub key_optional: bool,
+}
+
+impl KnownProvider {
+    /// Returns true if this provider is local-only — runs on the user's
+    /// machine and isn't reachable from cloud deployments. Used by cloud-mode
+    /// filters to hide providers that bind to localhost. Replaces the old
+    /// `auth_type == Local || name == "ollama"` string-based check, which
+    /// missed every new local OpenAI-compatible provider added after Ollama.
+    #[must_use]
+    pub fn is_local_only(&self) -> bool {
+        self.auth_type == AuthType::Local || self.key_optional
+    }
 }
 
 /// Build the known providers list at runtime, including local-llm if enabled.
@@ -877,6 +890,15 @@ pub fn known_providers() -> Vec<KnownProvider> {
             auth_type: AuthType::ApiKey,
             env_key: Some("OLLAMA_API_KEY"),
             default_base_url: Some("http://localhost:11434"),
+            requires_model: false,
+            key_optional: true,
+        },
+        KnownProvider {
+            name: "lmstudio",
+            display_name: "LM Studio",
+            auth_type: AuthType::ApiKey,
+            env_key: Some("LMSTUDIO_API_KEY"),
+            default_base_url: Some("http://127.0.0.1:1234/v1"),
             requires_model: false,
             key_optional: true,
         },
@@ -1115,7 +1137,7 @@ pub fn detect_auto_provider_sources_with_overrides(
 
     for provider in known_providers().into_iter().filter(|p| {
         if is_cloud {
-            return p.auth_type != AuthType::Local && p.name != "ollama";
+            return !p.is_local_only();
         }
         true
     }) {
@@ -1681,8 +1703,7 @@ impl ProviderSetupService for LiveProviderSetupService {
             .enumerate()
             .filter_map(|(known_idx, provider)| {
                 // Hide local-only providers on cloud deployments.
-                if is_cloud && (provider.auth_type == AuthType::Local || provider.name == "ollama")
-                {
+                if is_cloud && provider.is_local_only() {
                     return None;
                 }
 
@@ -1826,10 +1847,9 @@ impl ProviderSetupService for LiveProviderSetupService {
                 })
                 .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
 
-            // API key is required for api-key providers (except Ollama which is optional)
-            if provider.auth_type == AuthType::ApiKey
-                && provider_name != "ollama"
-                && api_key.is_none()
+            // API key is required for api-key providers unless the provider
+            // marks the key as optional (Ollama, LM Studio).
+            if provider.auth_type == AuthType::ApiKey && !provider.key_optional && api_key.is_none()
             {
                 return Err("missing 'apiKey' parameter".into());
             }
@@ -2257,9 +2277,9 @@ impl ProviderSetupService for LiveProviderSetupService {
                 .iter()
                 .find(|p| p.name == provider_name)
                 .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
-            // API key is required for api-key providers (except Ollama).
-            if info.auth_type == AuthType::ApiKey && provider_name != "ollama" && api_key.is_none()
-            {
+            // API key is required for api-key providers unless the provider
+            // marks the key as optional (Ollama, LM Studio).
+            if info.auth_type == AuthType::ApiKey && !info.key_optional && api_key.is_none() {
                 return Err("missing 'apiKey' parameter".into());
             }
             Some(KnownProvider {
@@ -4051,8 +4071,50 @@ mod tests {
         assert!(names.contains(&"kimi-code"), "missing kimi-code");
         assert!(names.contains(&"venice"), "missing venice");
         assert!(names.contains(&"ollama"), "missing ollama");
+        assert!(names.contains(&"lmstudio"), "missing lmstudio");
         // OAuth providers
         assert!(names.contains(&"github-copilot"), "missing github-copilot");
+    }
+
+    #[test]
+    fn lmstudio_is_local_only_with_optional_key() {
+        let providers = known_providers();
+        let lmstudio = providers
+            .iter()
+            .find(|p| p.name == "lmstudio")
+            .expect("lmstudio not in known_providers");
+        assert_eq!(lmstudio.auth_type, AuthType::ApiKey);
+        assert!(
+            lmstudio.key_optional,
+            "lmstudio runs locally and must not require an API key"
+        );
+        assert!(
+            lmstudio.is_local_only(),
+            "lmstudio must be filtered out of cloud deployments"
+        );
+        assert_eq!(lmstudio.env_key, Some("LMSTUDIO_API_KEY"));
+        assert_eq!(
+            lmstudio.default_base_url,
+            Some("http://127.0.0.1:1234/v1"),
+            "lmstudio default base URL must match LM Studio's default server port"
+        );
+    }
+
+    #[test]
+    fn is_local_only_matches_legacy_name_check() {
+        // Regression: before the typed `is_local_only()` helper, cloud-mode
+        // filters used `auth_type == Local || name == "ollama"`. Confirm the
+        // typed method covers exactly the same set of providers (plus any new
+        // ones marked key_optional or auth_type::Local going forward).
+        for p in known_providers() {
+            let legacy = p.auth_type == AuthType::Local || p.name == "ollama";
+            let typed = p.is_local_only();
+            assert!(
+                typed || !legacy,
+                "{}: legacy says local but typed disagrees",
+                p.name
+            );
+        }
     }
 
     #[test]
@@ -4079,6 +4141,7 @@ mod tests {
             ("kimi-code", "KIMI_API_KEY"),
             ("venice", "VENICE_API_KEY"),
             ("ollama", "OLLAMA_API_KEY"),
+            ("lmstudio", "LMSTUDIO_API_KEY"),
         ];
         let providers = known_providers();
         for (name, env_key) in expected {
@@ -4111,6 +4174,7 @@ mod tests {
             "kimi-code",
             "venice",
             "ollama",
+            "lmstudio",
         ] {
             // We can't actually persist in tests (would write to real disk),
             // but we can verify the provider name is recognized.
@@ -4149,6 +4213,7 @@ mod tests {
             "kimi-code",
             "venice",
             "ollama",
+            "lmstudio",
             "github-copilot",
         ] {
             assert!(
@@ -4176,7 +4241,7 @@ mod tests {
             .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
             .collect();
 
-        // local-llm and ollama should be hidden on cloud deployments
+        // local-only providers should be hidden on cloud deployments
         assert!(
             !names.contains(&"local-llm"),
             "local-llm should be hidden on cloud: {names:?}"
@@ -4184,6 +4249,10 @@ mod tests {
         assert!(
             !names.contains(&"ollama"),
             "ollama should be hidden on cloud: {names:?}"
+        );
+        assert!(
+            !names.contains(&"lmstudio"),
+            "lmstudio should be hidden on cloud: {names:?}"
         );
 
         // Cloud-compatible providers should still be present
@@ -4215,6 +4284,10 @@ mod tests {
         assert!(
             names.contains(&"ollama"),
             "ollama should be present locally: {names:?}"
+        );
+        assert!(
+            names.contains(&"lmstudio"),
+            "lmstudio should be present locally: {names:?}"
         );
         assert!(
             names.contains(&"openai"),
