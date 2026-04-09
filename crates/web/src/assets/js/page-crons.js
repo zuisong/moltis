@@ -598,8 +598,6 @@ function parseScheduleFromForm(kind, signals) {
 	return { schedule: schedule };
 }
 
-
-
 function CronModal() {
 	var isEdit = !!editingJob.value;
 	var job = editingJob.value;
@@ -761,20 +759,28 @@ function CronModal() {
 		if (schedKind.value === "at") {
 			return html`<input data-field="at" class="provider-key-input ${errorField.value === "at" ? "field-error" : ""}" type="datetime-local"
         value=${schedAtTimestamp.value}
-        onInput=${(e) => { schedAtTimestamp.value = e.target.value; }} />`;
+        onInput=${(e) => {
+					schedAtTimestamp.value = e.target.value;
+				}} />`;
 		}
 		if (schedKind.value === "every") {
 			return html`<input data-field="every" class="provider-key-input ${errorField.value === "every" ? "field-error" : ""}" type="number" placeholder="Interval in seconds" min="1"
         value=${schedEverySecs.value}
-        onInput=${(e) => { schedEverySecs.value = e.target.value; }} />`;
+        onInput=${(e) => {
+					schedEverySecs.value = e.target.value;
+				}} />`;
 		}
 		return html`
       <input data-field="cron" class="provider-key-input ${errorField.value === "cron" ? "field-error" : ""}" placeholder="*/5 * * * *"
         value=${schedCronExpr.value}
-        onInput=${(e) => { schedCronExpr.value = e.target.value; }} />
+        onInput=${(e) => {
+					schedCronExpr.value = e.target.value;
+				}} />
       <input data-field="tz" class="provider-key-input" placeholder="Timezone (optional, e.g. Europe/Paris)"
         value=${schedCronTz.value}
-        onInput=${(e) => { schedCronTz.value = e.target.value; }} />
+        onInput=${(e) => {
+					schedCronTz.value = e.target.value;
+				}} />
       <p class="text-xs text-[var(--muted)] mt-1">${cronTimezoneHelpText()}</p>
     `;
 	}
