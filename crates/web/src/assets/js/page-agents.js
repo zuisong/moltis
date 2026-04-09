@@ -312,12 +312,12 @@ function AgentCard({ agent, defaultId, onEdit, onDelete, onSetDefault }) {
 			${
 				truncatedWorkspacePromptFiles.length > 0 &&
 				html`
-				<div class="text-xs text-[var(--text)] mt-2">
+				<div class="text-xs mt-2 rounded-md border border-[var(--border)] bg-[var(--surface)] p-2 text-[var(--text)]">
 					${truncatedWorkspacePromptFiles.map((file, index) => {
 						var name = typeof file.name === "string" ? file.name : "workspace file";
-						var charCount = Number(file.charCount || 0).toLocaleString();
-						var limitChars = Number(file.limitChars || 0).toLocaleString();
-						var truncatedChars = Number(file.truncatedChars || 0).toLocaleString();
+						var charCount = Number(file.original_chars || 0).toLocaleString();
+						var limitChars = Number(file.limit_chars || 0).toLocaleString();
+						var truncatedChars = Number(file.truncated_chars || 0).toLocaleString();
 						var source = typeof file.source === "string" ? ` (${file.source})` : "";
 						var line = `${name}${source}: ${charCount} chars, limit ${limitChars}, truncated by ${truncatedChars}`;
 						return html`<div key=${`${name}-${index}`}>${line}</div>`;

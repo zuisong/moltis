@@ -3253,6 +3253,7 @@ pub async fn prepare_gateway_core(
     let state = GatewayState::with_options(
         resolved_auth,
         services,
+        config.clone(),
         Some(Arc::clone(&sandbox_router)),
         Some(Arc::clone(&credential_store)),
         Some(pairing_store),
@@ -4913,6 +4914,7 @@ mod tests {
                 password: None,
             },
             GatewayServices::noop(),
+            moltis_config::MoltisConfig::default(),
             None,
             Some(Arc::clone(&credential_store)),
             None,

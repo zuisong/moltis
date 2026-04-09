@@ -5,7 +5,10 @@ use std::{
 
 use tracing::warn;
 
-use moltis_protocol::{ErrorShape, error_codes};
+use {
+    moltis_agents::prompt::WorkspaceFilePromptStatus,
+    moltis_protocol::{ErrorShape, error_codes},
+};
 
 use crate::{
     broadcast::{BroadcastOpts, broadcast},
@@ -202,10 +205,17 @@ fn normalize_relative_agent_path(path: &str) -> Result<PathBuf, ErrorShape> {
     Ok(candidate.to_path_buf())
 }
 
-fn workspace_file_limit_chars() -> usize {
-    moltis_config::discover_and_load()
-        .chat
-        .workspace_file_max_chars
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkspacePromptFileStatusResponse {
+    path: String,
+    source: &'static str,
+    size: Option<u64>,
+    #[serde(flatten)]
+    prompt_status: WorkspaceFilePromptStatus,
+}
+
+fn workspace_file_limit_chars(ctx: &MethodContext) -> usize {
+    ctx.state.config.chat.workspace_file_max_chars
 }
 
 fn should_fallback_agent_file_to_root(agent_id: &str, relative_path: &Path) -> bool {
@@ -239,29 +249,34 @@ fn workspace_prompt_file_status(
     agent_id: &str,
     file_name: &str,
     limit_chars: usize,
-) -> Option<serde_json::Value> {
+) -> Option<WorkspacePromptFileStatusResponse> {
     let relative_path = Path::new(file_name);
     let (path, source) = resolve_agent_file_target(agent_id, relative_path)?;
     let content = std::fs::read_to_string(&path).ok()?;
-    let char_count = content.chars().count();
+    let original_chars = content.chars().count();
     let size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
-    Some(serde_json::json!({
-        "name": file_name,
-        "path": file_name,
-        "source": source,
-        "size": size_bytes,
-        "charCount": char_count,
-        "limitChars": limit_chars,
-        "truncated": char_count > limit_chars,
-        "truncatedChars": char_count.saturating_sub(limit_chars),
-        "includedChars": char_count.min(limit_chars),
-    }))
+    Some(WorkspacePromptFileStatusResponse {
+        path: file_name.to_string(),
+        source,
+        size: size_bytes,
+        prompt_status: WorkspaceFilePromptStatus {
+            name: file_name.to_string(),
+            original_chars,
+            included_chars: original_chars.min(limit_chars),
+            limit_chars,
+            truncated_chars: original_chars.saturating_sub(limit_chars),
+            truncated: original_chars > limit_chars,
+        },
+    })
 }
 
 fn workspace_prompt_files_status(agent_id: &str, limit_chars: usize) -> Vec<serde_json::Value> {
     ["AGENTS.md", "TOOLS.md"]
         .iter()
-        .filter_map(|file_name| workspace_prompt_file_status(agent_id, file_name, limit_chars))
+        .filter_map(|file_name| {
+            workspace_prompt_file_status(agent_id, file_name, limit_chars)
+                .and_then(|status| serde_json::to_value(status).ok())
+        })
         .collect()
 }
 
@@ -426,7 +441,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         ));
                     };
                     let default_id = store.default_id().await.map_err(ErrorShape::from)?;
-                    let limit_chars = workspace_file_limit_chars();
+                    let limit_chars = workspace_file_limit_chars(&ctx);
                     let agents = store
                         .list()
                         .await
@@ -480,7 +495,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                     let mut payload = serde_json::to_value(agent)
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
-                    let limit_chars = workspace_file_limit_chars();
+                    let limit_chars = workspace_file_limit_chars(&ctx);
                     if let Some(obj) = payload.as_object_mut() {
                         obj.insert(
                             "identity_fields".to_string(),
@@ -761,7 +776,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
             Box::new(|ctx| {
                 Box::pin(async move {
                     let agent_id = resolve_requested_agent_id(&ctx, &ctx.params).await?;
-                    let limit_chars = workspace_file_limit_chars();
+                    let limit_chars = workspace_file_limit_chars(&ctx);
                     let mut files: Vec<serde_json::Value> = Vec::new();
                     let root = moltis_config::agent_workspace_dir(&agent_id);
                     let root_exists = root.exists();
@@ -791,7 +806,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 && let Some(obj) = entry.as_object_mut()
                                 && let Some(status) =
                                     workspace_prompt_file_status(&agent_id, file_name, limit_chars)
-                                && let Some(status_obj) = status.as_object()
+                                && let Ok(status_value) = serde_json::to_value(status)
+                                && let Some(status_obj) = status_value.as_object()
                             {
                                 for (key, value) in status_obj {
                                     if key != "path" && key != "source" && key != "size" {
