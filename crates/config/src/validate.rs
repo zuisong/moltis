@@ -1133,6 +1133,16 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
+    // A zero workspace file limit would silently drop all AGENTS.md / TOOLS.md content.
+    if config.chat.workspace_file_max_chars == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "chat.workspace_file_max_chars".into(),
+            message: "chat.workspace_file_max_chars is 0 — AGENTS.md and TOOLS.md will be empty in the prompt".into(),
+        });
+    }
+
     if config.mcp.request_timeout_secs == 0 {
         diagnostics.push(Diagnostic {
             severity: Severity::Error,

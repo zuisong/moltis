@@ -585,43 +585,25 @@ fn append_workspace_files_section(
     }
 
     prompt.push_str("## Workspace Files\n\n");
-    if let Some(agents_md) = agents_text {
-        prompt.push_str("### AGENTS.md (workspace)\n\n");
-        let original_chars = agents_md.chars().count();
-        append_truncated_text_block(
-            prompt,
-            agents_md,
-            max_chars,
-            "\n*(AGENTS.md truncated for prompt size.)*\n",
-        );
-        if original_chars > max_chars {
-            tracing::warn!(
-                file = "AGENTS.md",
-                original_chars,
-                limit = max_chars,
-                "workspace file truncated for prompt size"
+    for (label, text) in [("AGENTS.md", agents_text), ("TOOLS.md", tools_text)] {
+        if let Some(md) = text {
+            prompt.push_str(&format!("### {label} (workspace)\n\n"));
+            let truncated = append_truncated_text_block(
+                prompt,
+                md,
+                max_chars,
+                &format!("\n*({label} truncated for prompt size.)*\n"),
             );
+            if truncated {
+                tracing::warn!(
+                    file = label,
+                    original_chars = md.chars().count(),
+                    limit = max_chars,
+                    "workspace file truncated for prompt size"
+                );
+            }
+            prompt.push_str("\n\n");
         }
-        prompt.push_str("\n\n");
-    }
-    if let Some(tools_md) = tools_text {
-        prompt.push_str("### TOOLS.md (workspace)\n\n");
-        let original_chars = tools_md.chars().count();
-        append_truncated_text_block(
-            prompt,
-            tools_md,
-            max_chars,
-            "\n*(TOOLS.md truncated for prompt size.)*\n",
-        );
-        if original_chars > max_chars {
-            tracing::warn!(
-                file = "TOOLS.md",
-                original_chars,
-                limit = max_chars,
-                "workspace file truncated for prompt size"
-            );
-        }
-        prompt.push_str("\n\n");
     }
 }
 
@@ -711,7 +693,7 @@ fn append_available_tools_section(
         for schema in tool_schemas {
             let name = schema["name"].as_str().unwrap_or("unknown");
             let desc = schema["description"].as_str().unwrap_or("");
-            let compact_desc = truncate_prompt_text(desc, 160);
+            let (compact_desc, _) = truncate_prompt_text(desc, 160);
             if compact_desc.is_empty() {
                 prompt.push_str(&format!("- `{name}`\n"));
             } else {
@@ -789,30 +771,36 @@ fn format_host_runtime_line(host: &PromptHostRuntimeContext) -> Option<String> {
     (!parts.is_empty()).then(|| format!("Host: {}", parts.join(" | ")))
 }
 
-fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
+/// Truncate `text` to at most `max_chars` characters.
+/// Returns `(output, was_truncated)`.
+fn truncate_prompt_text(text: &str, max_chars: usize) -> (String, bool) {
     if text.is_empty() || max_chars == 0 {
-        return String::new();
+        return (String::new(), false);
     }
     let mut iter = text.chars();
     let taken: String = iter.by_ref().take(max_chars).collect();
     if iter.next().is_some() {
-        format!("{taken}...")
+        (format!("{taken}..."), true)
     } else {
-        taken
+        (taken, false)
     }
 }
 
+/// Append `text` to `prompt`, truncating to `max_chars` characters.
+/// If the text was truncated, `truncated_notice` is appended and the
+/// function returns `true`.
 fn append_truncated_text_block(
     prompt: &mut String,
     text: &str,
     max_chars: usize,
     truncated_notice: &str,
-) {
-    let truncated = truncate_prompt_text(text, max_chars);
+) -> bool {
+    let (truncated, was_truncated) = truncate_prompt_text(text, max_chars);
     prompt.push_str(&truncated);
-    if text.chars().count() > max_chars {
+    if was_truncated {
         prompt.push_str(truncated_notice);
     }
+    was_truncated
 }
 
 fn format_sandbox_runtime_line(sandbox: &PromptSandboxRuntimeContext) -> String {
