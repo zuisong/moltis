@@ -359,7 +359,7 @@ impl BrowserPool {
         let container_host = self.config.container_host.clone();
 
         let container = tokio::task::spawn_blocking(move || {
-            // Check container runtime availability (Docker or Apple Container)
+            // Check container runtime availability (Docker, Podman, or Apple Container)
             if !container::is_container_available() {
                 return Err(Error::LaunchFailed(
                     "No container runtime available for sandboxed browser. \
