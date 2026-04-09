@@ -74,6 +74,7 @@ async fn start_auth_server_impl(
     let state = GatewayState::with_options(
         resolved_auth,
         services,
+        moltis_config::MoltisConfig::default(),
         None,
         Some(Arc::clone(&cred_store)),
         None, // pairing_store
@@ -144,6 +145,7 @@ async fn start_localhost_server_with_vault() -> (
     let state = GatewayState::with_options(
         resolved_auth,
         services,
+        moltis_config::MoltisConfig::default(),
         None,
         Some(Arc::clone(&cred_store)),
         None, // pairing_store
@@ -217,6 +219,7 @@ async fn start_localhost_server_with_vault_and_session_store() -> (
     let state = GatewayState::with_options(
         resolved_auth,
         services,
+        moltis_config::MoltisConfig::default(),
         None,
         Some(Arc::clone(&cred_store)),
         None, // pairing_store
@@ -1822,6 +1825,7 @@ async fn start_server_with_onboarding(
     let state = GatewayState::with_options(
         resolved_auth,
         services,
+        moltis_config::MoltisConfig::default(),
         None,
         Some(Arc::clone(&cred_store)),
         None, // pairing_store
