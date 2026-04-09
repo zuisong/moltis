@@ -761,17 +761,28 @@ impl OpenAiProvider {
         let system_text = system_parts.join("\n\n");
 
         // Find the first user message and prepend system content to it.
+        let system_block =
+            format!("[System Instructions]\n{system_text}\n[End System Instructions]\n\n");
         if let Some(first_user) = messages
             .iter_mut()
             .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
         {
-            let existing = first_user
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            first_user["content"] = serde_json::Value::String(format!(
-                "[System Instructions]\n{system_text}\n[End System Instructions]\n\n{existing}"
-            ));
+            match first_user.get("content").cloned() {
+                Some(serde_json::Value::String(s)) => {
+                    first_user["content"] = serde_json::Value::String(format!("{system_block}{s}"));
+                },
+                Some(serde_json::Value::Array(mut arr)) => {
+                    // Multimodal content (text + images): prepend as a text block.
+                    arr.insert(
+                        0,
+                        serde_json::json!({ "type": "text", "text": system_block }),
+                    );
+                    first_user["content"] = serde_json::Value::Array(arr);
+                },
+                _ => {
+                    first_user["content"] = serde_json::Value::String(system_block);
+                },
+            }
         } else {
             // No user message yet (e.g. probe); insert a synthetic user message.
             messages.insert(
@@ -2094,6 +2105,44 @@ mod tests {
                 .unwrap()
                 .contains("be helpful")
         );
+    }
+
+    #[test]
+    fn minimax_body_preserves_multimodal_user_content() {
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.1".to_string(),
+            "https://api.minimax.io/v1".to_string(),
+            "minimax".to_string(),
+        );
+        // Simulate a multimodal user message (text + image) serialized as an array
+        let mut body = serde_json::json!({
+            "model": "MiniMax-M2.1",
+            "messages": [
+                { "role": "system", "content": "be helpful" },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "describe this" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+                    ]
+                }
+            ]
+        });
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "system message removed");
+        assert_eq!(messages[0]["role"], "user");
+
+        // Content should be an array with system block prepended
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3, "system text + original text + image");
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().contains("be helpful"));
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe this");
+        assert_eq!(content[2]["type"], "image_url");
     }
 
     #[test]

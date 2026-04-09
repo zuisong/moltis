@@ -93,20 +93,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake build-essential clang libclang-dev pkg-config
 
+      - name: Export provider secret
+        if: env.SKIP != 'true'
+        env:
+          SECRET_VALUE: ${{ secrets[matrix.secret_key] }}
+          SECRET_NAME: ${{ matrix.secret_key }}
+        run: echo "$SECRET_NAME=$SECRET_VALUE" >> "$GITHUB_ENV"
+
       - name: Run integration tests
         if: env.SKIP != 'true'
         env:
-          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          Z_API_KEY: ${{ secrets.Z_API_KEY }}
           TEST_NAME: ${{ matrix.test }}
         run: |
           cargo test \
