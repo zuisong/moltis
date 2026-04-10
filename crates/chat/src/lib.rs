@@ -12818,6 +12818,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rewrite_multimodal_text_blocks_inserts_text_when_missing() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let blocks = vec![ContentBlock::ImageUrl {
+            image_url: SessionImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+            },
+        }];
+
+        let rewritten = rewrite_multimodal_text_blocks(&blocks, "sanitized");
+        assert_eq!(rewritten.len(), 2);
+        assert!(matches!(
+            &rewritten[0],
+            ContentBlock::Text { text } if text == "sanitized"
+        ));
+        assert!(matches!(&rewritten[1], ContentBlock::ImageUrl { .. }));
+    }
+
+    #[test]
+    fn rewrite_multimodal_text_blocks_replaces_first_and_drops_extra_text_blocks() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "original".to_string(),
+            },
+            ContentBlock::Text {
+                text: "extra".to_string(),
+            },
+        ];
+
+        let rewritten = rewrite_multimodal_text_blocks(&blocks, "sanitized");
+        assert_eq!(rewritten.len(), 1);
+        assert!(matches!(
+            &rewritten[0],
+            ContentBlock::Text { text } if text == "sanitized"
+        ));
+    }
+
+    #[test]
+    fn apply_message_received_rewrite_updates_text_params() {
+        let mut content = MessageContent::Text("original".to_string());
+        let mut params = serde_json::json!({
+            "text": "original",
+            "content": [{ "type": "text", "text": "stale" }]
+        });
+
+        apply_message_received_rewrite(&mut content, &mut params, "sanitized");
+
+        assert!(matches!(content, MessageContent::Text(ref text) if text == "sanitized"));
+        assert_eq!(params["text"], "sanitized");
+        assert!(params.get("content").is_none());
+    }
+
+    #[test]
+    fn apply_message_received_rewrite_updates_multimodal_params() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let mut content = MessageContent::Multimodal(vec![
+            ContentBlock::Text {
+                text: "original".to_string(),
+            },
+            ContentBlock::ImageUrl {
+                image_url: SessionImageUrl {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                },
+            },
+        ]);
+        let mut params = serde_json::json!({
+            "text": "original",
+            "message": "legacy",
+            "content": [
+                { "type": "text", "text": "original" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+            ]
+        });
+
+        apply_message_received_rewrite(&mut content, &mut params, "sanitized");
+
+        match content {
+            MessageContent::Multimodal(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(
+                    &blocks[0],
+                    ContentBlock::Text { text } if text == "sanitized"
+                ));
+                assert!(matches!(&blocks[1], ContentBlock::ImageUrl { .. }));
+            },
+            _ => panic!("expected multimodal content"),
+        }
+        assert!(params.get("text").is_none());
+        assert!(params.get("message").is_none());
+        let content_blocks = params["content"]
+            .as_array()
+            .expect("expected serialized multimodal content");
+        assert_eq!(content_blocks[0]["text"], "sanitized");
+        assert_eq!(
+            content_blocks[1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
+    }
+
     // ── Logbook formatting tests ─────────────────────────────────────────
 
     #[test]
