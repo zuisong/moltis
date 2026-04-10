@@ -184,6 +184,7 @@ test.describe("Settings navigation", () => {
 		{ id: "mcp", heading: "MCP" },
 		{ id: "hooks", heading: "Hooks" },
 		{ id: "skills", heading: "Skills" },
+		{ id: "projects", heading: "Repositories" },
 		{ id: "sandboxes", heading: "Sandboxes" },
 		{ id: "monitoring", heading: "Monitoring" },
 		{ id: "logs", heading: "Logs" },
