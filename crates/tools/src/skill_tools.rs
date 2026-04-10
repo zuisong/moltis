@@ -365,11 +365,15 @@ impl AgentTool for ReadSkillTool {
 
     fn description(&self) -> &str {
         "Load a skill's full content or access its linked files (references, \
-         templates, scripts). The primary call (with just 'name') returns the \
-         SKILL.md body plus a list of available sidecar files under \
-         references/, templates/, and scripts/. To read those, call again with \
-         the file_path argument (e.g. file_path=\"references/api.md\"). Use the \
-         skill names listed in the <available_skills> system-prompt block."
+         templates, assets, scripts). The primary call (with just 'name') \
+         returns the SKILL.md body plus a list of available sidecar files \
+         under references/, templates/, assets/, and scripts/. To read those, \
+         call again with the file_path argument \
+         (e.g. file_path=\"references/api.md\"). Nested file_paths such as \
+         \"references/subdir/deep.md\" are supported even if the listing only \
+         shows the first level. Binary files return a structured response \
+         with { is_binary: true, bytes }. Use the skill names listed in the \
+         <available_skills> system-prompt block."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -419,7 +423,10 @@ impl AgentTool for ReadSkillTool {
 }
 
 /// Read the main SKILL.md body (or the plugin's `.md` file) plus the list of
-/// sidecar files available in `references/`, `templates/`, and `scripts/`.
+/// sidecar files available in `references/`, `templates/`, `assets/`, and
+/// `scripts/`. The response also surfaces frontmatter metadata fields
+/// (`license`, `homepage`, `compatibility`, `allowed_tools`, `display_name`)
+/// so the agent can make informed activation decisions without a second call.
 async fn read_primary(
     name: &str,
     meta: &moltis_skills::types::SkillMetadata,
@@ -428,7 +435,7 @@ async fn read_primary(
 
     // Plugin skills can be backed by a single `.md` file rather than a
     // directory containing SKILL.md (see `prompt_gen.rs`). Handle both shapes.
-    let (description, body, linked_files, effective_dir) = if is_plugin && meta.path.is_file() {
+    let (loaded_meta, body, linked_files, effective_dir) = if is_plugin && meta.path.is_file() {
         let body = tokio::fs::read_to_string(&meta.path).await.map_err(|e| {
             Error::message(format!(
                 "failed to read plugin skill '{name}' at {}: {e}",
@@ -440,7 +447,9 @@ async fn read_primary(
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| meta.path.clone());
-        (meta.description.clone(), body, Vec::new(), effective_dir)
+        // Plugin .md files don't carry full frontmatter in the discovered
+        // metadata — fall back to the discoverer's stub metadata.
+        (meta.clone(), body, Vec::new(), effective_dir)
     } else {
         let canonical_skill_dir = tokio::fs::canonicalize(&meta.path).await.map_err(|e| {
             Error::message(format!("skill directory not accessible for '{name}': {e}"))
@@ -449,12 +458,7 @@ async fn read_primary(
             .await
             .map_err(|e| Error::message(format!("failed to load skill '{name}': {e}")))?;
         let linked = list_skill_sidecar_files(&canonical_skill_dir).await?;
-        (
-            content.metadata.description,
-            content.body,
-            linked,
-            canonical_skill_dir,
-        )
+        (content.metadata, content.body, linked, canonical_skill_dir)
     };
 
     // Warn on injection patterns (do not block).
@@ -475,21 +479,66 @@ async fn read_primary(
         None => "unknown",
     };
 
-    Ok(json!({
-        "name": name,
-        "description": description,
-        "source": source_label,
-        "body": body,
-        "linked_files": linked_files,
-        "bytes": body.len(),
-        "skill_dir_name": effective_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(""),
-    }))
+    // Build the response as a Map directly to avoid the
+    // `as_object_mut().expect()` pattern that workspace clippy lints on.
+    // Optional metadata fields are only included when set so the agent
+    // doesn't wade through empty keys.
+    let mut response = serde_json::Map::new();
+    response.insert("name".into(), json!(name));
+    response.insert("description".into(), json!(loaded_meta.description));
+    response.insert("source".into(), json!(source_label));
+    response.insert("body".into(), json!(body));
+    response.insert("bytes".into(), json!(body.len()));
+    response.insert(
+        "skill_dir_name".into(),
+        json!(
+            effective_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+        ),
+    );
+
+    if let Some(display_name) = &loaded_meta.display_name {
+        response.insert("display_name".into(), json!(display_name));
+    }
+    if let Some(license) = &loaded_meta.license {
+        response.insert("license".into(), json!(license));
+    }
+    if let Some(homepage) = &loaded_meta.homepage {
+        response.insert("homepage".into(), json!(homepage));
+    }
+    if let Some(compatibility) = &loaded_meta.compatibility {
+        response.insert("compatibility".into(), json!(compatibility));
+    }
+    if !loaded_meta.allowed_tools.is_empty() {
+        response.insert("allowed_tools".into(), json!(loaded_meta.allowed_tools));
+    }
+    if !linked_files.is_empty() {
+        response.insert(
+            "usage_hint".into(),
+            json!(
+                "To view a linked file, call read_skill again with file_path \
+                 set to one of the paths in linked_files (e.g. \
+                 file_path=\"references/api.md\"). Nested paths inside those \
+                 directories are also supported."
+            ),
+        );
+    }
+    // `linked_files` goes last so tools that pretty-print the response
+    // surface metadata first.
+    response.insert("linked_files".into(), json!(linked_files));
+
+    Ok(Value::Object(response))
 }
 
 /// Read a single sidecar file inside a skill directory.
+///
+/// Supports arbitrary-depth `Component::Normal`-only relative paths (e.g.
+/// `references/subdir/deep.md`). Binary files return a structured
+/// `{ is_binary: true, bytes }` response instead of failing on UTF-8 decode.
+/// If the file doesn't exist, returns a helpful listing of the sidecar files
+/// that do exist under this skill.
 async fn read_sidecar(name: &str, skill_dir: &Path, rel: &str) -> anyhow::Result<Value> {
     let relative = normalize_relative_skill_file_path(rel)?;
 
@@ -498,6 +547,38 @@ async fn read_sidecar(name: &str, skill_dir: &Path, rel: &str) -> anyhow::Result
         .map_err(|e| Error::message(format!("skill directory not accessible for '{name}': {e}")))?;
 
     let target = canonical_skill_dir.join(&relative);
+
+    // Check existence before canonicalising so we can return a helpful
+    // listing instead of an opaque I/O error when the file is missing.
+    match tokio::fs::symlink_metadata(&target).await {
+        Ok(_) => {},
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let available = list_skill_sidecar_files(&canonical_skill_dir).await?;
+            return Err(Error::message(format!(
+                "sidecar file '{}' not found in skill '{name}'. \
+                 Available sidecar files: {}",
+                relative.display(),
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available
+                        .iter()
+                        .filter_map(|v| v.get("path").and_then(|p| p.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            ))
+            .into());
+        },
+        Err(e) => {
+            return Err(Error::message(format!(
+                "sidecar file '{}' not accessible: {e}",
+                relative.display()
+            ))
+            .into());
+        },
+    }
+
     let canonical_target = tokio::fs::canonicalize(&target).await.map_err(|e| {
         Error::message(format!(
             "sidecar file '{}' not accessible: {e}",
@@ -529,29 +610,84 @@ async fn read_sidecar(name: &str, skill_dir: &Path, rel: &str) -> anyhow::Result
         .into());
     }
 
-    let content = tokio::fs::read_to_string(&canonical_target)
-        .await
-        .map_err(|e| {
-            Error::message(format!(
-                "failed to read sidecar file '{}': {e}",
-                relative.display()
-            ))
-        })?;
+    // Try UTF-8; fall back to a structured "binary" response on decode
+    // failure (mirrors hermes-agent's `skill_view` behavior).
+    let raw = tokio::fs::read(&canonical_target).await.map_err(|e| {
+        Error::message(format!(
+            "failed to read sidecar file '{}': {e}",
+            relative.display()
+        ))
+    })?;
 
-    Ok(json!({
-        "name": name,
-        "file_path": relative.display().to_string(),
-        "bytes": metadata.len(),
-        "content": content,
-    }))
+    match std::str::from_utf8(&raw) {
+        Ok(text) => Ok(json!({
+            "name": name,
+            "file_path": relative.display().to_string(),
+            "bytes": metadata.len(),
+            "content": text,
+            "is_binary": false,
+        })),
+        Err(_) => {
+            let file_type = canonical_target
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| format!(".{s}"))
+                .unwrap_or_default();
+            Ok(json!({
+                "name": name,
+                "file_path": relative.display().to_string(),
+                "bytes": metadata.len(),
+                "is_binary": true,
+                "file_type": file_type,
+                "note": format!(
+                    "Binary file ({} bytes). Contents omitted — the model \
+                     cannot consume binary data directly.",
+                    metadata.len()
+                ),
+            }))
+        },
+    }
 }
 
-/// One-level-deep walk of `<skill_dir>/{references,templates,scripts}`.
-/// Returns at most [`MAX_SIDECAR_FILES_PER_CALL`] files. Directory entries,
-/// symlinks, and unreadable entries are skipped silently (best-effort).
+/// Sidecar subdirectories that are walked for the primary-read linked-files
+/// listing. Matches the agentskills.io standard used by hermes-agent.
+const SIDECAR_SUBDIRS: &[&str] = &["references", "templates", "assets", "scripts"];
+
+/// Entry returned by [`list_skill_sidecar_files`]. Sorted-for-determinism and
+/// kept as a typed struct so both the primary read path and the sidecar
+/// "file not found" error path can reuse it.
+#[derive(Debug, Clone)]
+struct SidecarEntry {
+    /// Path relative to the skill directory, e.g. `references/api.md`.
+    relative_path: String,
+    bytes: u64,
+}
+
+impl From<&SidecarEntry> for Value {
+    fn from(entry: &SidecarEntry) -> Self {
+        json!({
+            "path": entry.relative_path,
+            "bytes": entry.bytes,
+        })
+    }
+}
+
+/// One-level-deep walk of `<skill_dir>/{references,templates,assets,scripts}`.
+///
+/// Returns a sorted (by relative path) list of entries, capped at
+/// [`MAX_SIDECAR_FILES_PER_CALL`]. Directory entries, symlinks, hidden files
+/// (dotfiles), and unreadable entries are skipped silently so the listing
+/// only shows real in-skill files the agent can actually consume.
 async fn list_skill_sidecar_files(skill_dir: &Path) -> crate::Result<Vec<Value>> {
-    const SIDECAR_SUBDIRS: &[&str] = &["references", "templates", "scripts"];
-    let mut out = Vec::new();
+    let mut entries = collect_sidecar_entries(skill_dir).await?;
+    // Sort for deterministic output — makes tests stable and the agent's
+    // reasoning traces reproducible across runs.
+    entries.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(entries.iter().map(Value::from).collect())
+}
+
+async fn collect_sidecar_entries(skill_dir: &Path) -> crate::Result<Vec<SidecarEntry>> {
+    let mut out: Vec<SidecarEntry> = Vec::new();
 
     for sub in SIDECAR_SUBDIRS {
         if out.len() >= MAX_SIDECAR_FILES_PER_CALL {
@@ -588,10 +724,10 @@ async fn list_skill_sidecar_files(skill_dir: &Path) -> crate::Result<Vec<Value>>
             if file_name.starts_with('.') {
                 continue;
             }
-            out.push(json!({
-                "path": format!("{sub}/{file_name}"),
-                "bytes": meta.len(),
-            }));
+            out.push(SidecarEntry {
+                relative_path: format!("{sub}/{file_name}"),
+                bytes: meta.len(),
+            });
         }
     }
 
@@ -1780,5 +1916,538 @@ mod tests {
                 .unwrap()
                 .contains("Ignore previous instructions")
         );
+    }
+
+    // ── ReadSkillTool robustness (moltis-u3f) ──────────────────────────────
+
+    /// Helper: seed a personal skill whose SKILL.md body is written verbatim
+    /// between the frontmatter and EOF. Lets individual tests include
+    /// arbitrary frontmatter fields like `license`, `homepage`, etc.
+    fn seed_personal_skill_full(
+        root: &Path,
+        name: &str,
+        frontmatter_extra: &str,
+        body: &str,
+    ) -> PathBuf {
+        let skill_dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let content = format!(
+            "---\nname: {name}\ndescription: full-metadata skill\n{frontmatter_extra}---\n{body}"
+        );
+        std::fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+        skill_dir
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_lists_assets_directory() {
+        // agentskills.io standard: `assets/` holds supplementary files.
+        // hermes-agent surfaces these; we should too.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+        std::fs::write(skill_dir.join("assets/logo.txt"), "logo\n").unwrap();
+        std::fs::write(skill_dir.join("assets/config.yaml"), "k: v\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "demo" })).await.unwrap();
+        let linked: Vec<String> = result["linked_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["path"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            linked.contains(&"assets/logo.txt".to_string()),
+            "assets/ files must appear in linked_files: {linked:?}"
+        );
+        assert!(linked.contains(&"assets/config.yaml".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_sidecar_in_assets_is_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+        std::fs::write(skill_dir.join("assets/config.yaml"), "key: value\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": "assets/config.yaml"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["content"], "key: value\n");
+        assert_eq!(result["is_binary"], false);
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_sidecar_listing_is_sorted() {
+        // Deterministic output makes tests stable and agent reasoning
+        // traces reproducible across runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        // Write in non-alphabetical order on disk.
+        for name in ["zeta.md", "alpha.md", "mu.md"] {
+            std::fs::write(skill_dir.join("references").join(name), "x\n").unwrap();
+        }
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "demo" })).await.unwrap();
+        let paths: Vec<String> = result["linked_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "references/alpha.md".to_string(),
+                "references/mu.md".to_string(),
+                "references/zeta.md".to_string(),
+            ],
+            "sidecar listing must be sorted by relative path: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_sidecar_binary_file_returns_structured_response() {
+        // A .bin file with non-UTF-8 content should not raise an error —
+        // instead the tool should return `is_binary: true` with size info so
+        // the model knows the file exists but cannot be read as text.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+        // Invalid UTF-8 bytes.
+        let bytes: &[u8] = &[0xff, 0xfe, 0xfd, 0x00, 0x01, 0x02];
+        std::fs::write(skill_dir.join("assets/payload.bin"), bytes).unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": "assets/payload.bin"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["is_binary"], true);
+        assert_eq!(result["bytes"].as_u64().unwrap(), bytes.len() as u64);
+        assert_eq!(result["file_type"], ".bin");
+        // No `content` key — the model can't consume binary.
+        assert!(
+            result.get("content").is_none(),
+            "binary response must omit the content field: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_missing_sidecar_lists_available_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(skill_dir.join("references/api.md"), "api\n").unwrap();
+        std::fs::write(skill_dir.join("references/guide.md"), "guide\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": "references/does-not-exist.md"
+            }))
+            .await;
+        let err = result.expect_err("missing sidecar must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("references/does-not-exist.md"),
+            "error should name the missing path: {msg}"
+        );
+        assert!(
+            msg.contains("references/api.md") && msg.contains("references/guide.md"),
+            "error should hint at available sidecars: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_nested_sidecar_file_path_is_readable() {
+        // Nested sidecars are not listed (the listing stays one level deep to
+        // keep the linked_files output small), but the agent can still target
+        // them explicitly via file_path.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("references/v2")).unwrap();
+        std::fs::write(skill_dir.join("references/v2/api.md"), "v2 api\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": "references/v2/api.md"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["content"], "v2 api\n");
+        assert_eq!(result["file_path"], "references/v2/api.md");
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_surfaces_frontmatter_metadata_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill_full(
+            tmp.path(),
+            "metadata-demo",
+            "license: MIT\nhomepage: https://example.com/demo\ncompatibility: requires claude-sonnet\nallowed_tools:\n  - Read\n  - Bash(git:*)\n",
+            "# Full-metadata demo\n",
+        );
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({ "name": "metadata-demo" }))
+            .await
+            .unwrap();
+        assert_eq!(result["license"], "MIT");
+        assert_eq!(result["homepage"], "https://example.com/demo");
+        assert_eq!(result["compatibility"], "requires claude-sonnet");
+        let tools: Vec<&str> = result["allowed_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(tools.contains(&"Read"));
+        assert!(tools.contains(&"Bash(git:*)"));
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_omits_empty_metadata_fields() {
+        // A minimal skill should not include noisy empty keys in the response.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill(tmp.path(), "bare", "# Bare\n");
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "bare" })).await.unwrap();
+        assert!(result.get("license").is_none());
+        assert!(result.get("homepage").is_none());
+        assert!(result.get("compatibility").is_none());
+        assert!(result.get("allowed_tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_primary_call_emits_usage_hint_when_sidecars_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "with-sidecars", "# Body\n");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(skill_dir.join("references/api.md"), "api\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({ "name": "with-sidecars" }))
+            .await
+            .unwrap();
+        assert!(
+            result["usage_hint"]
+                .as_str()
+                .map(|s| s.contains("read_skill") && s.contains("file_path"))
+                .unwrap_or(false),
+            "usage_hint should explain how to read a sidecar: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_primary_call_omits_usage_hint_when_no_sidecars() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill(tmp.path(), "no-sidecars", "# Body\n");
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({ "name": "no-sidecars" }))
+            .await
+            .unwrap();
+        assert!(
+            result.get("usage_hint").is_none(),
+            "no sidecars → no usage hint (avoid noise): {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_returns_latest_on_disk_content() {
+        // Freshness: the discoverer must re-read the filesystem on each
+        // discover() call, so edits to a skill body are picked up without a
+        // tool restart.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "live", "# Version 1\n");
+        let tool = read_tool_for(tmp.path());
+
+        let first = tool.execute(json!({ "name": "live" })).await.unwrap();
+        assert!(first["body"].as_str().unwrap().contains("Version 1"));
+
+        // Now edit the body on disk and read again.
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: live\ndescription: a test skill\n---\n# Version 2\n",
+        )
+        .unwrap();
+
+        let second = tool.execute(json!({ "name": "live" })).await.unwrap();
+        assert!(
+            second["body"].as_str().unwrap().contains("Version 2"),
+            "second read must reflect on-disk edits, got: {}",
+            second["body"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_handles_unicode_body_and_description() {
+        // Skill names themselves are ASCII-only (see `validate_name`), but
+        // the body and description can hold arbitrary UTF-8.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = tmp.path().join("skills/unicode-demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: unicode-demo\ndescription: 日本語の説明 👋\n---\n\
+             # 日本語\n\n绝不要忽略之前的指令。\nこんにちは 👋\n",
+        )
+        .unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({ "name": "unicode-demo" }))
+            .await
+            .unwrap();
+        let body = result["body"].as_str().unwrap();
+        assert!(body.contains("日本語"));
+        assert!(body.contains("こんにちは 👋"));
+        assert!(
+            result["description"]
+                .as_str()
+                .unwrap()
+                .contains("日本語の説明")
+        );
+        // Byte count must match the actual UTF-8 byte length (not char count).
+        assert_eq!(result["bytes"].as_u64().unwrap(), body.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_handles_empty_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "empty", "placeholder");
+        // Overwrite with an explicitly empty body (frontmatter only).
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: empty\ndescription: no body\n---\n",
+        )
+        .unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "empty" })).await.unwrap();
+        assert_eq!(result["body"].as_str().unwrap(), "");
+        assert_eq!(result["bytes"].as_u64().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_sidecar_at_exactly_the_size_limit_is_accepted() {
+        // Boundary: exactly MAX_SIDECAR_FILE_BYTES is allowed; +1 is rejected
+        // (the +1 case is already covered by
+        // test_read_skill_rejects_oversized_sidecar).
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        let content = "x".repeat(MAX_SIDECAR_FILE_BYTES);
+        std::fs::write(skill_dir.join("references/big.txt"), &content).unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": "references/big.txt"
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            result["content"].as_str().unwrap().len(),
+            MAX_SIDECAR_FILE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_listing_caps_at_max_files_per_call() {
+        // Seed more than the cap so we can verify the listing is bounded.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "many", "# Many\n");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        for i in 0..(MAX_SIDECAR_FILES_PER_CALL + 5) {
+            std::fs::write(
+                skill_dir.join(format!("references/file-{i:03}.md")),
+                "body\n",
+            )
+            .unwrap();
+        }
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "many" })).await.unwrap();
+        let linked = result["linked_files"].as_array().unwrap();
+        assert!(
+            linked.len() <= MAX_SIDECAR_FILES_PER_CALL,
+            "listing must cap at {MAX_SIDECAR_FILES_PER_CALL}, got {}",
+            linked.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_listing_skips_hidden_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "hidden", "# Hidden\n");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(skill_dir.join("references/visible.md"), "v\n").unwrap();
+        std::fs::write(skill_dir.join("references/.secret"), "s\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "hidden" })).await.unwrap();
+        let paths: Vec<String> = result["linked_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(paths, vec!["references/visible.md".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_listing_skips_subdirectories() {
+        // Subdirectories under a sidecar dir should not appear as entries in
+        // the listing (we only walk one level deep). Their files remain
+        // targetable via file_path — see
+        // test_read_skill_nested_sidecar_file_path_is_readable.
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_dir = seed_personal_skill(tmp.path(), "tree", "# Tree\n");
+        std::fs::create_dir_all(skill_dir.join("references/v2")).unwrap();
+        std::fs::write(skill_dir.join("references/top.md"), "t\n").unwrap();
+        std::fs::write(skill_dir.join("references/v2/inner.md"), "i\n").unwrap();
+
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "tree" })).await.unwrap();
+        let paths: Vec<String> = result["linked_files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["path"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["references/top.md".to_string()],
+            "subdirectory entries should not appear in the listing: {paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_multi_source_resolves_by_name() {
+        // Two source directories, same skill name in one of them. The
+        // discoverer should resolve the configured source and return the
+        // right body.
+        let tmp = tempfile::tempdir().unwrap();
+        // Seed a project-scoped skill (different directory).
+        let project_dir = tmp.path().join(".moltis/skills");
+        std::fs::create_dir_all(project_dir.join("shared")).unwrap();
+        std::fs::write(
+            project_dir.join("shared/SKILL.md"),
+            "---\nname: shared\ndescription: project scoped\n---\n# From project\n",
+        )
+        .unwrap();
+        // Seed a personal-scoped skill with a different name.
+        seed_personal_skill(tmp.path(), "personal-only", "# From personal\n");
+
+        let discoverer = Arc::new(FsSkillDiscoverer::new(vec![
+            (project_dir, SkillSource::Project),
+            (tmp.path().join("skills"), SkillSource::Personal),
+        ]));
+        let tool = ReadSkillTool::new(discoverer);
+
+        let a = tool.execute(json!({ "name": "shared" })).await.unwrap();
+        assert_eq!(a["source"], "project");
+        assert!(a["body"].as_str().unwrap().contains("From project"));
+
+        let b = tool
+            .execute(json!({ "name": "personal-only" }))
+            .await
+            .unwrap();
+        assert_eq!(b["source"], "personal");
+        assert!(b["body"].as_str().unwrap().contains("From personal"));
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_concurrent_reads_do_not_interfere() {
+        // Spawn several concurrent reads against the same tool; they should
+        // all resolve to the seeded body without panics or cross-talk.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill(tmp.path(), "concurrent", "# Concurrent body\n");
+        let tool = Arc::new(read_tool_for(tmp.path()));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let tool = Arc::clone(&tool);
+            handles.push(tokio::spawn(async move {
+                tool.execute(json!({ "name": "concurrent" })).await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.unwrap().unwrap();
+            assert!(result["body"].as_str().unwrap().contains("Concurrent body"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_unknown_name_with_empty_registry_is_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No skills seeded at all.
+        std::fs::create_dir_all(tmp.path().join("skills")).unwrap();
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({ "name": "any" })).await;
+        let err = result.expect_err("unknown skill must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no skills are currently available"),
+            "empty-registry hint should be explicit: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_sidecar_rejects_empty_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": ""
+            }))
+            .await;
+        assert!(result.is_err(), "empty file_path must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_sidecar_rejects_whitespace_only_file_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        let tool = read_tool_for(tmp.path());
+        let result = tool
+            .execute(json!({
+                "name": "demo",
+                "file_path": "   "
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "whitespace-only file_path must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_skill_rejects_missing_name_parameter() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_personal_skill(tmp.path(), "demo", "# Demo\n");
+        let tool = read_tool_for(tmp.path());
+        let result = tool.execute(json!({})).await;
+        let err = result.expect_err("missing 'name' must error");
+        assert!(format!("{err}").contains("name"));
     }
 }

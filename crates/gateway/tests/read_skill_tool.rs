@@ -202,3 +202,80 @@ async fn read_skill_rejects_path_traversal_in_file_path() {
         .await;
     assert!(result.is_err(), "path traversal must be rejected");
 }
+
+#[tokio::test]
+async fn read_skill_lists_assets_directory_end_to_end() {
+    // Regression coverage for the agentskills.io `assets/` standard.
+    let (tmp, skill_dir) = seed_test_skill("test-skill", "# Test\n");
+    std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+    std::fs::write(skill_dir.join("assets/logo.txt"), "logo\n").unwrap();
+    let registry = registry_for(tmp.path());
+    let tool = registry
+        .get("read_skill")
+        .expect("read_skill is registered");
+
+    let result = tool.execute(json!({ "name": "test-skill" })).await.unwrap();
+    let linked: Vec<String> = result["linked_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["path"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        linked.contains(&"assets/logo.txt".to_string()),
+        "assets/ files must appear in the end-to-end linked_files output: {linked:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_skill_missing_sidecar_returns_helpful_listing_end_to_end() {
+    let (tmp, skill_dir) = seed_test_skill("test-skill", "# Test\n");
+    std::fs::write(skill_dir.join("references/other.md"), "other\n").unwrap();
+    let registry = registry_for(tmp.path());
+    let tool = registry
+        .get("read_skill")
+        .expect("read_skill is registered");
+
+    let result = tool
+        .execute(json!({
+            "name": "test-skill",
+            "file_path": "references/does-not-exist.md"
+        }))
+        .await;
+    let err = result.expect_err("missing sidecar must error");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("references/notes.md"),
+        "should list the seeded notes.md: {msg}"
+    );
+    assert!(
+        msg.contains("references/other.md"),
+        "should list the seeded other.md: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn read_skill_binary_sidecar_returns_structured_response_end_to_end() {
+    let (tmp, skill_dir) = seed_test_skill("test-skill", "# Test\n");
+    std::fs::create_dir_all(skill_dir.join("assets")).unwrap();
+    let bytes: &[u8] = &[0xff, 0xfe, 0x00, 0x01];
+    std::fs::write(skill_dir.join("assets/payload.bin"), bytes).unwrap();
+    let registry = registry_for(tmp.path());
+    let tool = registry
+        .get("read_skill")
+        .expect("read_skill is registered");
+
+    let result = tool
+        .execute(json!({
+            "name": "test-skill",
+            "file_path": "assets/payload.bin"
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result["is_binary"], true);
+    assert_eq!(result["bytes"].as_u64().unwrap(), bytes.len() as u64);
+    assert!(
+        result.get("content").is_none(),
+        "binary response must omit `content`: {result}"
+    );
+}
