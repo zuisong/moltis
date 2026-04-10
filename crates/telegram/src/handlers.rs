@@ -1543,6 +1543,8 @@ async fn handle_voice_message(
             account_id,
             "no event sink available for voice message; sending direct reply"
         );
+        // Without an event sink there is no session dispatch path at all, so
+        // "falling back" to caption text here would still be dropped later.
         send_direct_reply(outbound, account_id, &reply_target, VOICE_REPLY_UNAVAILABLE).await;
         return None;
     };
@@ -2871,6 +2873,7 @@ mod tests {
     /// the Bot API.
     async fn run_voice_scenario(
         caption: Option<&str>,
+        has_event_sink: bool,
         stt_available: bool,
         download: VoiceDownloadOutcome,
         transcription: VoiceTranscriptionOutcome,
@@ -2966,7 +2969,11 @@ mod tests {
                 outbound: Arc::clone(&outbound),
                 cancel: CancellationToken::new(),
                 message_log: None,
-                event_sink: Some(Arc::clone(&sink) as Arc<dyn ChannelEventSink>),
+                event_sink: if has_event_sink {
+                    Some(Arc::clone(&sink) as Arc<dyn ChannelEventSink>)
+                } else {
+                    None
+                },
                 otp: Mutex::new(OtpState::new(300)),
             });
         }
@@ -3035,6 +3042,7 @@ mod tests {
         let result = run_voice_scenario(
             None,
             true,
+            true,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Empty,
         )
@@ -3061,6 +3069,7 @@ mod tests {
     async fn voice_empty_transcription_with_caption_dispatches_caption() {
         let result = run_voice_scenario(
             Some("please review the attached audio"),
+            true,
             true,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Empty,
@@ -3092,6 +3101,7 @@ mod tests {
         let result = run_voice_scenario(
             None,
             true,
+            true,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Err,
         )
@@ -3117,6 +3127,7 @@ mod tests {
     async fn voice_transcription_error_with_caption_dispatches_caption() {
         let result = run_voice_scenario(
             Some("summarize this clip"),
+            true,
             true,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Err,
@@ -3147,6 +3158,7 @@ mod tests {
         let result = run_voice_scenario(
             None,
             true,
+            true,
             VoiceDownloadOutcome::Fail,
             // transcription outcome is irrelevant because we never reach it.
             VoiceTranscriptionOutcome::Ok("unused"),
@@ -3173,6 +3185,7 @@ mod tests {
     async fn voice_download_failure_with_caption_dispatches_caption() {
         let result = run_voice_scenario(
             Some("voice note about the design"),
+            true,
             true,
             VoiceDownloadOutcome::Fail,
             VoiceTranscriptionOutcome::Ok("unused"),
@@ -3204,6 +3217,7 @@ mod tests {
         let result = run_voice_scenario(
             None,
             true,
+            true,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Ok("hello world"),
         )
@@ -3220,6 +3234,7 @@ mod tests {
         let result = run_voice_scenario(
             Some("context: meeting notes"),
             true,
+            true,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Ok("we decided to ship on friday"),
         )
@@ -3235,6 +3250,7 @@ mod tests {
     async fn voice_stt_unavailable_without_caption_sends_setup_hint_and_skips_dispatch() {
         let result = run_voice_scenario(
             None,
+            true,
             false,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Ok("unused"),
@@ -3255,6 +3271,7 @@ mod tests {
     async fn voice_stt_unavailable_with_caption_dispatches_caption() {
         let result = run_voice_scenario(
             Some("summarize this anyway"),
+            true,
             false,
             VoiceDownloadOutcome::Ok,
             VoiceTranscriptionOutcome::Ok("unused"),
@@ -3271,6 +3288,47 @@ mod tests {
                 .iter()
                 .all(|m| { m.text != escaped_telegram_reply_text(VOICE_REPLY_STT_SETUP_HINT) }),
             "setup hint should not be sent when caption is present: {:?}",
+            result.sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_without_event_sink_and_without_caption_sends_unavailable_reply() {
+        let result = run_voice_scenario(
+            None,
+            false,
+            false,
+            VoiceDownloadOutcome::Ok,
+            VoiceTranscriptionOutcome::Ok("unused"),
+        )
+        .await;
+
+        assert_eq!(result.dispatch_calls, 0);
+        assert!(
+            result.sent_messages.iter().any(|m| {
+                m.chat_id == 42 && m.text == escaped_telegram_reply_text(VOICE_REPLY_UNAVAILABLE)
+            }),
+            "expected unavailable reply, got: {:?}",
+            result.sent_messages
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_without_event_sink_with_caption_sends_unavailable_reply() {
+        let result = run_voice_scenario(
+            Some("please use the caption"),
+            false,
+            false,
+            VoiceDownloadOutcome::Ok,
+            VoiceTranscriptionOutcome::Ok("unused"),
+        )
+        .await;
+
+        assert_eq!(result.dispatch_calls, 0);
+        assert!(
+            result.sent_messages.iter().any(|m| m.chat_id == 42
+                && m.text == escaped_telegram_reply_text(VOICE_REPLY_UNAVAILABLE)),
+            "expected unavailable reply even with caption, got: {:?}",
             result.sent_messages
         );
     }
