@@ -1,4 +1,4 @@
-// ── Attribution ──────────────────────────────────────────────────────
+// ── Attribution ───────────────────────────────────────────��──────────
 // Deterministic compaction extraction adapted from claw-code (ultraworkers/claw-code).
 // Original source: rust/crates/runtime/src/compact.rs
 // License: MIT — Copyright (c) ultraworkers
@@ -18,6 +18,20 @@ const COMPACT_DIRECT_RESUME_INSTRUCTION: &str = "Continue the conversation from 
     questions. Resume directly — do not acknowledge the summary, do not recap what was \
     happening, and do not preface with continuation text.";
 
+/// Maximum total characters for a compaction summary.
+pub const SUMMARY_MAX_CHARS: usize = 1_200;
+/// Maximum number of lines in a compaction summary (excluding omission notice).
+pub const SUMMARY_MAX_LINES: usize = 24;
+/// Maximum characters per line in a compaction summary.
+pub const SUMMARY_MAX_LINE_CHARS: usize = 160;
+
+/// Max chars for content previews (tool results, user requests, timeline).
+const PREVIEW_CHARS: usize = 160;
+/// Max chars for "current work" preview.
+const CURRENT_WORK_CHARS: usize = 200;
+
+// ── Public API ────────────────────────────────────────────────────────
+
 /// Produce a structured summary string from a slice of JSON message values.
 ///
 /// Extracts: message counts by role, tool names, key files, recent user requests,
@@ -32,35 +46,7 @@ pub fn summarize_messages(messages: &[Value]) -> String {
         .filter(|m| m["role"] == "tool" || m["role"] == "tool_result")
         .count();
 
-    let mut tool_names: Vec<&str> = messages
-        .iter()
-        .flat_map(|m| {
-            let mut names = Vec::new();
-            // From assistant tool_calls
-            if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
-                for call in calls {
-                    if let Some(name) = call
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                    {
-                        names.push(name);
-                    }
-                }
-            }
-            // From tool_result messages
-            if let Some(name) = m.get("tool_name").and_then(Value::as_str) {
-                names.push(name);
-            }
-            // From tool messages (legacy)
-            if let Some(name) = m.get("name").and_then(Value::as_str) {
-                names.push(name);
-            }
-            names
-        })
-        .collect();
-    tool_names.sort_unstable();
-    tool_names.dedup();
+    let tool_names = collect_unique_tool_names(messages);
 
     let mut lines = vec![
         "<summary>".to_string(),
@@ -100,28 +86,7 @@ pub fn summarize_messages(messages: &[Value]) -> String {
     }
 
     lines.push("- Key timeline:".to_string());
-    let timeline_head = 3;
-    let timeline_tail = 5;
-    if messages.len() <= timeline_head + timeline_tail {
-        for message in messages {
-            let role = message["role"].as_str().unwrap_or("unknown");
-            let content = extract_content_preview(message);
-            lines.push(format!("  - {role}: {content}"));
-        }
-    } else {
-        for message in &messages[..timeline_head] {
-            let role = message["role"].as_str().unwrap_or("unknown");
-            let content = extract_content_preview(message);
-            lines.push(format!("  - {role}: {content}"));
-        }
-        let omitted = messages.len() - timeline_head - timeline_tail;
-        lines.push(format!("  - ... ({omitted} messages omitted) ..."));
-        for message in &messages[messages.len() - timeline_tail..] {
-            let role = message["role"].as_str().unwrap_or("unknown");
-            let content = extract_content_preview(message);
-            lines.push(format!("  - {role}: {content}"));
-        }
-    }
+    lines.extend(build_timeline_entries(messages));
     lines.push("</summary>".to_string());
     lines.join("\n")
 }
@@ -135,30 +100,24 @@ pub fn merge_compact_summaries(existing_summary: Option<&str>, new_summary: &str
         return new_summary.to_string();
     };
 
-    let previous_highlights = extract_summary_highlights(existing_summary);
-    let new_formatted_summary = format_compact_summary(new_summary);
-    let new_highlights = extract_summary_highlights(&new_formatted_summary);
-    let new_timeline = extract_summary_timeline(&new_formatted_summary);
+    let prev = parse_summary_sections(existing_summary);
+    let curr = parse_summary_sections(new_summary);
 
     let mut lines = vec!["<summary>".to_string(), "Conversation summary:".to_string()];
 
-    if !previous_highlights.is_empty() {
+    if !prev.highlights.is_empty() {
         lines.push("- Previously compacted context:".to_string());
-        lines.extend(
-            previous_highlights
-                .into_iter()
-                .map(|line| format!("  {line}")),
-        );
+        lines.extend(prev.highlights.into_iter().map(|l| format!("  {l}")));
     }
 
-    if !new_highlights.is_empty() {
+    if !curr.highlights.is_empty() {
         lines.push("- Newly compacted context:".to_string());
-        lines.extend(new_highlights.into_iter().map(|line| format!("  {line}")));
+        lines.extend(curr.highlights.into_iter().map(|l| format!("  {l}")));
     }
 
-    if !new_timeline.is_empty() {
+    if !curr.timeline.is_empty() {
         lines.push("- Key timeline:".to_string());
-        lines.extend(new_timeline.into_iter().map(|line| format!("  {line}")));
+        lines.extend(curr.timeline.into_iter().map(|l| format!("  {l}")));
     }
 
     lines.push("</summary>".to_string());
@@ -229,13 +188,13 @@ pub fn format_compact_summary(summary: &str) -> String {
 pub fn extract_existing_compacted_summary(history: &[Value]) -> Option<String> {
     let first = history.first()?;
     let content = first.get("content").and_then(Value::as_str)?;
-    let summary_text = if let Some(text) = content.strip_prefix("[Conversation Summary]\n\n") {
-        text
-    } else if content.starts_with(COMPACT_CONTINUATION_PREAMBLE) {
-        content
-    } else {
-        return None;
-    };
+    let summary_text = content
+        .strip_prefix("[Conversation Summary]\n\n")
+        .or_else(|| {
+            content
+                .starts_with(COMPACT_CONTINUATION_PREAMBLE)
+                .then_some(content)
+        })?;
     let summary = summary_text.trim();
     if summary.is_empty() {
         return None;
@@ -243,11 +202,137 @@ pub fn extract_existing_compacted_summary(history: &[Value]) -> Option<String> {
     Some(summary.to_string())
 }
 
+/// Compress a compaction summary to fit within budget constraints.
+///
+/// Enforces: max 1,200 chars total, max 24 lines, max 160 chars per line.
+/// Deduplicates lines (case-insensitive), preserves headers and bullets,
+/// and appends an omission notice when lines are dropped.
+#[must_use]
+pub fn compress_summary(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Step 1: deduplicate lines (case-insensitive) + truncate long lines.
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let key = line.trim().to_ascii_lowercase();
+        if seen.insert(key) {
+            deduped.push(truncate_line(line, SUMMARY_MAX_LINE_CHARS));
+        }
+    }
+    drop(seen);
+
+    // Step 2: check if already within budget.
+    let joined = deduped.join("\n");
+    if deduped.len() <= SUMMARY_MAX_LINES && joined.len() <= SUMMARY_MAX_CHARS {
+        return joined;
+    }
+
+    // Step 3: priority-based line dropping.
+    // Headers (#) always kept. Bullets (- * •) survive longer than plain lines.
+    let mut headers: Vec<String> = Vec::new();
+    let mut bullets: Vec<String> = Vec::new();
+    let mut other: Vec<String> = Vec::new();
+
+    for line in deduped {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            headers.push(line);
+        } else if trimmed.starts_with(['-', '*', '•']) {
+            bullets.push(line);
+        } else {
+            other.push(line);
+        }
+    }
+
+    // Candidates ordered for dropping: other first (dropped first), then bullets.
+    let mut candidates: Vec<String> = Vec::new();
+    candidates.extend(other);
+    candidates.extend(bullets);
+
+    let header_count = headers.len();
+
+    // Check if keeping all candidates fits.
+    if header_count + candidates.len() <= SUMMARY_MAX_LINES
+        && total_join_len(&headers, &candidates) <= SUMMARY_MAX_CHARS
+    {
+        let mut result = headers;
+        result.extend(candidates);
+        return result.join("\n");
+    }
+
+    // Drop lines from the end of candidates, accounting for omission notice.
+    let omission_notice = |n: usize| format!("[... {n} lines omitted for brevity]");
+
+    for drop_count in 1..=candidates.len() {
+        let keep = &candidates[..candidates.len() - drop_count];
+        let line_count = header_count + keep.len() + 1;
+        if line_count > SUMMARY_MAX_LINES {
+            continue;
+        }
+
+        let notice = omission_notice(drop_count);
+        let len = total_join_len(&headers, keep) + notice.len() + 1;
+        if len <= SUMMARY_MAX_CHARS {
+            let mut result = headers;
+            result.extend(keep.iter().cloned());
+            result.push(notice);
+            return result.join("\n");
+        }
+    }
+
+    // Edge case: even dropping all candidates, headers alone are too long.
+    let all_dropped = candidates.len();
+    let mut result: Vec<String> = Vec::new();
+    let mut header_drops = 0usize;
+    let notice_len = omission_notice(all_dropped).len() + 1;
+    let mut budget = SUMMARY_MAX_CHARS.saturating_sub(notice_len);
+
+    for line in &headers {
+        let needed = line.len() + usize::from(!result.is_empty());
+        if needed > budget || result.len() + 1 >= SUMMARY_MAX_LINES {
+            header_drops += 1;
+            continue;
+        }
+        budget -= needed;
+        result.push(line.clone());
+    }
+
+    result.push(omission_notice(all_dropped + header_drops));
+    result.join("\n")
+}
+
 // ── Private helpers ──────────────────────────────────────────────────
 
-/// Single content block preview (160 char truncation).
-fn summarize_block(content: &str) -> String {
-    truncate_summary(content, 160)
+/// Format a single timeline entry: `  - role: content_preview`.
+fn timeline_entry(message: &Value) -> String {
+    let role = message["role"].as_str().unwrap_or("unknown");
+    let content = extract_content_preview(message);
+    format!("  - {role}: {content}")
+}
+
+/// Build timeline entries for a message slice, with head+tail truncation.
+fn build_timeline_entries(messages: &[Value]) -> Vec<String> {
+    const HEAD: usize = 3;
+    const TAIL: usize = 5;
+
+    if messages.len() <= HEAD + TAIL {
+        return messages.iter().map(timeline_entry).collect();
+    }
+
+    let mut entries: Vec<String> = messages[..HEAD].iter().map(timeline_entry).collect();
+    let omitted = messages.len() - HEAD - TAIL;
+    entries.push(format!("  - ... ({omitted} messages omitted) ..."));
+    entries.extend(messages[messages.len() - TAIL..].iter().map(timeline_entry));
+    entries
 }
 
 /// Extract a text preview from a JSON message value.
@@ -256,13 +341,13 @@ fn extract_content_preview(message: &Value) -> String {
 
     // Text content
     if let Some(text) = message.get("content").and_then(Value::as_str) {
-        parts.push(summarize_block(text));
+        parts.push(truncate_to(text, PREVIEW_CHARS));
     } else if let Some(blocks) = message.get("content").and_then(Value::as_array) {
         for block in blocks {
             if block["type"] == "text"
                 && let Some(text) = block.get("text").and_then(Value::as_str)
             {
-                parts.push(summarize_block(text));
+                parts.push(truncate_to(text, PREVIEW_CHARS));
             }
         }
     }
@@ -280,7 +365,10 @@ fn extract_content_preview(message: &Value) -> String {
                 .and_then(|f| f.get("arguments"))
                 .and_then(Value::as_str)
                 .unwrap_or("{}");
-            parts.push(summarize_block(&format!("tool_use {name}({args})")));
+            parts.push(truncate_to(
+                &format!("tool_use {name}({args})"),
+                PREVIEW_CHARS,
+            ));
         }
     }
 
@@ -302,9 +390,10 @@ fn extract_content_preview(message: &Value) -> String {
         } else {
             ""
         };
-        parts.push(summarize_block(&format!(
-            "tool_result {tool_name}: {prefix}{result_text}"
-        )));
+        parts.push(truncate_to(
+            &format!("tool_result {tool_name}: {prefix}{result_text}"),
+            PREVIEW_CHARS,
+        ));
     }
 
     if parts.is_empty() {
@@ -312,6 +401,37 @@ fn extract_content_preview(message: &Value) -> String {
     } else {
         parts.join(" | ")
     }
+}
+
+/// Collect unique, sorted tool names from message history.
+fn collect_unique_tool_names(messages: &[Value]) -> Vec<&str> {
+    let mut names: Vec<&str> = messages
+        .iter()
+        .flat_map(|m| {
+            let mut out = Vec::new();
+            if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    if let Some(name) = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                    {
+                        out.push(name);
+                    }
+                }
+            }
+            if let Some(name) = m.get("tool_name").and_then(Value::as_str) {
+                out.push(name);
+            }
+            if let Some(name) = m.get("name").and_then(Value::as_str) {
+                out.push(name);
+            }
+            out
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// Collect recent text previews for messages matching a given role.
@@ -322,7 +442,7 @@ fn collect_recent_role_summaries(messages: &[Value], role: &str, limit: usize) -
         .rev()
         .filter_map(first_text_block)
         .take(limit)
-        .map(|text| truncate_summary(text, 160))
+        .map(|text| truncate_to(text, PREVIEW_CHARS))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -342,7 +462,7 @@ fn infer_pending_work(messages: &[Value]) -> Vec<String> {
             KEYWORDS.iter().any(|kw| lowered.contains(kw))
         })
         .take(3)
-        .map(|text| truncate_summary(text, 160))
+        .map(|text| truncate_to(text, PREVIEW_CHARS))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -355,15 +475,11 @@ fn collect_key_files(messages: &[Value]) -> Vec<String> {
         .iter()
         .flat_map(|m| {
             let mut texts: Vec<&str> = Vec::new();
-            if let Some(text) = m.get("content").and_then(Value::as_str) {
+            // Reuse first_text_block for main content extraction.
+            if let Some(text) = first_text_block(m) {
                 texts.push(text);
-            } else if let Some(blocks) = m.get("content").and_then(Value::as_array) {
-                for block in blocks {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        texts.push(text);
-                    }
-                }
             }
+            // Additionally check tool_calls arguments for file paths.
             if let Some(args) = m
                 .get("tool_calls")
                 .and_then(Value::as_array)
@@ -396,7 +512,7 @@ fn infer_current_work(messages: &[Value]) -> Option<String> {
         .filter(|m| m["role"] == "assistant")
         .filter_map(first_text_block)
         .find(|text| !text.trim().is_empty())
-        .map(|text| truncate_summary(text, 200))
+        .map(|text| truncate_to(text, CURRENT_WORK_CHARS))
 }
 
 /// Extract the first non-empty text from a JSON message value.
@@ -420,6 +536,43 @@ fn first_text_block(message: &Value) -> Option<&str> {
         }
     }
     None
+}
+
+/// Parsed sections of a formatted summary.
+struct SummarySections {
+    highlights: Vec<String>,
+    timeline: Vec<String>,
+}
+
+/// Parse a summary into highlights and timeline sections in a single pass.
+fn parse_summary_sections(summary: &str) -> SummarySections {
+    let mut highlights = Vec::new();
+    let mut timeline = Vec::new();
+    let mut in_timeline = false;
+
+    for line in format_compact_summary(summary).lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed == "Summary:" || trimmed == "Conversation summary:" {
+            if in_timeline {
+                break;
+            }
+            continue;
+        }
+        if trimmed == "- Key timeline:" {
+            in_timeline = true;
+            continue;
+        }
+        if in_timeline {
+            timeline.push(trimmed.to_string());
+        } else {
+            highlights.push(trimmed.to_string());
+        }
+    }
+
+    SummarySections {
+        highlights,
+        timeline,
+    }
 }
 
 /// Extract file path candidates from content using whitespace splitting.
@@ -454,60 +607,38 @@ fn has_interesting_extension(candidate: &str) -> bool {
         })
 }
 
-/// Truncate content to max_chars, appending ellipsis if truncated.
-fn truncate_summary(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
+/// Truncate content to max_len bytes, appending ellipsis if truncated.
+fn truncate_to(content: &str, max_len: usize) -> String {
+    if content.len() <= max_len {
         return content.to_string();
     }
-    let mut truncated: String = content.chars().take(max_chars).collect();
+    let mut truncated = content[..content.floor_char_boundary(max_len)].to_string();
     truncated.push('…');
     truncated
 }
 
-/// Extract bullet lines (starting with `-`) as highlights.
-fn extract_summary_highlights(summary: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut in_timeline = false;
-
-    for line in format_compact_summary(summary).lines() {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() || trimmed == "Summary:" || trimmed == "Conversation summary:" {
-            continue;
-        }
-        if trimmed == "- Key timeline:" {
-            in_timeline = true;
-            continue;
-        }
-        if in_timeline {
-            continue;
-        }
-        lines.push(trimmed.to_string());
+/// Truncate a single line to max bytes (no ellipsis — used by compress_summary).
+fn truncate_line(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        line.to_string()
+    } else {
+        line[..line.floor_char_boundary(max_bytes)].to_string()
     }
-
-    lines
 }
 
-/// Extract timeline lines from the "Key timeline:" section.
-fn extract_summary_timeline(summary: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut in_timeline = false;
-
-    for line in format_compact_summary(summary).lines() {
-        let trimmed = line.trim_end();
-        if trimmed == "- Key timeline:" {
-            in_timeline = true;
-            continue;
-        }
-        if !in_timeline {
-            continue;
-        }
-        if trimmed.is_empty() {
-            break;
-        }
-        lines.push(trimmed.to_string());
+/// Calculate total byte length of headers + candidates when joined with newlines.
+fn total_join_len(headers: &[String], candidates: &[String]) -> usize {
+    let total: usize = headers
+        .iter()
+        .chain(candidates.iter())
+        .map(|s| s.len())
+        .sum();
+    let count = headers.len() + candidates.len();
+    if count == 0 {
+        0
+    } else {
+        total + count - 1
     }
-
-    lines
 }
 
 /// Collapse consecutive blank lines into a single newline.
@@ -761,16 +892,20 @@ mod tests {
     // ── helper unit tests ────────────────────────────────────────────
 
     #[test]
-    fn truncate_summary_short() {
-        assert_eq!(truncate_summary("hello", 10), "hello");
+    fn truncate_to_short() {
+        assert_eq!(truncate_to("hello", 10), "hello");
     }
 
     #[test]
-    fn truncate_summary_long() {
+    fn truncate_to_long() {
         let long = "x".repeat(200);
-        let truncated = truncate_summary(&long, 160);
+        let truncated = truncate_to(&long, 160);
         assert!(truncated.ends_with('…'));
-        assert!(truncated.chars().count() <= 161);
+        assert!(
+            truncated.len() <= 163,
+            "truncated len should be <= 163, got {}",
+            truncated.len()
+        );
     }
 
     #[test]
@@ -837,12 +972,6 @@ mod tests {
         assert!(summary.contains("4 messages omitted"));
         assert!(summary.contains("msg 7"));
         assert!(summary.contains("msg 11"));
-        // Should NOT contain the omitted messages
-        assert!(
-            !summary.contains("msg 3:")
-                || summary.contains("msg 3") && summary.contains("omitted") == false
-        );
-        // Simpler: just check for the omission notice
         assert!(summary.contains("(4 messages omitted)"));
     }
 
@@ -871,5 +1000,122 @@ mod tests {
         assert!(files.contains(&"src/app.py".to_string()));
         assert!(files.contains(&"config/settings.toml".to_string()));
         assert!(files.contains(&"deploy/deploy.yaml".to_string()));
+    }
+
+    // ── compress_summary (budget enforcement) ───────────────────────
+
+    #[test]
+    fn compress_summary_under_budget_returns_unchanged() {
+        let input = "# Summary\n\n- Key point one\n- Key point two\nDone.";
+        let result = compress_summary(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn compress_summary_over_char_limit() {
+        let mut lines = vec!["# Summary".to_string()];
+        for i in 0..30 {
+            lines.push(format!(
+                "- This is line {i} with some padding text to make it longer than usual"
+            ));
+        }
+        let input = lines.join("\n");
+        assert!(input.len() > 1_200, "input should exceed 1200 chars");
+
+        let result = compress_summary(&input);
+        assert!(
+            result.len() <= 1_200,
+            "result must be <= 1200 chars, got {}",
+            result.len()
+        );
+        assert!(
+            result.contains("lines omitted"),
+            "should have omission notice"
+        );
+    }
+
+    #[test]
+    fn compress_summary_over_line_count() {
+        let mut lines = vec!["# Summary".to_string()];
+        for i in 0..40 {
+            lines.push(format!("Line {i}"));
+        }
+        let input = lines.join("\n");
+
+        let result = compress_summary(&input);
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert!(
+            result_lines.len() <= 25,
+            "result should be <= 25 lines (24 + notice), got {}",
+            result_lines.len()
+        );
+        assert!(result.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compress_summary_long_line_truncation() {
+        let long_line: String = "x".repeat(200);
+        let input = format!("Header\n{long_line}");
+        let result = compress_summary(&input);
+
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines.len(), 2);
+        assert!(
+            result_lines[1].len() <= 160,
+            "long line should be <= 160 chars, got {}",
+            result_lines[1].len()
+        );
+    }
+
+    #[test]
+    fn compress_summary_deduplication() {
+        let input = "Alpha\nalpha\nBeta\nBETA\nGamma";
+        let result = compress_summary(input);
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines, vec!["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn compress_summary_header_preservation() {
+        let mut lines = vec!["# Section One".to_string()];
+        for i in 0..30 {
+            lines.push(format!(
+                "Body line {i} with enough text to fill up space here"
+            ));
+        }
+        lines.push("## Section Two".to_string());
+        for i in 0..10 {
+            lines.push(format!("- Bullet {i} important"));
+        }
+        let input = lines.join("\n");
+
+        let result = compress_summary(&input);
+        assert!(
+            result.contains("# Section One"),
+            "headers should be preserved"
+        );
+        assert!(
+            result.contains("## Section Two"),
+            "second header should be preserved"
+        );
+        assert!(result.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compress_summary_empty_input() {
+        assert_eq!(compress_summary(""), "");
+        assert_eq!(compress_summary("   "), "");
+    }
+
+    #[test]
+    fn compress_summary_single_very_long_line() {
+        let long_line = "a".repeat(2_000);
+        let result = compress_summary(&long_line);
+
+        assert!(
+            result.len() <= 160,
+            "single long line should be truncated, got {} chars",
+            result.len()
+        );
     }
 }
