@@ -221,7 +221,29 @@ pub(crate) async fn run_compaction(
     match config.mode {
         CompactionMode::Deterministic => deterministic::run(history),
         CompactionMode::RecencyPreserving => {
-            let context_window = provider.map_or(200_000, LlmProvider::context_window);
+            // `RecencyPreserving` doesn't call the LLM, but it still
+            // needs a context window to size the tail-budget token cut.
+            // Pull it from the provider if available; otherwise fall
+            // back to the 200 K default (matching Claude-3.5-sonnet /
+            // the LlmProvider trait default). On small-context models
+            // the 200 K fallback would give an oversized tail budget
+            // that covers the entire history and causes
+            // `TooSmallToCompact`, so log a WARN so operators can see
+            // the degraded behaviour in the logs and decide whether to
+            // configure a provider or switch to `deterministic` for
+            // the session.
+            let context_window = if let Some(p) = provider {
+                p.context_window()
+            } else {
+                tracing::warn!(
+                    "chat.compact: recency_preserving has no resolved provider, \
+                     falling back to a 200 K context-window estimate for the tail \
+                     budget. On smaller-context models this may produce an \
+                     oversized tail that skips effective compaction — configure \
+                     a session provider or set chat.compaction.mode = \"deterministic\""
+                );
+                200_000
+            };
             recency_preserving::run(history, config, context_window)
         },
         CompactionMode::Structured => {

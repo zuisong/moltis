@@ -4735,13 +4735,32 @@ impl ChatService for LiveChatService {
         // triggered manually via the RPC (the auto-compact path broadcasts
         // separately around `send()`). The settings hint is included only
         // when the user hasn't opted out via chat.compaction.show_settings_hint.
+        //
+        // Include `totalTokens` / `contextWindow` on this payload so the
+        // web UI's compact card can render a full "Before compact"
+        // section even when this event fires first in `send()`'s
+        // pre-emptive auto-compact path. Without these fields the card
+        // was rendering without the "Total tokens" and "Context usage"
+        // rows on that path.
         let show_hint = compaction_config.show_settings_hint;
+        let pre_compact_total_tokens: u32 = history
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .map(|text| u32::try_from(estimate_text_tokens(text)).unwrap_or(u32::MAX))
+            .sum();
+        let context_window = provider_arc.as_deref().map(|p| p.context_window());
         let mut compact_payload = serde_json::json!({
             "sessionKey": session_key,
             "state": "compact",
             "phase": "done",
             "messageCount": history.len(),
+            "totalTokens": pre_compact_total_tokens,
         });
+        if let Some(window) = context_window
+            && let Some(obj) = compact_payload.as_object_mut()
+        {
+            obj.insert("contextWindow".to_string(), serde_json::json!(window));
+        }
         if let (Some(obj), Some(meta)) = (
             compact_payload.as_object_mut(),
             outcome.broadcast_metadata(show_hint).as_object().cloned(),
@@ -8005,7 +8024,15 @@ fn format_channel_compaction_notice(
     };
     let total = outcome.total_tokens();
     let token_line = if total == 0 {
-        "No LLM tokens used (deterministic strategy)".to_string()
+        // Any strategy that made no LLM calls ends up here: Deterministic,
+        // RecencyPreserving, or a Structured run that fell back to
+        // recency_preserving before the LLM call landed. Report the
+        // actual effective mode so users don't see "deterministic
+        // strategy" when they picked recency_preserving.
+        format!(
+            "No LLM tokens used ({} strategy)",
+            mode_label.to_lowercase()
+        )
     } else {
         format!(
             "Used {total} tokens ({input} in + {output} out)",
@@ -11319,7 +11346,9 @@ mod tests {
     fn format_channel_compaction_notice_surfaces_recency_preserving_fallback_honestly() {
         // When Structured falls back to RecencyPreserving, the outcome's
         // effective_mode reports what actually ran. The channel notice
-        // should show that the user's requested strategy didn't run.
+        // should show that the user's requested strategy didn't run AND
+        // label the zero-token line with the actual mode, not a
+        // hardcoded "deterministic strategy" string.
         let outcome = compaction_run::CompactionOutcome {
             history: vec![],
             effective_mode: moltis_config::CompactionMode::RecencyPreserving,
@@ -11328,7 +11357,14 @@ mod tests {
         };
         let msg = format_channel_compaction_notice(&outcome, true);
         assert!(msg.contains("Mode: Recency preserving"));
-        assert!(msg.contains("No LLM tokens used"));
+        assert!(
+            msg.contains("No LLM tokens used (recency preserving strategy)"),
+            "token line should name the effective mode, got: {msg}"
+        );
+        assert!(
+            !msg.contains("deterministic strategy"),
+            "token line must not hardcode 'deterministic strategy', got: {msg}"
+        );
     }
 
     #[test]
