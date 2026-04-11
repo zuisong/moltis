@@ -22,16 +22,37 @@ use crate::{
     fs::shared::{canonicalize_existing, ensure_regular_file, reject_if_symlink},
 };
 
+/// Outcome of a successful [`apply_edit`] call.
+///
+/// Carries enough metadata for the tool response to describe how the edit
+/// landed, including whether CRLF recovery fired.
+#[derive(Debug, Clone)]
+pub(crate) struct EditOutcome {
+    pub content: String,
+    pub replacements: usize,
+    pub recovered_via_crlf: bool,
+}
+
 /// Apply a single exact-match edit to `content`, enforcing uniqueness semantics.
 ///
-/// Returns the new content on success. Errors surface the number of matches so
-/// the caller (and the LLM via the tool result) can tell why the edit failed.
+/// Returns an [`EditOutcome`] on success. Errors surface the number of matches
+/// so the caller (and the LLM via the tool result) can tell why the edit
+/// failed.
+///
+/// # CRLF recovery
+///
+/// [`ReadTool`](super::read::ReadTool) strips `\r` from CRLF files so the LLM
+/// sees them as LF. If the LLM then crafts an `Edit` with a `\n`-only
+/// `old_string` against a CRLF file, the literal match will miss. On zero
+/// literal hits we retry with `\r\n` substituted for every `\n` in the needle
+/// and `new_string`, so CRLF round-trips work transparently through the
+/// Read + Edit pipeline.
 pub(crate) fn apply_edit(
     content: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> Result<String> {
+) -> Result<EditOutcome> {
     if old_string.is_empty() {
         return Err(Error::message("'old_string' must not be empty"));
     }
@@ -40,11 +61,40 @@ pub(crate) fn apply_edit(
     }
 
     let match_count = content.matches(old_string).count();
-    if match_count == 0 {
-        return Err(Error::message(
-            "'old_string' not found in file — edit refused",
-        ));
+    if match_count > 0 {
+        return finish_edit(
+            content,
+            old_string,
+            new_string,
+            replace_all,
+            match_count,
+            false,
+        );
     }
+
+    // Recovery: CRLF-ify the needle and try again.
+    if content.contains("\r\n") && old_string.contains('\n') && !old_string.contains("\r\n") {
+        let crlf_old = old_string.replace('\n', "\r\n");
+        let crlf_new = new_string.replace('\n', "\r\n");
+        let crlf_count = content.matches(&crlf_old).count();
+        if crlf_count > 0 {
+            return finish_edit(content, &crlf_old, &crlf_new, replace_all, crlf_count, true);
+        }
+    }
+
+    Err(Error::message(
+        "'old_string' not found in file — edit refused",
+    ))
+}
+
+fn finish_edit(
+    content: &str,
+    needle: &str,
+    replacement: &str,
+    replace_all: bool,
+    match_count: usize,
+    recovered_via_crlf: bool,
+) -> Result<EditOutcome> {
     if match_count > 1 && !replace_all {
         return Err(Error::message(format!(
             "'old_string' matches {match_count} locations in the file; \
@@ -53,12 +103,22 @@ pub(crate) fn apply_edit(
         )));
     }
 
-    if replace_all {
-        Ok(content.replace(old_string, new_string))
+    let updated = if replace_all {
+        content.replace(needle, replacement)
     } else {
-        // Replace only the first occurrence (match_count == 1 at this point).
-        Ok(content.replacen(old_string, new_string, 1))
-    }
+        content.replacen(needle, replacement, 1)
+    };
+    let replacements = if replace_all {
+        match_count
+    } else {
+        1
+    };
+
+    Ok(EditOutcome {
+        content: updated,
+        replacements,
+        recovered_via_crlf,
+    })
 }
 
 /// Native `Edit` tool implementation.
@@ -87,16 +147,9 @@ impl EditTool {
             .await
             .map_err(|e| Error::message(format!("failed to read '{file_path}': {e}")))?;
 
-        let replacements_before = content.matches(old_string).count();
-        let updated = apply_edit(&content, old_string, new_string, replace_all)?;
+        let outcome = apply_edit(&content, old_string, new_string, replace_all)?;
 
-        persist_atomic(&canonical, &updated).await?;
-
-        let replacements = if replace_all {
-            replacements_before
-        } else {
-            1
-        };
+        persist_atomic(&canonical, &outcome.content).await?;
 
         #[cfg(feature = "metrics")]
         counter!(
@@ -108,8 +161,9 @@ impl EditTool {
 
         Ok(json!({
             "file_path": canonical.to_string_lossy(),
-            "replacements": replacements,
+            "replacements": outcome.replacements,
             "replace_all": replace_all,
+            "recovered_via_crlf": outcome.recovered_via_crlf,
         }))
     }
 }
@@ -227,8 +281,10 @@ mod tests {
     #[test]
     fn apply_edit_unique_match() {
         let content = "hello world";
-        let updated = apply_edit(content, "world", "rust", false).unwrap();
-        assert_eq!(updated, "hello rust");
+        let outcome = apply_edit(content, "world", "rust", false).unwrap();
+        assert_eq!(outcome.content, "hello rust");
+        assert_eq!(outcome.replacements, 1);
+        assert!(!outcome.recovered_via_crlf);
     }
 
     #[test]
@@ -241,8 +297,9 @@ mod tests {
     #[test]
     fn apply_edit_replace_all() {
         let content = "foo foo foo";
-        let updated = apply_edit(content, "foo", "bar", true).unwrap();
-        assert_eq!(updated, "bar bar bar");
+        let outcome = apply_edit(content, "foo", "bar", true).unwrap();
+        assert_eq!(outcome.content, "bar bar bar");
+        assert_eq!(outcome.replacements, 3);
     }
 
     #[test]
@@ -260,6 +317,49 @@ mod tests {
     #[test]
     fn apply_edit_rejects_no_match() {
         let err = apply_edit("hello", "world", "rust", false).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn apply_edit_crlf_recovery_single_line() {
+        // File is CRLF; needle is LF-only (as Read would have returned).
+        let content = "one\r\ntwo\r\nthree\r\n";
+        let outcome = apply_edit(content, "one\ntwo", "ONE\nTWO", false).unwrap();
+        assert!(outcome.recovered_via_crlf);
+        assert_eq!(outcome.replacements, 1);
+        assert_eq!(outcome.content, "ONE\r\nTWO\r\nthree\r\n");
+    }
+
+    #[test]
+    fn apply_edit_crlf_recovery_preserves_file_line_endings() {
+        // New-string is also LF-only; recovery CRLF-ifies it so the file
+        // stays CRLF throughout after the edit.
+        let content = "alpha\r\nbeta\r\n";
+        let outcome = apply_edit(content, "alpha\nbeta", "ALPHA\nBETA", false).unwrap();
+        assert_eq!(outcome.content, "ALPHA\r\nBETA\r\n");
+    }
+
+    #[test]
+    fn apply_edit_no_recovery_when_lf_file() {
+        // LF file + LF needle — happy path, recovery does not fire.
+        let content = "alpha\nbeta\n";
+        let outcome = apply_edit(content, "alpha\nbeta", "ALPHA\nBETA", false).unwrap();
+        assert!(!outcome.recovered_via_crlf);
+    }
+
+    #[test]
+    fn apply_edit_no_recovery_when_needle_already_crlf() {
+        // File CRLF, needle CRLF — literal match wins, no recovery fires.
+        let content = "one\r\ntwo\r\n";
+        let outcome = apply_edit(content, "one\r\ntwo", "ONE\r\nTWO", false).unwrap();
+        assert!(!outcome.recovered_via_crlf);
+    }
+
+    #[test]
+    fn apply_edit_crlf_recovery_still_fails_if_no_match() {
+        // Not present in any form.
+        let content = "alpha\r\nbeta\r\n";
+        let err = apply_edit(content, "delta\nepsilon", "X\nY", false).unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -326,6 +426,32 @@ mod tests {
         assert_eq!(value["replacements"], 3);
         let contents = tokio::fs::read_to_string(&target).await.unwrap();
         assert_eq!(contents, "bar bar bar");
+    }
+
+    #[tokio::test]
+    async fn edit_tool_recovers_crlf_file_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("crlf.txt");
+        tokio::fs::write(&target, "line one\r\nline two\r\nline three\r\n")
+            .await
+            .unwrap();
+
+        // LLM sends LF-only needle (matching what Read stripped).
+        let tool = EditTool::new();
+        let value = tool
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "old_string": "line one\nline two",
+                "new_string": "LINE ONE\nLINE TWO",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["replacements"], 1);
+        assert_eq!(value["recovered_via_crlf"], true);
+
+        let contents = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(contents, "LINE ONE\r\nLINE TWO\r\nline three\r\n");
     }
 
     #[tokio::test]

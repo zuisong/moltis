@@ -50,23 +50,21 @@ impl MultiEditTool {
 
         let mut buffer = original;
         let mut per_edit_replacements: Vec<usize> = Vec::with_capacity(edits.len());
+        let mut any_crlf_recovery = false;
 
         for (idx, edit) in edits.iter().enumerate() {
-            let count = buffer.matches(&edit.old_string).count();
-            let updated = apply_edit(
+            let outcome = apply_edit(
                 &buffer,
                 &edit.old_string,
                 &edit.new_string,
                 edit.replace_all,
             )
             .map_err(|e| Error::message(format!("edit #{}: {e}", idx + 1)))?;
-            let applied = if edit.replace_all {
-                count
-            } else {
-                1
-            };
-            per_edit_replacements.push(applied);
-            buffer = updated;
+            per_edit_replacements.push(outcome.replacements);
+            if outcome.recovered_via_crlf {
+                any_crlf_recovery = true;
+            }
+            buffer = outcome.content;
         }
 
         persist_atomic(&canonical, &buffer).await?;
@@ -83,6 +81,7 @@ impl MultiEditTool {
             "file_path": canonical.to_string_lossy(),
             "edits_applied": edits.len(),
             "replacements_per_edit": per_edit_replacements,
+            "recovered_via_crlf": any_crlf_recovery,
         }))
     }
 }
