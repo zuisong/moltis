@@ -42,6 +42,7 @@
 - [Session State](session-state.md)
 - [Session Branching](session-branching.md)
 - [Checkpoints](checkpoints.md)
+- [Compaction](compaction.md)
 - [Filesystem Tools](tools-fs.md)
 - [Scheduling (Cron Jobs)](scheduling.md)
 - [Webhooks](webhooks.md)

@@ -48,6 +48,9 @@ use {
     moltis_tools::policy::{ToolPolicy, profile_tools},
 };
 
+mod compaction;
+mod compaction_run;
+
 pub mod chat_error;
 pub mod error;
 pub mod runtime;
@@ -392,6 +395,20 @@ fn estimate_text_tokens(text: &str) -> u64 {
     }
     let bytes = trimmed.len() as u64;
     bytes.div_ceil(4).max(1)
+}
+
+/// Compute the auto-compact trigger threshold for a given context window
+/// and user-configured `chat.compaction.threshold_percent`.
+///
+/// The returned value is the number of estimated next-request input
+/// tokens at or above which `send()` fires a pre-emptive compaction.
+/// The fraction is clamped to `[0.1, 0.95]` so a typo'd config can't
+/// disable auto-compact or spam it on every message, and the result is
+/// floored at `1` so zero-context windows still get a non-zero check.
+#[must_use]
+fn compute_auto_compact_threshold(context_window_tokens: u64, threshold_percent: f32) -> u64 {
+    let fraction = f64::from(threshold_percent.clamp(0.1, 0.95));
+    ((context_window_tokens as f64) * fraction).round().max(1.0) as u64
 }
 
 fn now_ms() -> u64 {
@@ -3766,14 +3783,23 @@ impl ChatService for LiveChatService {
             .get("_accept_language")
             .and_then(|v| v.as_str())
             .map(String::from);
-        // Auto-compact when the next request is likely to exceed 95% of the
-        // model context window.
+        // Auto-compact when the next request is likely to exceed
+        // `chat.compaction.threshold_percent` of the model context window.
+        // The value is clamped to the 0.1–0.95 range in case config
+        // validation missed a typo; the default (0.95) is loaded via
+        // load_prompt_persona_for_agent for the session's agent and
+        // matches the pre-PR-#653 hardcoded trigger.
+        let compaction_cfg = &load_prompt_persona_for_agent(&session_agent_id)
+            .config
+            .chat
+            .compaction;
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let estimated_next_input = token_usage
             .current_request_input_tokens
             .saturating_add(estimate_text_tokens(&text));
-        let compact_threshold = (context_window * 95) / 100;
+        let compact_threshold =
+            compute_auto_compact_threshold(context_window, compaction_cfg.threshold_percent);
 
         if estimated_next_input >= compact_threshold {
             let pre_compact_msg_count = history.len();
@@ -3785,7 +3811,9 @@ impl ChatService for LiveChatService {
                 session = %session_key,
                 estimated_next_input,
                 context_window,
-                "auto-compact triggered (estimated next request over 95% threshold)"
+                threshold_percent = compaction_cfg.threshold_percent,
+                compact_threshold,
+                "auto-compact triggered (estimated next request over chat.compaction.threshold_percent)"
             );
             broadcast(
                 &self.state,
@@ -3816,6 +3844,18 @@ impl ChatService for LiveChatService {
                         .read(&session_key)
                         .await
                         .unwrap_or_default();
+                    // This `auto_compact done` event is a lifecycle
+                    // signal for subscribers that pre-emptive
+                    // auto-compact finished. The mode/token metadata
+                    // lives on the `chat.compact done` event that
+                    // `self.compact()` broadcasts from the inside —
+                    // the `compactBroadcastPath: "inner"` marker below
+                    // lets hook / webhook consumers detect that and
+                    // subscribe to that event instead. The parallel
+                    // `run_with_tools` context-overflow path emits a
+                    // self-contained `auto_compact done` (with
+                    // `compactBroadcastPath: "wrapper"`) that carries
+                    // the metadata directly.
                     broadcast(
                         &self.state,
                         "chat",
@@ -3826,6 +3866,7 @@ impl ChatService for LiveChatService {
                             "messageCount": pre_compact_msg_count,
                             "totalTokens": pre_compact_total,
                             "contextWindow": context_window,
+                            "compactBroadcastPath": "inner",
                         }),
                         BroadcastOpts::default(),
                     )
@@ -4639,74 +4680,106 @@ impl ChatService for LiveChatService {
             }
         }
 
-        // Build a summary prompt from the conversation using structured messages.
-        // We pass the typed ChatMessage objects directly so role boundaries are
-        // maintained via the API's message structure, preventing prompt injection
-        // where user content could mimic role prefixes in concatenated text.
-        let mut summary_messages = vec![ChatMessage::system(
-            "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
-        )];
-        summary_messages.extend(values_to_chat_messages(&history));
-        summary_messages.push(ChatMessage::user(
-            "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-        ));
+        // Resolve the session persona so we can pick up the compaction config
+        // and provide a provider to LLM-backed compaction modes. Agent-scoped
+        // config falls back through `load_prompt_persona_for_agent`'s default
+        // path, so this is safe even when the session has no custom preset.
+        let persona = load_prompt_persona_for_agent(&session_agent_id);
+        let compaction_config = &persona.config.chat.compaction;
 
-        // Use the session's model if available, otherwise fall back to the model
-        // from the last assistant message, then to the first registered provider.
-        let provider = self
-            .resolve_provider(&session_key, &history)
-            .await
-            .map_err(ServiceError::message)?;
+        // LLM-backed modes need a resolved provider. Deterministic mode
+        // ignores it, so resolution failures are only fatal for the other
+        // modes — and `run_compaction` returns a clear ProviderRequired
+        // error in that case.
+        let provider_arc = self.resolve_provider(&session_key, &history).await.ok();
 
-        info!(session = %session_key, messages = history.len(), "chat.compact: summarizing");
+        let outcome =
+            compaction_run::run_compaction(&history, compaction_config, provider_arc.as_deref())
+                .await
+                .map_err(|e| ServiceError::message(e.to_string()))?;
 
-        let mut stream = provider.stream(summary_messages);
-        let mut summary = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                StreamEvent::Delta(delta) => summary.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    return Err(format!("compact summarization failed: {e}").into());
-                },
-                // Tool events not expected in summarization stream.
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                // Provider raw payloads are debug metadata, not summary text.
-                | StreamEvent::ProviderRaw(_)
-                // Ignore provider reasoning blocks; summary body should only
-                // include final answer text.
-                | StreamEvent::ReasoningDelta(_) => {},
-            }
-        }
+        let compacted = outcome.history.clone();
 
-        if summary.is_empty() {
-            return Err("compact produced empty summary".into());
-        }
+        // Keep a plain-text copy of the summary so the memory-file snapshot
+        // below can still record what we compacted to. The helper walks the
+        // compacted history because recency_preserving / structured modes
+        // splice head and tail messages around the summary — it isn't
+        // necessarily compacted[0].
+        let summary_for_memory = compaction_run::extract_summary_body(&compacted);
 
-        // Replace history with a single user message containing the summary.
-        // Using the user role (not assistant) avoids breaking providers like
-        // llama.cpp that require every assistant message to follow a user message,
-        // and ensures the summary stays in the conversation turn array for
-        // providers using the Responses API (which promotes system messages to
-        // instructions).
-        let compacted_msg = PersistedMessage::User {
-            content: MessageContent::Text(format!("[Conversation Summary]\n\n{summary}")),
-            created_at: Some(now_ms()),
-            audio: None,
-            channel: None,
-            seq: None,
-            run_id: None,
-        };
-        let compacted = vec![compacted_msg.to_value()];
+        info!(
+            session = %session_key,
+            requested_mode = ?compaction_config.mode,
+            effective_mode = ?outcome.effective_mode,
+            input_tokens = outcome.input_tokens,
+            output_tokens = outcome.output_tokens,
+            messages = history.len(),
+            "chat.compact: strategy dispatched"
+        );
 
+        // Replace the session history BEFORE broadcasting or notifying
+        // channels. If we did it the other way around, a concurrent
+        // `send()` RPC that landed between the broadcast and the store
+        // update would see the stale history and the client UI would
+        // already believe compaction had finished — a narrow but real
+        // race window flagged by Greptile on commit 0714de07.
         self.session_store
             .replace_history(&session_key, compacted.clone())
             .await
             .map_err(ServiceError::message)?;
 
         self.session_metadata.touch(&session_key, 1).await;
+
+        // Broadcast a chat.compact-scoped "done" event so UI consumers see
+        // the effective mode and token usage even when compaction is
+        // triggered manually via the RPC (the auto-compact path broadcasts
+        // separately around `send()`). The settings hint is included only
+        // when the user hasn't opted out via chat.compaction.show_settings_hint.
+        //
+        // Include `totalTokens` / `contextWindow` on this payload so the
+        // web UI's compact card can render a full "Before compact"
+        // section even when this event fires first in `send()`'s
+        // pre-emptive auto-compact path. Without these fields the card
+        // was rendering without the "Total tokens" and "Context usage"
+        // rows on that path.
+        let show_hint = compaction_config.show_settings_hint;
+        let pre_compact_total_tokens: u32 = history
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .map(|text| u32::try_from(estimate_text_tokens(text)).unwrap_or(u32::MAX))
+            .sum();
+        let context_window = provider_arc.as_deref().map(|p| p.context_window());
+        let mut compact_payload = serde_json::json!({
+            "sessionKey": session_key,
+            "state": "compact",
+            "phase": "done",
+            "messageCount": history.len(),
+            "totalTokens": pre_compact_total_tokens,
+        });
+        if let Some(window) = context_window
+            && let Some(obj) = compact_payload.as_object_mut()
+        {
+            obj.insert("contextWindow".to_string(), serde_json::json!(window));
+        }
+        if let (Some(obj), Some(meta)) = (
+            compact_payload.as_object_mut(),
+            outcome.broadcast_metadata(show_hint).as_object().cloned(),
+        ) {
+            obj.extend(meta);
+        }
+        broadcast(
+            &self.state,
+            "chat",
+            compact_payload,
+            BroadcastOpts::default(),
+        )
+        .await;
+
+        // Notify any channel (Telegram, Discord, Matrix, WhatsApp, etc.)
+        // that has pending reply targets on this session, so channel
+        // users see "Conversation compacted (mode, tokens, hint)"
+        // alongside the web UI's compact card.
+        notify_channels_of_compaction(&self.state, &session_key, &outcome, show_hint).await;
 
         // Save compaction summary to memory file and trigger sync.
         if let Some(mm) = self.state.memory_manager() {
@@ -4721,7 +4794,7 @@ impl ChatService for LiveChatService {
                 let filename = format!("compaction-{}-{ts}.md", session_key);
                 let path = memory_dir.join(&filename);
                 let content = format!(
-                    "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{summary}"
+                    "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{summary_for_memory}"
                 );
                 if let Err(e) = tokio::fs::write(&path, &content).await {
                     warn!(error = %e, "compact: failed to write memory file");
@@ -4740,7 +4813,7 @@ impl ChatService for LiveChatService {
         if let Some(ref hooks) = self.hook_registry {
             let payload = moltis_common::hooks::HookPayload::AfterCompaction {
                 session_key: session_key.clone(),
-                summary_len: summary.len(),
+                summary_len: summary_for_memory.len(),
             };
             if let Err(e) = hooks.dispatch(&payload).await {
                 warn!(session = %session_key, error = %e, "AfterCompaction hook failed");
@@ -6923,22 +6996,55 @@ async fn run_with_tools(
             )
             .await;
 
-            // Inline compaction: summarize history, replace in store.
-            match compact_session(store, session_key, &provider_ref).await {
-                Ok(()) => {
-                    broadcast(
-                        state,
-                        "chat",
-                        serde_json::json!({
-                            "runId": run_id,
-                            "sessionKey": session_key,
-                            "state": "auto_compact",
-                            "phase": "done",
-                            "reason": "context_window_exceeded",
-                        }),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
+            // Inline compaction: run the configured strategy, replace in store.
+            // Forward the session provider so LLM-backed modes (llm_replace
+            // / structured) have a client to summarise with.
+            match compact_session(
+                store,
+                session_key,
+                &persona.config.chat.compaction,
+                Some(&*provider_ref),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    // Merge the compaction metadata (mode, tokens, settings
+                    // hint) into the broadcast so the UI can show a toast
+                    // like "Compacted via Structured mode (1,234 tokens)".
+                    // Respect chat.compaction.show_settings_hint so the
+                    // hint is omitted when the user has opted out.
+                    //
+                    // `compactBroadcastPath: "wrapper"` marks this as
+                    // the self-contained auto_compact event with the
+                    // metadata inline. The parallel pre-emptive path
+                    // in `send()` emits `compactBroadcastPath: "inner"`
+                    // instead, where the metadata lives on the separate
+                    // `chat.compact done` event fired from within
+                    // `self.compact()`. Hook consumers that only care
+                    // about metadata can subscribe to whichever path
+                    // matches their use case.
+                    let show_hint = persona.config.chat.compaction.show_settings_hint;
+                    let mut payload = serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "state": "auto_compact",
+                        "phase": "done",
+                        "reason": "context_window_exceeded",
+                        "compactBroadcastPath": "wrapper",
+                    });
+                    if let (Some(obj), Some(meta)) = (
+                        payload.as_object_mut(),
+                        outcome.broadcast_metadata(show_hint).as_object().cloned(),
+                    ) {
+                        obj.extend(meta);
+                    }
+                    broadcast(state, "chat", payload, BroadcastOpts::default()).await;
+
+                    // Notify any channel (Telegram, Discord, Matrix,
+                    // WhatsApp, etc.) that has pending reply targets on
+                    // this session so channel users see the same mode +
+                    // token info as the web UI.
+                    notify_channels_of_compaction(state, session_key, &outcome, show_hint).await;
 
                     // Reload compacted history and retry.
                     let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
@@ -7178,80 +7284,41 @@ async fn run_with_tools(
 ///
 /// This is a standalone helper so `run_with_tools` can call it without
 /// requiring `&self` on `LiveChatService`.
+/// Compact a session using the configured [`moltis_config::CompactionMode`].
+///
+/// Thin wrapper around [`compaction_run::run_compaction`] that owns the
+/// session-store read/write pair. `provider` is forwarded to LLM-backed
+/// modes; `None` is accepted for deterministic compaction but causes
+/// `llm_replace` / `structured` to return a [`ProviderRequired`] error.
+///
+/// Returns the full [`compaction_run::CompactionOutcome`] so the caller
+/// can surface the effective mode and token usage in its broadcast
+/// event. This is a standalone helper so `run_with_tools` can call it
+/// without requiring `&self` on `LiveChatService`.
+///
+/// [`ProviderRequired`]: compaction_run::CompactionRunError::ProviderRequired
 async fn compact_session(
     store: &Arc<SessionStore>,
     session_key: &str,
-    provider: &Arc<dyn moltis_agents::model::LlmProvider>,
-) -> error::Result<()> {
+    config: &moltis_config::CompactionConfig,
+    provider: Option<&dyn moltis_agents::model::LlmProvider>,
+) -> error::Result<compaction_run::CompactionOutcome> {
     let history = store
         .read(session_key)
         .await
         .map_err(|source| error::Error::external("failed to read session history", source))?;
-    if history.is_empty() {
-        return Err(error::Error::message("nothing to compact"));
-    }
 
-    // Use structured ChatMessage objects so role boundaries are maintained via
-    // the API's message structure, preventing prompt injection where user content
-    // could mimic role prefixes in concatenated text.
-    let mut summary_messages = vec![ChatMessage::system(
-        "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
-    )];
-    summary_messages.extend(values_to_chat_messages(&history));
-    summary_messages.push(ChatMessage::user(
-        "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-    ));
-
-    let mut stream = provider.stream(summary_messages);
-    let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            StreamEvent::Delta(delta) => summary.push_str(&delta),
-            StreamEvent::Done(_) => break,
-            StreamEvent::Error(e) => {
-                return Err(error::Error::message(format!(
-                    "compact summarization failed: {e}"
-                )));
-            },
-            // Tool events not expected in summarization stream.
-            StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallArgumentsDelta { .. }
-            | StreamEvent::ToolCallComplete { .. }
-            // Provider raw payloads are debug metadata, not summary text.
-            | StreamEvent::ProviderRaw(_)
-            // Ignore provider reasoning blocks; summary body should only
-            // include final answer text.
-            | StreamEvent::ReasoningDelta(_) => {},
-        }
-    }
-
-    if summary.is_empty() {
-        return Err(error::Error::message("compact produced empty summary"));
-    }
-
-    // Use user role so strict providers (e.g. llama.cpp) don't reject the
-    // history for having an assistant message without a preceding user message.
-    // User role also keeps the summary in the conversation turn array for
-    // providers using the Responses API (system messages get promoted to
-    // instructions and disappear from turns).
-    let compacted_msg = PersistedMessage::User {
-        content: MessageContent::Text(format!("[Conversation Summary]\n\n{summary}")),
-        created_at: Some(now_ms()),
-        audio: None,
-        channel: None,
-        seq: None,
-        run_id: None,
-    };
-    let compacted = vec![compacted_msg.to_value()];
+    let outcome = compaction_run::run_compaction(&history, config, provider)
+        .await
+        .map_err(|e| error::Error::message(e.to_string()))?;
 
     store
-        .replace_history(session_key, compacted)
+        .replace_history(session_key, outcome.history.clone())
         .await
         .map_err(|source| error::Error::external("failed to replace compacted history", source))?;
 
-    Ok(())
+    Ok(outcome)
 }
-
 // ── Streaming mode (no tools) ───────────────────────────────────────────────
 
 const STREAM_RETRYABLE_SERVER_PATTERNS: &[&str] = &[
@@ -7933,6 +8000,109 @@ fn format_channel_error_message(error_obj: &Value) -> String {
         .or_else(|| error_obj.get("message").and_then(|v| v.as_str()))
         .unwrap_or("Please try again.");
     format!("⚠️ {title}: {detail}")
+}
+
+/// Format a user-facing notice announcing that a session was compacted.
+///
+/// Shown verbatim to channel users (Telegram, Discord, WhatsApp, etc.) and
+/// kept short so small mobile clients don't wrap the whole thing.
+///
+/// When `include_settings_hint` is false, the "Change chat.compaction.mode…"
+/// footer is omitted so users who have set
+/// `chat.compaction.show_settings_hint = false` don't see the repetitive
+/// hint on every compaction. Mode + token lines are always included.
+/// The LLM retry path never sees this text regardless.
+fn format_channel_compaction_notice(
+    outcome: &compaction_run::CompactionOutcome,
+    include_settings_hint: bool,
+) -> String {
+    let mode_label = match outcome.effective_mode {
+        moltis_config::CompactionMode::Deterministic => "Deterministic",
+        moltis_config::CompactionMode::RecencyPreserving => "Recency preserving",
+        moltis_config::CompactionMode::Structured => "Structured",
+        moltis_config::CompactionMode::LlmReplace => "LLM replace",
+    };
+    let total = outcome.total_tokens();
+    let token_line = if total == 0 {
+        // Any strategy that made no LLM calls ends up here: Deterministic,
+        // RecencyPreserving, or a Structured run that fell back to
+        // recency_preserving before the LLM call landed. Report the
+        // actual effective mode so users don't see "deterministic
+        // strategy" when they picked recency_preserving.
+        format!(
+            "No LLM tokens used ({} strategy)",
+            mode_label.to_lowercase()
+        )
+    } else {
+        format!(
+            "Used {total} tokens ({input} in + {output} out)",
+            total = total,
+            input = outcome.input_tokens,
+            output = outcome.output_tokens,
+        )
+    };
+    let body = format!(
+        "🧹 Conversation compacted\n\
+         Mode: {mode_label}\n\
+         {token_line}",
+    );
+    if include_settings_hint {
+        format!("{body}\n{hint}", hint = compaction_run::SETTINGS_HINT)
+    } else {
+        body
+    }
+}
+
+/// Send a silent "session compacted" notice to pending channel targets
+/// without draining them.
+///
+/// Mirrors [`send_retry_status_to_channels`]: the targets are *peeked*,
+/// not drained, so the in-flight agent run can still deliver its final
+/// reply to them afterward. Uses `send_text_silent` so the channel
+/// integration doesn't count it toward user-visible interactive replies
+/// (no TTS, no delivery receipts beyond the channel's own).
+async fn notify_channels_of_compaction(
+    state: &Arc<dyn ChatRuntime>,
+    session_key: &str,
+    outcome: &compaction_run::CompactionOutcome,
+    include_settings_hint: bool,
+) {
+    let targets = state.peek_channel_replies(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let Some(outbound) = state.channel_outbound() else {
+        return;
+    };
+
+    let message = format_channel_compaction_notice(outcome, include_settings_hint);
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let message = message.clone();
+        let to = target.outbound_to().into_owned();
+        tasks.push(tokio::spawn(async move {
+            let reply_to = target.message_id.as_deref();
+            if let Err(e) = outbound
+                .send_text_silent(&target.account_id, &to, &message, reply_to)
+                .await
+            {
+                warn!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
+                    "failed to send compaction notice to channel: {e}"
+                );
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel compaction notice task join failed");
+        }
+    }
 }
 
 /// Send a short retry status update to pending channel targets without draining
@@ -11007,7 +11177,7 @@ mod tests {
             history[0]
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|content| content.starts_with("[Conversation Summary]\n\nsummary"))
+                .is_some_and(|content| content.starts_with("[Conversation Summary]\n\n"))
         );
         assert_eq!(history[1].get("role").and_then(Value::as_str), Some("user"));
         assert_eq!(
@@ -11051,10 +11221,8 @@ mod tests {
             .await
             .expect("seed assistant msg");
 
-        let provider: Arc<dyn LlmProvider> = Arc::new(AutoCompactRegressionProvider {
-            context_window: 100,
-        });
-        compact_session(&store, session_key, &provider)
+        let compaction_config = moltis_config::CompactionConfig::default();
+        compact_session(&store, session_key, &compaction_config, None)
             .await
             .expect("compact_session should succeed");
 
@@ -11108,6 +11276,32 @@ mod tests {
     }
 
     #[test]
+    fn compute_auto_compact_threshold_honors_configured_fraction() {
+        // Default: 0.95 × 200K = 190K. Matches the pre-PR-#653 trigger.
+        assert_eq!(compute_auto_compact_threshold(200_000, 0.95), 190_000);
+        // Aggressive: 0.5 × 200K = 100K, catching auto-compact earlier.
+        assert_eq!(compute_auto_compact_threshold(200_000, 0.5), 100_000);
+    }
+
+    #[test]
+    fn compute_auto_compact_threshold_clamps_out_of_range_values() {
+        // Below 0.1 clamps to 0.1 so a typo like 0.01 doesn't drown the
+        // session in compactions on every single message.
+        assert_eq!(compute_auto_compact_threshold(100_000, 0.01), 10_000);
+        // Above 0.95 clamps to 0.95 so auto-compact can never be silently
+        // disabled by `threshold_percent = 1.0`.
+        assert_eq!(compute_auto_compact_threshold(100_000, 1.0), 95_000);
+    }
+
+    #[test]
+    fn compute_auto_compact_threshold_floors_at_one_for_zero_context_window() {
+        // A zero-token context window (shouldn't happen in practice) must
+        // still produce a non-zero threshold so the `>=` check in send()
+        // doesn't trigger on every message, or on none.
+        assert_eq!(compute_auto_compact_threshold(0, 0.75), 1);
+    }
+
+    #[test]
     fn format_channel_error_message_falls_back_to_message_rejected_shape() {
         let error_obj = serde_json::json!({
             "type": "message_rejected",
@@ -11115,6 +11309,92 @@ mod tests {
         });
         let msg = format_channel_error_message(&error_obj);
         assert_eq!(msg, "⚠️ Message rejected: rejected by hook");
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_zero_tokens_for_deterministic_mode() {
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::Deterministic,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let msg = format_channel_compaction_notice(&outcome, true);
+        assert!(msg.contains("🧹 Conversation compacted"));
+        assert!(msg.contains("Mode: Deterministic"));
+        assert!(msg.contains("No LLM tokens used"));
+        assert!(msg.contains("chat.compaction.mode"));
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_shows_token_breakdown_for_llm_modes() {
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::Structured,
+            input_tokens: 1_234,
+            output_tokens: 567,
+        };
+        let msg = format_channel_compaction_notice(&outcome, true);
+        assert!(msg.contains("Mode: Structured"));
+        assert!(
+            msg.contains("Used 1801 tokens (1234 in + 567 out)"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_surfaces_recency_preserving_fallback_honestly() {
+        // When Structured falls back to RecencyPreserving, the outcome's
+        // effective_mode reports what actually ran. The channel notice
+        // should show that the user's requested strategy didn't run AND
+        // label the zero-token line with the actual mode, not a
+        // hardcoded "deterministic strategy" string.
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::RecencyPreserving,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let msg = format_channel_compaction_notice(&outcome, true);
+        assert!(msg.contains("Mode: Recency preserving"));
+        assert!(
+            msg.contains("No LLM tokens used (recency preserving strategy)"),
+            "token line should name the effective mode, got: {msg}"
+        );
+        assert!(
+            !msg.contains("deterministic strategy"),
+            "token line must not hardcode 'deterministic strategy', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_omits_settings_hint_when_disabled() {
+        // Users who have set `chat.compaction.show_settings_hint = false`
+        // should still see the mode and token info but not the repetitive
+        // "Change chat.compaction.mode in moltis.toml…" footer.
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::Structured,
+            input_tokens: 1_000,
+            output_tokens: 500,
+        };
+        let msg = format_channel_compaction_notice(&outcome, false);
+        assert!(
+            msg.contains("Mode: Structured"),
+            "mode still present: {msg}"
+        );
+        assert!(
+            msg.contains("Used 1500 tokens"),
+            "token line still present: {msg}"
+        );
+        assert!(
+            !msg.contains("chat.compaction.mode"),
+            "settings hint must be stripped, got: {msg}"
+        );
+        assert!(
+            !msg.contains("docs.moltis.org"),
+            "docs URL must be stripped too, got: {msg}"
+        );
     }
 
     #[test]

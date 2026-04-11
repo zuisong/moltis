@@ -124,6 +124,7 @@ firecrawl = ["moltis-tools/firecrawl"]
 fs-tools = ["moltis-tools/fs-tools"]
 graphql = []
 local-embeddings = ["moltis-memory/local-embeddings"]
+llm-compaction = ["moltis-chat/llm-compaction"]
 local-llm = [
   "moltis-chat/local-llm",
   "moltis-provider-setup/local-llm",
