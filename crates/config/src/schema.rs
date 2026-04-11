@@ -247,10 +247,21 @@ pub struct MoltisConfig {
 }
 
 /// Agent spawn presets used by tools like `spawn_agent`.
+///
+/// **IMPORTANT:** Everything under `[agents.presets.*]` — including each
+/// preset's `tools.allow`/`tools.deny` — applies ONLY to sub-agents spawned
+/// via the `spawn_agent` tool. Preset tool policies have no effect on the
+/// main agent session. To filter tools for the main session, configure
+/// `[tools.policy]` (see `ToolPolicyConfig`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentsConfig {
-    /// Optional default preset name used when `spawn_agent.preset` is omitted.
+    /// Default preset name used when `spawn_agent.preset` is omitted.
+    ///
+    /// Applies ONLY to sub-agents spawned via the `spawn_agent` tool. It
+    /// does NOT configure tool policy, model, or identity for the main
+    /// agent session. For main-session tool allow/deny, use
+    /// `[tools.policy]`.
     pub default_preset: Option<String>,
     /// Named spawn presets.
     #[serde(default)]
@@ -347,6 +358,11 @@ impl Default for SessionAccessPolicyConfig {
 /// Presets allow defining specialized agent configurations that can be
 /// selected when spawning sub-agents. Each preset can override identity,
 /// model, tool policies, and system prompt.
+///
+/// **IMPORTANT:** Presets apply ONLY to sub-agents spawned via the
+/// `spawn_agent` tool. The `tools.allow`/`tools.deny` fields on a preset
+/// do NOT filter tools for the main agent session — the main session's
+/// tool policy is controlled by the top-level `[tools.policy]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentPreset {
