@@ -161,17 +161,30 @@ pub(crate) const SETTINGS_HINT: &str = "Change chat.compaction.mode in moltis.to
 /// Best-effort extraction of a human-readable summary body from a
 /// compacted history, for use in memory-file snapshots and hook payloads.
 ///
-/// Walks the compacted messages looking for the first one whose text
-/// content begins with either `[Conversation Summary]` (produced by the
-/// `deterministic`, `structured`, and `llm_replace` modes) or
+/// Walks the compacted messages in **reverse** looking for a message whose
+/// text content begins with either `[Conversation Summary]` (produced by
+/// the `deterministic`, `structured`, and `llm_replace` modes) or
 /// `[Conversation Compacted]` (produced by the `recency_preserving`
-/// middle marker), and returns the stripped body. Returns an empty
-/// string when no summary-shaped message is found, which is fine for
-/// hook `summary_len` reporting and falls through gracefully.
+/// middle marker), and returns the stripped body.
+///
+/// Reverse iteration matters for iterative `structured` re-compaction:
+/// the prior compaction's `[Conversation Summary]` message is preserved
+/// verbatim inside the head, and the freshly-generated summary is
+/// spliced in at `head_end`. A naïve left-to-right scan would return
+/// the stale prior body, so the memory-file snapshot and
+/// `AfterCompaction.summary_len` hook payload would describe the old
+/// compaction instead of the new one. For the other modes (and for
+/// first-time structured) there is only one summary-shaped message, so
+/// the reverse walk has no effect.
+///
+/// Returns an empty string when no summary-shaped message is found,
+/// which is fine for hook `summary_len` reporting and falls through
+/// gracefully.
 #[must_use]
 pub(crate) fn extract_summary_body(compacted: &[Value]) -> String {
     compacted
         .iter()
+        .rev()
         .filter_map(|msg| msg.get("content").and_then(Value::as_str))
         .find_map(|content| {
             content
@@ -407,5 +420,32 @@ mod tests {
             json!({"role": "assistant", "content": "just a regular reply"}),
         ];
         assert_eq!(extract_summary_body(&compacted), "");
+    }
+
+    #[test]
+    fn extract_summary_body_picks_newest_summary_in_iterative_structured_recompaction() {
+        // Iterative `structured` re-compaction shape: the prior
+        // compaction's `[Conversation Summary]` sits in the retained
+        // head at index 0, and the freshly-generated summary is spliced
+        // in at `head_end`. The memory-file snapshot and
+        // AfterCompaction hook need the NEWEST summary body, not the
+        // stale one.
+        let compacted = vec![
+            json!({
+                "role": "user",
+                "content": "[Conversation Summary]\n\nOld summary body from a previous compaction",
+            }),
+            json!({"role": "assistant", "content": "ok got it"}),
+            json!({
+                "role": "user",
+                "content": "[Conversation Summary]\n\nFresh summary body from this compaction",
+            }),
+            json!({"role": "user", "content": "recent user turn"}),
+            json!({"role": "assistant", "content": "recent reply"}),
+        ];
+        assert_eq!(
+            extract_summary_body(&compacted),
+            "Fresh summary body from this compaction"
+        );
     }
 }
