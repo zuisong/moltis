@@ -24,19 +24,22 @@ pub use {
     grep::GrepTool,
     multi_edit::MultiEditTool,
     read::ReadTool,
-    shared::{FsPathPolicy, FsState, new_fs_state},
+    shared::{BinaryPolicy, FsPathPolicy, FsState, new_fs_state},
     write::WriteTool,
 };
 
-use {moltis_agents::tool_registry::ToolRegistry, std::path::PathBuf};
+use {
+    crate::checkpoints::CheckpointManager,
+    moltis_agents::tool_registry::ToolRegistry,
+    std::{path::PathBuf, sync::Arc},
+};
 
 /// Aggregated configuration for fs tool registration.
 ///
 /// Phase 1 shipped with three bare positional parameters; phase 4 keeps
-/// adding knobs (path policy, max-read override, binary policy) so the
-/// registration signature is migrated to a single context struct now,
-/// while call sites are still minimal.
-#[derive(Debug, Clone, Default)]
+/// adding knobs so the registration signature is migrated to a single
+/// context struct.
+#[derive(Clone)]
 pub struct FsToolsContext {
     /// Default search root for `Glob`/`Grep` when the LLM omits `path`.
     /// Must be absolute. When `None`, calls without explicit `path` error.
@@ -45,8 +48,39 @@ pub struct FsToolsContext {
     /// must-read-before-write enforcement. `None` disables all trackers.
     pub fs_state: Option<FsState>,
     /// Allow/deny path policy. Empty policy (`None`) permits everything.
-    /// Phase 4 adds this from `[tools.fs].allow_paths` / `deny_paths`.
     pub path_policy: Option<FsPathPolicy>,
+    /// Binary-file handling strategy for `Read`. Default is `Reject`
+    /// (typed marker without content).
+    pub binary_policy: BinaryPolicy,
+    /// Whether `Glob`/`Grep` honor `.gitignore` while walking. Default
+    /// `true`.
+    pub respect_gitignore: bool,
+    /// When set, `Write`/`Edit`/`MultiEdit` call `checkpoint_path` on
+    /// this manager before mutating so the pre-edit state can be
+    /// restored via `checkpoint_restore`. `None` disables.
+    pub checkpoint_manager: Option<Arc<CheckpointManager>>,
+}
+
+impl Default for FsToolsContext {
+    fn default() -> Self {
+        Self {
+            workspace_root: None,
+            fs_state: None,
+            path_policy: None,
+            binary_policy: BinaryPolicy::default(),
+            // Follow the upstream default: WalkBuilder respects .gitignore
+            // unless explicitly disabled.
+            respect_gitignore: true,
+            checkpoint_manager: None,
+        }
+    }
+}
+
+impl FsToolsContext {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Register every native filesystem tool on a [`ToolRegistry`].
@@ -59,9 +93,12 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
         workspace_root,
         fs_state,
         path_policy,
+        binary_policy,
+        respect_gitignore,
+        checkpoint_manager,
     } = context;
 
-    let mut read = ReadTool::new();
+    let mut read = ReadTool::new().with_binary_policy(binary_policy);
     if let Some(ref s) = fs_state {
         read = read.with_fs_state(s.clone());
     }
@@ -77,6 +114,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     if let Some(ref p) = path_policy {
         write = write.with_path_policy(p.clone());
     }
+    if let Some(ref m) = checkpoint_manager {
+        write = write.with_checkpoint_manager(m.clone());
+    }
     registry.register(Box::new(write));
 
     let mut edit = EditTool::new();
@@ -85,6 +125,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     }
     if let Some(ref p) = path_policy {
         edit = edit.with_path_policy(p.clone());
+    }
+    if let Some(ref m) = checkpoint_manager {
+        edit = edit.with_checkpoint_manager(m.clone());
     }
     registry.register(Box::new(edit));
 
@@ -95,9 +138,12 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     if let Some(ref p) = path_policy {
         multi_edit = multi_edit.with_path_policy(p.clone());
     }
+    if let Some(ref m) = checkpoint_manager {
+        multi_edit = multi_edit.with_checkpoint_manager(m.clone());
+    }
     registry.register(Box::new(multi_edit));
 
-    let mut glob = GlobTool::new();
+    let mut glob = GlobTool::new().with_respect_gitignore(respect_gitignore);
     if let Some(ref root) = workspace_root {
         glob = glob.with_workspace_root(root.clone());
     }
@@ -106,7 +152,7 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     }
     registry.register(Box::new(glob));
 
-    let mut grep = GrepTool::new();
+    let mut grep = GrepTool::new().with_respect_gitignore(respect_gitignore);
     if let Some(root) = workspace_root {
         grep = grep.with_workspace_root(root);
     }
@@ -459,6 +505,81 @@ mod contract_tests {
             .collect();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("allowed.rs"));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_before_mutation_returns_id_and_backs_up_file() {
+        use {crate::checkpoints::CheckpointManager, std::sync::Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let target = real.join("important.txt");
+        tokio::fs::write(&target, "original state").await.unwrap();
+
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(CheckpointManager::new(
+            checkpoint_dir.path().to_path_buf(),
+        ));
+
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            checkpoint_manager: Some(manager.clone()),
+            ..FsToolsContext::default()
+        });
+
+        // Write should checkpoint before overwriting.
+        let write = registry.get("Write").unwrap();
+        let value = write
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "content": "new state",
+            }))
+            .await
+            .unwrap();
+
+        let checkpoint_id = value["checkpoint_id"].as_str().unwrap();
+        assert!(!checkpoint_id.is_empty());
+
+        // The file is now overwritten.
+        let contents = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(contents, "new state");
+
+        // Restore from the checkpoint and verify the original state is back.
+        manager.restore(checkpoint_id).await.unwrap();
+        let restored = tokio::fs::read_to_string(&target).await.unwrap();
+        assert_eq!(restored, "original state");
+    }
+
+    #[tokio::test]
+    async fn write_new_file_skips_checkpoint() {
+        use {crate::checkpoints::CheckpointManager, std::sync::Arc};
+
+        let dir = tempfile::tempdir().unwrap();
+        let real = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let target = real.join("brand-new.txt");
+
+        let checkpoint_dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(CheckpointManager::new(
+            checkpoint_dir.path().to_path_buf(),
+        ));
+
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            checkpoint_manager: Some(manager),
+            ..FsToolsContext::default()
+        });
+
+        let write = registry.get("Write").unwrap();
+        let value = write
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "content": "hello",
+            }))
+            .await
+            .unwrap();
+
+        // No checkpoint for new files — nothing to back up.
+        assert!(value["checkpoint_id"].is_null());
     }
 
     #[tokio::test]

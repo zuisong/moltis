@@ -14,8 +14,11 @@ use {
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, labels, tools as tools_metrics};
 
+use std::sync::Arc;
+
 use crate::{
     Result,
+    checkpoints::CheckpointManager,
     error::Error,
     fs::shared::{
         FsPathPolicy, FsState, canonicalize_for_create, enforce_must_read_before_write,
@@ -28,6 +31,7 @@ use crate::{
 pub struct WriteTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
 }
 
 impl WriteTool {
@@ -50,6 +54,14 @@ impl WriteTool {
         self
     }
 
+    /// Attach a [`CheckpointManager`] so Write backs up the target
+    /// file before overwriting. Does nothing for new files.
+    #[must_use]
+    pub fn with_checkpoint_manager(mut self, manager: Arc<CheckpointManager>) -> Self {
+        self.checkpoint_manager = Some(manager);
+        self
+    }
+
     #[instrument(skip(self, content), fields(file_path = %file_path, bytes = content.len()))]
     async fn write_impl(&self, file_path: &str, content: &str, session_key: &str) -> Result<Value> {
         let canonical = canonicalize_for_create(file_path).await?;
@@ -67,6 +79,7 @@ impl WriteTool {
         }
 
         let target_exists = tokio::fs::try_exists(&canonical).await.unwrap_or(false);
+        let mut checkpoint_id: Option<String> = None;
 
         if target_exists {
             // Reject symlinks so we don't unknowingly write through to
@@ -80,6 +93,12 @@ impl WriteTool {
                 enforce_must_read_before_write(self.fs_state.as_ref(), session_key, &canonical_str)
             {
                 return Ok(payload);
+            }
+
+            // Optional checkpoint backup before the mutation lands.
+            if let Some(ref manager) = self.checkpoint_manager {
+                let record = manager.checkpoint_path(&canonical, "Write").await?;
+                checkpoint_id = Some(record.id);
             }
         }
 
@@ -128,6 +147,7 @@ impl WriteTool {
         Ok(json!({
             "file_path": canonical.to_string_lossy(),
             "bytes_written": content.len(),
+            "checkpoint_id": checkpoint_id,
         }))
     }
 }

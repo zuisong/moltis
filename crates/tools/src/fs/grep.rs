@@ -75,7 +75,6 @@ struct GrepOptions {
 }
 
 /// Native `Grep` tool implementation.
-#[derive(Default)]
 pub struct GrepTool {
     /// Optional default root used when the LLM call omits `path`.
     workspace_root: Option<PathBuf>,
@@ -83,6 +82,18 @@ pub struct GrepTool {
     /// search root is denied; filters individual matching files
     /// otherwise.
     path_policy: Option<FsPathPolicy>,
+    /// Whether to respect `.gitignore` while walking. Default `true`.
+    respect_gitignore: bool,
+}
+
+impl Default for GrepTool {
+    fn default() -> Self {
+        Self {
+            workspace_root: None,
+            path_policy: None,
+            respect_gitignore: true,
+        }
+    }
 }
 
 impl GrepTool {
@@ -102,6 +113,13 @@ impl GrepTool {
     #[must_use]
     pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Override gitignore respect. Default `true`.
+    #[must_use]
+    pub fn with_respect_gitignore(mut self, respect: bool) -> Self {
+        self.respect_gitignore = respect;
         self
     }
 
@@ -140,9 +158,10 @@ impl GrepTool {
         } else {
             let walker = WalkBuilder::new(&root_canonical)
                 .hidden(false)
-                .git_ignore(true)
-                .git_exclude(true)
-                .git_global(true)
+                .git_ignore(self.respect_gitignore)
+                .git_exclude(self.respect_gitignore)
+                .git_global(self.respect_gitignore)
+                .ignore(self.respect_gitignore)
                 .build();
             for entry in walker {
                 let entry = match entry {
@@ -508,10 +527,12 @@ impl AgentTool for GrepTool {
 
         let workspace_root = self.workspace_root.clone();
         let path_policy = self.path_policy.clone();
+        let respect_gitignore = self.respect_gitignore;
         let result = tokio::task::spawn_blocking(move || {
             let tool = Self {
                 workspace_root,
                 path_policy,
+                respect_gitignore,
             };
             tool.grep_impl(opts)
         })

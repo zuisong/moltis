@@ -22,6 +22,22 @@ use crate::{Result, error::Error};
 /// to Read's response payload. Ported from hermes's `_read_tracker`.
 pub const READ_LOOP_THRESHOLD: usize = 3;
 
+/// Strategy for handling binary files encountered by `Read`.
+///
+/// Mirrors `config::schema::FsBinaryPolicy`. The tools crate can't
+/// depend on the config crate directly (that would be a cycle), so this
+/// enum is an internal copy the gateway maps into at registration time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BinaryPolicy {
+    /// Return a typed `{kind: "binary", bytes: N}` marker without
+    /// content. Default.
+    #[default]
+    Reject,
+    /// Return `{kind: "binary", bytes: N, base64: "..."}` so the LLM
+    /// can access the raw bytes. Still gated by `max_read_bytes`.
+    Base64,
+}
+
 /// Typed error kinds that fs tools surface to the LLM as structured `Ok`
 /// payloads rather than plain `Err` strings.
 ///

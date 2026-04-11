@@ -9,7 +9,7 @@ use {
     async_trait::async_trait,
     moltis_agents::tool_registry::AgentTool,
     serde_json::{Value, json},
-    std::{io::Write as _, path::Path},
+    std::{io::Write as _, path::Path, sync::Arc},
     tracing::instrument,
 };
 
@@ -18,6 +18,7 @@ use moltis_metrics::{counter, labels, tools as tools_metrics};
 
 use crate::{
     Result,
+    checkpoints::CheckpointManager,
     error::Error,
     fs::shared::{
         FsPathPolicy, FsState, canonicalize_existing, enforce_must_read_before_write,
@@ -130,6 +131,7 @@ fn finish_edit(
 pub struct EditTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
 }
 
 impl EditTool {
@@ -149,6 +151,14 @@ impl EditTool {
     #[must_use]
     pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Attach a [`CheckpointManager`] so Edit backs up the target file
+    /// before mutating.
+    #[must_use]
+    pub fn with_checkpoint_manager(mut self, manager: Arc<CheckpointManager>) -> Self {
+        self.checkpoint_manager = Some(manager);
         self
     }
 
@@ -188,6 +198,13 @@ impl EditTool {
 
         let outcome = apply_edit(&content, old_string, new_string, replace_all)?;
 
+        // Optional checkpoint before the mutation lands.
+        let checkpoint_id = if let Some(ref manager) = self.checkpoint_manager {
+            Some(manager.checkpoint_path(&canonical, "Edit").await?.id)
+        } else {
+            None
+        };
+
         persist_atomic(&canonical, &outcome.content).await?;
 
         note_fs_mutation(self.fs_state.as_ref(), session_key, &canonical_str);
@@ -205,6 +222,7 @@ impl EditTool {
             "replacements": outcome.replacements,
             "replace_all": replace_all,
             "recovered_via_crlf": outcome.recovered_via_crlf,
+            "checkpoint_id": checkpoint_id,
         }))
     }
 }

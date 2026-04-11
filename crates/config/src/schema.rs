@@ -1642,10 +1642,21 @@ pub struct FsToolsConfig {
     pub max_read_bytes: u64,
 
     /// What to do with binary files encountered by `Read`.
-    /// `"reject"` (default) returns a typed `binary` payload without
-    /// content. Other modes reserved for phase 4 follow-ups.
     #[serde(default)]
     pub binary_policy: FsBinaryPolicy,
+
+    /// Whether `Glob` and `Grep` respect `.gitignore` / `.ignore` files
+    /// and `.git/info/exclude` while walking. Default `true`.
+    #[serde(default = "default_fs_respect_gitignore")]
+    pub respect_gitignore: bool,
+
+    /// When true, Write/Edit/MultiEdit call the existing
+    /// `CheckpointManager` to create a per-file backup before mutating,
+    /// so the LLM can restore the pre-edit state via
+    /// `checkpoint_restore`. Default `false` to avoid unbounded disk
+    /// growth on repos with large files.
+    #[serde(default)]
+    pub checkpoint_before_mutation: bool,
 }
 
 impl Default for FsToolsConfig {
@@ -1658,6 +1669,8 @@ impl Default for FsToolsConfig {
             must_read_before_write: false,
             max_read_bytes: default_fs_max_read_bytes(),
             binary_policy: FsBinaryPolicy::default(),
+            respect_gitignore: default_fs_respect_gitignore(),
+            checkpoint_before_mutation: false,
         }
     }
 }
@@ -1666,13 +1679,21 @@ fn default_fs_max_read_bytes() -> u64 {
     10 * 1024 * 1024
 }
 
+const fn default_fs_respect_gitignore() -> bool {
+    true
+}
+
 /// Strategy for handling binary files when encountered by `Read`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FsBinaryPolicy {
-    /// Return a typed `{kind: "binary", bytes: N}` payload without content.
+    /// Return a typed `{kind: "binary", bytes: N}` marker without content.
     #[default]
     Reject,
+    /// Return `{kind: "binary", bytes: N, base64: "..."}` so the LLM can
+    /// access the raw bytes (useful for small images, hashes, etc.).
+    /// Still capped by `max_read_bytes`.
+    Base64,
 }
 
 fn default_agent_timeout_secs() -> u64 {

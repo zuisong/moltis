@@ -9,6 +9,7 @@ use {
     async_trait::async_trait,
     moltis_agents::tool_registry::AgentTool,
     serde_json::{Value, json},
+    std::sync::Arc,
     tracing::instrument,
 };
 
@@ -17,6 +18,7 @@ use moltis_metrics::{counter, labels, tools as tools_metrics};
 
 use crate::{
     Result,
+    checkpoints::CheckpointManager,
     error::Error,
     fs::{
         edit::{apply_edit, persist_atomic},
@@ -33,6 +35,7 @@ use crate::{
 pub struct MultiEditTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
+    checkpoint_manager: Option<Arc<CheckpointManager>>,
 }
 
 impl MultiEditTool {
@@ -52,6 +55,14 @@ impl MultiEditTool {
     #[must_use]
     pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Attach a [`CheckpointManager`] so MultiEdit backs up the target
+    /// file before the batch lands.
+    #[must_use]
+    pub fn with_checkpoint_manager(mut self, manager: Arc<CheckpointManager>) -> Self {
+        self.checkpoint_manager = Some(manager);
         self
     }
 
@@ -110,6 +121,13 @@ impl MultiEditTool {
             buffer = outcome.content;
         }
 
+        // Optional checkpoint before the whole batch lands.
+        let checkpoint_id = if let Some(ref manager) = self.checkpoint_manager {
+            Some(manager.checkpoint_path(&canonical, "MultiEdit").await?.id)
+        } else {
+            None
+        };
+
         persist_atomic(&canonical, &buffer).await?;
 
         note_fs_mutation(self.fs_state.as_ref(), session_key, &canonical_str);
@@ -127,6 +145,7 @@ impl MultiEditTool {
             "edits_applied": edits.len(),
             "replacements_per_edit": per_edit_replacements,
             "recovered_via_crlf": any_crlf_recovery,
+            "checkpoint_id": checkpoint_id,
         }))
     }
 }

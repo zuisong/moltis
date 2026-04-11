@@ -281,6 +281,8 @@ fn build_schema_map() -> KnownKeys {
                     ("must_read_before_write", Leaf),
                     ("max_read_bytes", Leaf),
                     ("binary_policy", Leaf),
+                    ("respect_gitignore", Leaf),
+                    ("checkpoint_before_mutation", Leaf),
                 ])),
             ),
             ("agent_timeout_secs", Leaf),

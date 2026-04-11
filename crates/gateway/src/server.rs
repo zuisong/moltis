@@ -3576,6 +3576,7 @@ pub async fn prepare_gateway_core(
         // detection (gated by track_reads).
         #[cfg(feature = "fs-tools")]
         {
+            use moltis_config::schema::FsBinaryPolicy;
             let fs_cfg = &config.tools.fs;
             let path_policy =
                 match moltis_tools::fs::FsPathPolicy::new(&fs_cfg.allow_paths, &fs_cfg.deny_paths) {
@@ -3597,10 +3598,24 @@ pub async fn prepare_gateway_core(
                 None
             };
             let workspace_root = fs_cfg.workspace_root.as_ref().map(PathBuf::from);
+            let binary_policy = match fs_cfg.binary_policy {
+                FsBinaryPolicy::Reject => moltis_tools::fs::BinaryPolicy::Reject,
+                FsBinaryPolicy::Base64 => moltis_tools::fs::BinaryPolicy::Base64,
+            };
+            let checkpoint_manager = if fs_cfg.checkpoint_before_mutation {
+                Some(Arc::new(moltis_tools::checkpoints::CheckpointManager::new(
+                    moltis_config::data_dir(),
+                )))
+            } else {
+                None
+            };
             let ctx = moltis_tools::fs::FsToolsContext {
                 workspace_root,
                 fs_state,
                 path_policy,
+                binary_policy,
+                respect_gitignore: fs_cfg.respect_gitignore,
+                checkpoint_manager,
             };
             moltis_tools::fs::register_fs_tools(&mut tool_registry, ctx);
         }

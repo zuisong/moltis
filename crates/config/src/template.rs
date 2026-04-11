@@ -273,6 +273,17 @@ max_read_bytes = 10485760         # Maximum bytes a single Read can return befor
                                   # payload (10 MB).
 binary_policy = "reject"          # How to handle binary files in Read:
                                   #   "reject" — return typed binary marker (default)
+                                  #   "base64" — return base64-encoded bytes in the
+                                  #              payload (still capped by max_read_bytes)
+respect_gitignore = true          # When true (default), Glob and Grep skip files
+                                  # ignored by .gitignore / .ignore / .git/info/exclude
+                                  # while walking. Set false to include ignored files.
+checkpoint_before_mutation = false  # When true, Write/Edit/MultiEdit call the
+                                  # existing CheckpointManager to snapshot the target
+                                  # file before mutating, so the LLM (or operator) can
+                                  # restore it later via `checkpoint_restore`. Default
+                                  # off because checkpoints grow with activity and
+                                  # size scales with file size.
 
 # ── Command Execution ─────────────────────────────────────────────────────────
 

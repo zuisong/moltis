@@ -32,7 +32,6 @@ use crate::{
 const DEFAULT_GLOB_LIMIT: usize = 1000;
 
 /// Native `Glob` tool implementation.
-#[derive(Default)]
 pub struct GlobTool {
     /// Optional default root used when the LLM call omits `path`.
     workspace_root: Option<PathBuf>,
@@ -40,6 +39,19 @@ pub struct GlobTool {
     /// is rejected entirely if the root is denied) and to each matching
     /// file (denied files are filtered out of results).
     path_policy: Option<FsPathPolicy>,
+    /// Whether to respect `.gitignore` / `.ignore` / `.git/info/exclude`
+    /// while walking. Default `true`.
+    respect_gitignore: bool,
+}
+
+impl Default for GlobTool {
+    fn default() -> Self {
+        Self {
+            workspace_root: None,
+            path_policy: None,
+            respect_gitignore: true,
+        }
+    }
 }
 
 impl GlobTool {
@@ -62,6 +74,13 @@ impl GlobTool {
     #[must_use]
     pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Override gitignore respect. Default `true`.
+    #[must_use]
+    pub fn with_respect_gitignore(mut self, respect: bool) -> Self {
+        self.respect_gitignore = respect;
         self
     }
 
@@ -108,9 +127,10 @@ impl GlobTool {
 
         let walker = WalkBuilder::new(&root_canonical)
             .hidden(false) // allow dotfiles; gitignore still filters .git/
-            .git_ignore(true)
-            .git_exclude(true)
-            .git_global(true)
+            .git_ignore(self.respect_gitignore)
+            .git_exclude(self.respect_gitignore)
+            .git_global(self.respect_gitignore)
+            .ignore(self.respect_gitignore)
             .build();
 
         for entry in walker {
@@ -217,10 +237,12 @@ impl AgentTool for GlobTool {
 
         let workspace_root = self.workspace_root.clone();
         let path_policy = self.path_policy.clone();
+        let respect_gitignore = self.respect_gitignore;
         let result = tokio::task::spawn_blocking(move || {
             let tool = Self {
                 workspace_root,
                 path_policy,
+                respect_gitignore,
             };
             tool.glob_impl(&pattern, path.as_deref())
         })
@@ -365,6 +387,42 @@ mod tests {
             .collect();
         assert_eq!(paths.len(), 1);
         assert!(paths[0].ends_with("kept.rs"));
+    }
+
+    #[tokio::test]
+    async fn glob_respect_gitignore_false_includes_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(dir.path().join(".git"))
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join(".gitignore"), "ignored.rs\n")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("kept.rs"), "x")
+            .await
+            .unwrap();
+        tokio::fs::write(dir.path().join("ignored.rs"), "x")
+            .await
+            .unwrap();
+
+        let tool = GlobTool::new().with_respect_gitignore(false);
+        let value = tool
+            .execute(json!({
+                "pattern": "*.rs",
+                "path": dir.path().to_str().unwrap(),
+            }))
+            .await
+            .unwrap();
+
+        let paths: Vec<String> = value["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|p| p.ends_with("kept.rs")));
+        assert!(paths.iter().any(|p| p.ends_with("ignored.rs")));
     }
 
     #[tokio::test]

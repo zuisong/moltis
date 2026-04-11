@@ -20,8 +20,8 @@ use crate::{
     Result,
     error::Error,
     fs::shared::{
-        DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, FsPathPolicy, FsState,
-        READ_LOOP_THRESHOLD, enforce_path_policy, format_numbered_lines, fs_error_payload,
+        BinaryPolicy, DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, FsPathPolicy,
+        FsState, READ_LOOP_THRESHOLD, enforce_path_policy, format_numbered_lines, fs_error_payload,
         io_error_to_typed_payload, looks_binary, require_absolute, session_key_from,
     },
 };
@@ -31,6 +31,7 @@ use crate::{
 pub struct ReadTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
+    binary_policy: BinaryPolicy,
 }
 
 impl ReadTool {
@@ -40,21 +41,26 @@ impl ReadTool {
     }
 
     /// Attach a shared [`FsState`] for per-session read tracking and
-    /// re-read loop detection. When set, each successful Read records the
-    /// file and, if the same `(path, offset, limit)` repeats beyond
-    /// [`READ_LOOP_THRESHOLD`] times without an intervening mutation, the
-    /// response payload gains a `loop_warning` field.
+    /// re-read loop detection.
     #[must_use]
     pub fn with_fs_state(mut self, state: FsState) -> Self {
         self.fs_state = Some(state);
         self
     }
 
-    /// Attach an allow/deny path policy. Paths that fail the policy
-    /// check return a typed `path_denied` payload.
+    /// Attach an allow/deny path policy.
     #[must_use]
     pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
         self.path_policy = Some(policy);
+        self
+    }
+
+    /// Override the binary-file handling policy. Default is
+    /// [`BinaryPolicy::Reject`] which returns a typed marker without
+    /// content.
+    #[must_use]
+    pub fn with_binary_policy(mut self, policy: BinaryPolicy) -> Self {
+        self.binary_policy = policy;
         self
     }
 
@@ -134,12 +140,23 @@ impl ReadTool {
                 labels::SUCCESS => "binary".to_string()
             )
             .increment(1);
-            return Ok(json!({
-                "kind": "binary",
-                "file_path": file_path,
-                "bytes": bytes.len(),
-                "message": "file appears to be binary; content not returned",
-            }));
+            return Ok(match self.binary_policy {
+                BinaryPolicy::Reject => json!({
+                    "kind": "binary",
+                    "file_path": file_path,
+                    "bytes": bytes.len(),
+                    "message": "file appears to be binary; content not returned (binary_policy = reject)",
+                }),
+                BinaryPolicy::Base64 => {
+                    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+                    json!({
+                        "kind": "binary",
+                        "file_path": file_path,
+                        "bytes": bytes.len(),
+                        "base64": BASE64.encode(&bytes),
+                    })
+                },
+            });
         }
 
         // Lossy decode so we never fail on invalid UTF-8 — we surface the
@@ -323,6 +340,25 @@ mod tests {
         assert!(content.contains("line 3"));
         assert!(content.contains("line 4"));
         assert!(!content.contains("line 5"));
+    }
+
+    #[tokio::test]
+    async fn read_binary_base64_policy_returns_encoded_bytes() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8, 1, 2, 3, 0, 4, 5]).unwrap();
+
+        let tool = ReadTool::new().with_binary_policy(BinaryPolicy::Base64);
+        let value = tool
+            .execute(json!({ "file_path": tmp.path().to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["kind"], "binary");
+        assert_eq!(value["bytes"], 7);
+        let encoded = value["base64"].as_str().unwrap();
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+        let decoded = BASE64.decode(encoded).unwrap();
+        assert_eq!(decoded, [0u8, 1, 2, 3, 0, 4, 5]);
     }
 
     #[tokio::test]
