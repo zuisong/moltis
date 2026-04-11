@@ -20,11 +20,15 @@ use crate::{
     Result,
     checkpoints::CheckpointManager,
     error::Error,
-    fs::shared::{
-        FsPathPolicy, FsState, canonicalize_existing, enforce_must_read_before_write,
-        enforce_path_policy, ensure_regular_file, note_fs_mutation, reject_if_symlink,
-        session_key_from,
+    fs::{
+        sandbox_bridge::{SandboxReadResult, ensure_sandbox, sandbox_read, sandbox_write},
+        shared::{
+            DEFAULT_MAX_READ_BYTES, FsPathPolicy, FsState, canonicalize_existing,
+            enforce_must_read_before_write, enforce_path_policy, ensure_regular_file,
+            note_fs_mutation, reject_if_symlink, session_key_from,
+        },
     },
+    sandbox::SandboxRouter,
 };
 
 /// Outcome of a successful [`apply_edit`] call.
@@ -132,6 +136,7 @@ pub struct EditTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl EditTool {
@@ -162,6 +167,14 @@ impl EditTool {
         self
     }
 
+    /// Attach a shared [`SandboxRouter`]. Sandboxed sessions round-trip
+    /// through Read+apply+Write via the bridge.
+    #[must_use]
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
+        self
+    }
+
     #[instrument(skip(self, old_string, new_string), fields(file_path = %file_path, replace_all))]
     async fn edit_impl(
         &self,
@@ -171,6 +184,44 @@ impl EditTool {
         replace_all: bool,
         session_key: &str,
     ) -> Result<Value> {
+        // Sandbox dispatch: read through the bridge, apply in host
+        // memory, write through the bridge. Skips host canonicalization
+        // and symlink check because the sandbox path is what the LLM
+        // sees and operates on.
+        if let Some(ref router) = self.sandbox_router
+            && router.is_sandboxed(session_key).await
+        {
+            let (backend, id) = ensure_sandbox(router, session_key).await?;
+            let read_result =
+                sandbox_read(&backend, &id, file_path, DEFAULT_MAX_READ_BYTES).await?;
+            let bytes = match read_result {
+                SandboxReadResult::Ok(bytes) => bytes,
+                other => {
+                    return Ok(other
+                        .into_typed_payload(file_path, DEFAULT_MAX_READ_BYTES)
+                        .unwrap_or(json!({})));
+                },
+            };
+            let content = String::from_utf8(bytes).map_err(|e| {
+                Error::message(format!(
+                    "sandbox file '{file_path}' is not valid UTF-8: {e}"
+                ))
+            })?;
+            let outcome = apply_edit(&content, old_string, new_string, replace_all)?;
+            if let Some(payload) =
+                sandbox_write(&backend, &id, file_path, outcome.content.as_bytes()).await?
+            {
+                return Ok(payload);
+            }
+            return Ok(json!({
+                "file_path": file_path,
+                "replacements": outcome.replacements,
+                "replace_all": replace_all,
+                "recovered_via_crlf": outcome.recovered_via_crlf,
+                "checkpoint_id": Value::Null,
+            }));
+        }
+
         reject_if_symlink(file_path).await?;
         let canonical = canonicalize_existing(file_path).await?;
         ensure_regular_file(&canonical).await?;

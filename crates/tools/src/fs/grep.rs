@@ -19,7 +19,10 @@ use {
     moltis_agents::tool_registry::AgentTool,
     regex::RegexBuilder,
     serde_json::{Value, json},
-    std::path::{Path, PathBuf},
+    std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    },
     tracing::instrument,
 };
 
@@ -30,6 +33,7 @@ use crate::{
     Result,
     error::Error,
     fs::shared::{FsPathPolicy, enforce_path_policy_deny_only, require_absolute},
+    sandbox::SandboxRouter,
 };
 
 /// Maximum bytes of a single file we will load for content searching.
@@ -84,6 +88,11 @@ pub struct GrepTool {
     path_policy: Option<FsPathPolicy>,
     /// Whether to respect `.gitignore` while walking. Default `true`.
     respect_gitignore: bool,
+    /// Sandbox routing for future phase 2b. Currently unused — Grep
+    /// sandbox routing requires parsing the container's `grep` output
+    /// across three different modes and is tracked in a follow-up bead.
+    #[allow(dead_code)]
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl Default for GrepTool {
@@ -92,6 +101,7 @@ impl Default for GrepTool {
             workspace_root: None,
             path_policy: None,
             respect_gitignore: true,
+            sandbox_router: None,
         }
     }
 }
@@ -120,6 +130,14 @@ impl GrepTool {
     #[must_use]
     pub fn with_respect_gitignore(mut self, respect: bool) -> Self {
         self.respect_gitignore = respect;
+        self
+    }
+
+    /// Attach a shared [`SandboxRouter`]. Currently a no-op — Grep
+    /// sandbox routing is tracked as a phase 2b follow-up bead.
+    #[must_use]
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
         self
     }
 
@@ -528,11 +546,13 @@ impl AgentTool for GrepTool {
         let workspace_root = self.workspace_root.clone();
         let path_policy = self.path_policy.clone();
         let respect_gitignore = self.respect_gitignore;
+        let sandbox_router = self.sandbox_router.clone();
         let result = tokio::task::spawn_blocking(move || {
             let tool = Self {
                 workspace_root,
                 path_policy,
                 respect_gitignore,
+                sandbox_router,
             };
             tool.grep_impl(opts)
         })

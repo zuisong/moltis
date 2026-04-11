@@ -22,12 +22,14 @@ use crate::{
     error::Error,
     fs::{
         edit::{apply_edit, persist_atomic},
+        sandbox_bridge::{SandboxReadResult, ensure_sandbox, sandbox_read, sandbox_write},
         shared::{
-            FsPathPolicy, FsState, canonicalize_existing, enforce_must_read_before_write,
-            enforce_path_policy, ensure_regular_file, note_fs_mutation, reject_if_symlink,
-            session_key_from,
+            DEFAULT_MAX_READ_BYTES, FsPathPolicy, FsState, canonicalize_existing,
+            enforce_must_read_before_write, enforce_path_policy, ensure_regular_file,
+            note_fs_mutation, reject_if_symlink, session_key_from,
         },
     },
+    sandbox::SandboxRouter,
 };
 
 /// Native `MultiEdit` tool implementation.
@@ -36,6 +38,7 @@ pub struct MultiEditTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl MultiEditTool {
@@ -66,6 +69,14 @@ impl MultiEditTool {
         self
     }
 
+    /// Attach a shared [`SandboxRouter`]. Sandboxed sessions round-trip
+    /// through Read+apply(*)+Write via the bridge.
+    #[must_use]
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
+        self
+    }
+
     #[instrument(skip(self, edits), fields(file_path = %file_path, edit_count = edits.len()))]
     async fn multi_edit_impl(
         &self,
@@ -75,6 +86,60 @@ impl MultiEditTool {
     ) -> Result<Value> {
         if edits.is_empty() {
             return Err(Error::message("'edits' must contain at least one edit"));
+        }
+
+        // Sandbox dispatch: read once, apply all edits in host memory,
+        // write the final buffer back through the bridge atomically.
+        if let Some(ref router) = self.sandbox_router
+            && router.is_sandboxed(session_key).await
+        {
+            let (backend, id) = ensure_sandbox(router, session_key).await?;
+            let read_result =
+                sandbox_read(&backend, &id, file_path, DEFAULT_MAX_READ_BYTES).await?;
+            let bytes = match read_result {
+                SandboxReadResult::Ok(bytes) => bytes,
+                other => {
+                    return Ok(other
+                        .into_typed_payload(file_path, DEFAULT_MAX_READ_BYTES)
+                        .unwrap_or(json!({})));
+                },
+            };
+            let original = String::from_utf8(bytes).map_err(|e| {
+                Error::message(format!(
+                    "sandbox file '{file_path}' is not valid UTF-8: {e}"
+                ))
+            })?;
+
+            let mut buffer = original;
+            let mut per_edit_replacements: Vec<usize> = Vec::with_capacity(edits.len());
+            let mut any_crlf_recovery = false;
+            for (idx, edit) in edits.iter().enumerate() {
+                let outcome = apply_edit(
+                    &buffer,
+                    &edit.old_string,
+                    &edit.new_string,
+                    edit.replace_all,
+                )
+                .map_err(|e| Error::message(format!("edit #{}: {e}", idx + 1)))?;
+                per_edit_replacements.push(outcome.replacements);
+                if outcome.recovered_via_crlf {
+                    any_crlf_recovery = true;
+                }
+                buffer = outcome.content;
+            }
+
+            if let Some(payload) =
+                sandbox_write(&backend, &id, file_path, buffer.as_bytes()).await?
+            {
+                return Ok(payload);
+            }
+            return Ok(json!({
+                "file_path": file_path,
+                "edits_applied": edits.len(),
+                "replacements_per_edit": per_edit_replacements,
+                "recovered_via_crlf": any_crlf_recovery,
+                "checkpoint_id": Value::Null,
+            }));
         }
 
         reject_if_symlink(file_path).await?;

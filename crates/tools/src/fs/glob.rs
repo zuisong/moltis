@@ -8,12 +8,13 @@
 
 use {
     async_trait::async_trait,
-    globset::Glob as GlobPattern,
+    globset::{Glob as GlobPattern, GlobMatcher},
     ignore::WalkBuilder,
     moltis_agents::tool_registry::AgentTool,
     serde_json::{Value, json},
     std::{
         path::{Path, PathBuf},
+        sync::Arc,
         time::SystemTime,
     },
     tracing::instrument,
@@ -25,7 +26,11 @@ use moltis_metrics::{counter, labels, tools as tools_metrics};
 use crate::{
     Result,
     error::Error,
-    fs::shared::{FsPathPolicy, enforce_path_policy_deny_only, require_absolute},
+    fs::{
+        sandbox_bridge::{ensure_sandbox, sandbox_list_files},
+        shared::{FsPathPolicy, enforce_path_policy_deny_only, require_absolute, session_key_from},
+    },
+    sandbox::SandboxRouter,
 };
 
 /// Maximum number of entries returned by a single `Glob` call.
@@ -42,6 +47,9 @@ pub struct GlobTool {
     /// Whether to respect `.gitignore` / `.ignore` / `.git/info/exclude`
     /// while walking. Default `true`.
     respect_gitignore: bool,
+    /// When set and the session is sandboxed, `find` the sandbox's
+    /// filesystem instead of the host.
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl Default for GlobTool {
@@ -50,6 +58,7 @@ impl Default for GlobTool {
             workspace_root: None,
             path_policy: None,
             respect_gitignore: true,
+            sandbox_router: None,
         }
     }
 }
@@ -81,6 +90,16 @@ impl GlobTool {
     #[must_use]
     pub fn with_respect_gitignore(mut self, respect: bool) -> Self {
         self.respect_gitignore = respect;
+        self
+    }
+
+    /// Attach a shared [`SandboxRouter`]. When the session is sandboxed
+    /// Glob lists files via the bridge's `find` helper and applies the
+    /// glob matcher on the host side; `.gitignore` semantics are lost
+    /// in the sandbox walk (the container `find` doesn't parse them).
+    #[must_use]
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
         self
     }
 
@@ -234,15 +253,77 @@ impl AgentTool for GlobTool {
             .get("path")
             .and_then(Value::as_str)
             .map(PathBuf::from);
+        let session_key = session_key_from(&params).to_string();
+
+        // Sandbox dispatch: shell `find ROOT -type f` into the container
+        // and apply the glob matcher + path policy on the host side.
+        // Gitignore semantics are not honored in the sandbox walk; that
+        // can be a follow-up.
+        if let Some(ref router) = self.sandbox_router
+            && router.is_sandboxed(&session_key).await
+        {
+            let (backend, id) = ensure_sandbox(router, &session_key).await?;
+            let root = match path.as_ref() {
+                Some(p) => p.clone(),
+                None => self.workspace_root.clone().ok_or_else(|| {
+                    Error::message(
+                        "Glob requires an absolute 'path' argument (no workspace root is configured)",
+                    )
+                })?,
+            };
+            let root_str = root
+                .to_str()
+                .ok_or_else(|| Error::message("Glob 'path' contains invalid UTF-8"))?;
+            let files = sandbox_list_files(&backend, &id, root_str).await?;
+            let matcher: GlobMatcher = GlobPattern::new(&pattern)
+                .map_err(|e| Error::message(format!("invalid glob pattern '{pattern}': {e}")))?
+                .compile_matcher();
+            let mut matched: Vec<String> = files
+                .into_iter()
+                .filter(|f| {
+                    let relative = PathBuf::from(f)
+                        .strip_prefix(&root)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|_| PathBuf::from(f));
+                    if !matcher.is_match(&relative) {
+                        return false;
+                    }
+                    if let Some(ref policy) = self.path_policy
+                        && policy.check(&PathBuf::from(f)).is_some()
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .collect();
+            let truncated = matched.len() > DEFAULT_GLOB_LIMIT;
+            if truncated {
+                matched.truncate(DEFAULT_GLOB_LIMIT);
+            }
+            #[cfg(feature = "metrics")]
+            counter!(
+                tools_metrics::EXECUTIONS_TOTAL,
+                labels::TOOL => "Glob".to_string(),
+                labels::SUCCESS => "true".to_string()
+            )
+            .increment(1);
+            return Ok(json!({
+                "paths": matched,
+                "truncated": truncated,
+                "root": root.to_string_lossy(),
+            }));
+        }
 
         let workspace_root = self.workspace_root.clone();
         let path_policy = self.path_policy.clone();
         let respect_gitignore = self.respect_gitignore;
+        let sandbox_router = self.sandbox_router.clone();
         let result = tokio::task::spawn_blocking(move || {
             let tool = Self {
                 workspace_root,
                 path_policy,
                 respect_gitignore,
+                sandbox_router,
             };
             tool.glob_impl(&pattern, path.as_deref())
         })

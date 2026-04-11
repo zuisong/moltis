@@ -15,6 +15,7 @@ pub mod glob;
 pub mod grep;
 pub mod multi_edit;
 pub mod read;
+pub mod sandbox_bridge;
 pub mod shared;
 pub mod write;
 
@@ -29,7 +30,7 @@ pub use {
 };
 
 use {
-    crate::checkpoints::CheckpointManager,
+    crate::{checkpoints::CheckpointManager, sandbox::SandboxRouter},
     moltis_agents::tool_registry::ToolRegistry,
     std::{path::PathBuf, sync::Arc},
 };
@@ -49,16 +50,18 @@ pub struct FsToolsContext {
     pub fs_state: Option<FsState>,
     /// Allow/deny path policy. Empty policy (`None`) permits everything.
     pub path_policy: Option<FsPathPolicy>,
-    /// Binary-file handling strategy for `Read`. Default is `Reject`
-    /// (typed marker without content).
+    /// Binary-file handling strategy for `Read`. Default is `Reject`.
     pub binary_policy: BinaryPolicy,
     /// Whether `Glob`/`Grep` honor `.gitignore` while walking. Default
     /// `true`.
     pub respect_gitignore: bool,
     /// When set, `Write`/`Edit`/`MultiEdit` call `checkpoint_path` on
-    /// this manager before mutating so the pre-edit state can be
-    /// restored via `checkpoint_restore`. `None` disables.
+    /// this manager before mutating. `None` disables checkpoints.
     pub checkpoint_manager: Option<Arc<CheckpointManager>>,
+    /// Shared [`SandboxRouter`]. When set, fs tools dispatch through
+    /// the [`sandbox_bridge`] for sessions the router marks as
+    /// sandboxed; unsandboxed sessions still run on the host.
+    pub sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl Default for FsToolsContext {
@@ -72,6 +75,7 @@ impl Default for FsToolsContext {
             // unless explicitly disabled.
             respect_gitignore: true,
             checkpoint_manager: None,
+            sandbox_router: None,
         }
     }
 }
@@ -96,6 +100,7 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
         binary_policy,
         respect_gitignore,
         checkpoint_manager,
+        sandbox_router,
     } = context;
 
     let mut read = ReadTool::new().with_binary_policy(binary_policy);
@@ -104,6 +109,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     }
     if let Some(ref p) = path_policy {
         read = read.with_path_policy(p.clone());
+    }
+    if let Some(ref r) = sandbox_router {
+        read = read.with_sandbox_router(r.clone());
     }
     registry.register(Box::new(read));
 
@@ -117,6 +125,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     if let Some(ref m) = checkpoint_manager {
         write = write.with_checkpoint_manager(m.clone());
     }
+    if let Some(ref r) = sandbox_router {
+        write = write.with_sandbox_router(r.clone());
+    }
     registry.register(Box::new(write));
 
     let mut edit = EditTool::new();
@@ -128,6 +139,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     }
     if let Some(ref m) = checkpoint_manager {
         edit = edit.with_checkpoint_manager(m.clone());
+    }
+    if let Some(ref r) = sandbox_router {
+        edit = edit.with_sandbox_router(r.clone());
     }
     registry.register(Box::new(edit));
 
@@ -141,6 +155,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     if let Some(ref m) = checkpoint_manager {
         multi_edit = multi_edit.with_checkpoint_manager(m.clone());
     }
+    if let Some(ref r) = sandbox_router {
+        multi_edit = multi_edit.with_sandbox_router(r.clone());
+    }
     registry.register(Box::new(multi_edit));
 
     let mut glob = GlobTool::new().with_respect_gitignore(respect_gitignore);
@@ -150,6 +167,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     if let Some(ref p) = path_policy {
         glob = glob.with_path_policy(p.clone());
     }
+    if let Some(ref r) = sandbox_router {
+        glob = glob.with_sandbox_router(r.clone());
+    }
     registry.register(Box::new(glob));
 
     let mut grep = GrepTool::new().with_respect_gitignore(respect_gitignore);
@@ -158,6 +178,9 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
     }
     if let Some(p) = path_policy {
         grep = grep.with_path_policy(p);
+    }
+    if let Some(r) = sandbox_router {
+        grep = grep.with_sandbox_router(r);
     }
     registry.register(Box::new(grep));
 }
@@ -517,9 +540,7 @@ mod contract_tests {
         tokio::fs::write(&target, "original state").await.unwrap();
 
         let checkpoint_dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(CheckpointManager::new(
-            checkpoint_dir.path().to_path_buf(),
-        ));
+        let manager = Arc::new(CheckpointManager::new(checkpoint_dir.path().to_path_buf()));
 
         let mut registry = ToolRegistry::new();
         register_fs_tools(&mut registry, FsToolsContext {
@@ -559,9 +580,7 @@ mod contract_tests {
         let target = real.join("brand-new.txt");
 
         let checkpoint_dir = tempfile::tempdir().unwrap();
-        let manager = Arc::new(CheckpointManager::new(
-            checkpoint_dir.path().to_path_buf(),
-        ));
+        let manager = Arc::new(CheckpointManager::new(checkpoint_dir.path().to_path_buf()));
 
         let mut registry = ToolRegistry::new();
         register_fs_tools(&mut registry, FsToolsContext {
@@ -580,6 +599,153 @@ mod contract_tests {
 
         // No checkpoint for new files — nothing to back up.
         assert!(value["checkpoint_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn sandbox_read_via_registry_round_trips_through_bridge() {
+        use {
+            crate::{
+                exec::ExecResult,
+                fs::sandbox_bridge::test_helpers::MockSandbox,
+                sandbox::{Sandbox, SandboxConfig, SandboxRouter},
+            },
+            base64::{Engine as _, engine::general_purpose::STANDARD as BASE64},
+            std::sync::Arc,
+        };
+
+        // Pre-program a successful base64 response for the sandbox read.
+        let content = b"hello from inside the sandbox";
+        let mock = MockSandbox::new(vec![ExecResult {
+            stdout: BASE64.encode(content),
+            stderr: String::new(),
+            exit_code: 0,
+        }]);
+        let backend: Arc<dyn Sandbox> = mock;
+        let router = Arc::new(SandboxRouter::with_backend(
+            SandboxConfig::default(),
+            backend,
+        ));
+        router.set_override("sandboxed", true).await;
+
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            sandbox_router: Some(router),
+            ..FsToolsContext::default()
+        });
+
+        let read = registry.get("Read").unwrap();
+        let value = read
+            .execute(json!({
+                "file_path": "/data/hello.txt",
+                "_session_key": "sandboxed",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["kind"], "text");
+        assert!(
+            value["content"]
+                .as_str()
+                .unwrap()
+                .contains("hello from inside the sandbox")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_read_routes_to_host_when_session_not_sandboxed() {
+        use {
+            crate::{
+                fs::sandbox_bridge::test_helpers::MockSandbox,
+                sandbox::{Sandbox, SandboxConfig, SandboxMode, SandboxRouter},
+            },
+            std::sync::Arc,
+        };
+
+        // Mode = Off and no override → not sandboxed; mock never called.
+        let mock = MockSandbox::new(vec![]);
+        let backend: Arc<dyn Sandbox> = mock.clone();
+        let cfg = SandboxConfig {
+            mode: SandboxMode::Off,
+            ..SandboxConfig::default()
+        };
+        let router = Arc::new(SandboxRouter::with_backend(cfg, backend));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("on_host.txt");
+        tokio::fs::write(&target, "hosted content").await.unwrap();
+
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            sandbox_router: Some(router),
+            ..FsToolsContext::default()
+        });
+
+        let read = registry.get("Read").unwrap();
+        let value = read
+            .execute(json!({
+                "file_path": target.to_str().unwrap(),
+                "_session_key": "not-sandboxed",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["kind"], "text");
+        assert!(
+            value["content"]
+                .as_str()
+                .unwrap()
+                .contains("hosted content")
+        );
+        assert!(
+            mock.last_command().is_none(),
+            "mock sandbox should not be called for non-sandboxed sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_write_via_registry_sends_base64_to_bridge() {
+        use {
+            crate::{
+                exec::ExecResult,
+                fs::sandbox_bridge::test_helpers::MockSandbox,
+                sandbox::{Sandbox, SandboxConfig, SandboxRouter},
+            },
+            base64::{Engine as _, engine::general_purpose::STANDARD as BASE64},
+            std::sync::Arc,
+        };
+
+        let mock = MockSandbox::new(vec![ExecResult {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+        }]);
+        let backend: Arc<dyn Sandbox> = mock.clone();
+        let router = Arc::new(SandboxRouter::with_backend(
+            SandboxConfig::default(),
+            backend,
+        ));
+        router.set_override("sandboxed", true).await;
+
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            sandbox_router: Some(router),
+            ..FsToolsContext::default()
+        });
+
+        let write = registry.get("Write").unwrap();
+        let value = write
+            .execute(json!({
+                "file_path": "/data/out.txt",
+                "content": "sandboxed write",
+                "_session_key": "sandboxed",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["bytes_written"], 15);
+        let cmd = mock.last_command().unwrap();
+        assert!(cmd.contains("/data/out.txt"));
+        assert!(cmd.contains(&BASE64.encode(b"sandboxed write")));
     }
 
     #[tokio::test]

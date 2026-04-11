@@ -9,6 +9,7 @@ use {
     async_trait::async_trait,
     moltis_agents::tool_registry::AgentTool,
     serde_json::{Value, json},
+    std::sync::Arc,
     tokio::fs,
     tracing::instrument,
 };
@@ -19,11 +20,16 @@ use moltis_metrics::{counter, labels, tools as tools_metrics};
 use crate::{
     Result,
     error::Error,
-    fs::shared::{
-        BinaryPolicy, DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, FsPathPolicy,
-        FsState, READ_LOOP_THRESHOLD, enforce_path_policy, format_numbered_lines, fs_error_payload,
-        io_error_to_typed_payload, looks_binary, require_absolute, session_key_from,
+    fs::{
+        sandbox_bridge::{SandboxReadResult, ensure_sandbox, sandbox_read},
+        shared::{
+            BinaryPolicy, DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind,
+            FsPathPolicy, FsState, READ_LOOP_THRESHOLD, enforce_path_policy, format_numbered_lines,
+            fs_error_payload, io_error_to_typed_payload, looks_binary, require_absolute,
+            session_key_from,
+        },
     },
+    sandbox::SandboxRouter,
 };
 
 /// Native `Read` tool implementation.
@@ -32,6 +38,7 @@ pub struct ReadTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
     binary_policy: BinaryPolicy,
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl ReadTool {
@@ -64,6 +71,15 @@ impl ReadTool {
         self
     }
 
+    /// Attach a shared [`SandboxRouter`]. When the router marks a
+    /// session as sandboxed, Read dispatches through the bridge
+    /// instead of touching the host filesystem.
+    #[must_use]
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
+        self
+    }
+
     #[instrument(skip(self), fields(file_path = %file_path))]
     async fn read_impl(
         &self,
@@ -73,6 +89,34 @@ impl ReadTool {
         session_key: &str,
     ) -> Result<Value> {
         require_absolute(file_path, "file_path")?;
+
+        // Sandbox dispatch: if the session is sandboxed, round-trip through
+        // the bridge and render the resulting bytes with the same logic as
+        // the host path. Path-policy and binary detection still run on
+        // host-side types, so both paths look identical to the LLM.
+        if let Some(ref router) = self.sandbox_router
+            && router.is_sandboxed(session_key).await
+        {
+            let (backend, id) = ensure_sandbox(router, session_key).await?;
+            let result = sandbox_read(&backend, &id, file_path, DEFAULT_MAX_READ_BYTES).await?;
+            match result {
+                SandboxReadResult::Ok(bytes) => {
+                    return Ok(self.render_bytes_to_payload(
+                        file_path,
+                        offset,
+                        limit,
+                        &bytes,
+                        session_key,
+                        true,
+                    ));
+                },
+                other => {
+                    return Ok(other
+                        .into_typed_payload(file_path, DEFAULT_MAX_READ_BYTES)
+                        .unwrap_or(json!({})));
+                },
+            }
+        }
 
         // Stat first so we can surface not_found / permission_denied as
         // typed Ok payloads rather than Err strings. The chat loop strips
@@ -132,7 +176,25 @@ impl ReadTool {
             },
         };
 
-        if looks_binary(&bytes) {
+        Ok(self.render_bytes_to_payload(file_path, offset, limit, &bytes, session_key, false))
+    }
+
+    /// Render raw file bytes into the typed Read payload.
+    ///
+    /// Shared by the host and sandbox branches so the LLM-facing shape
+    /// is identical across routing modes. `from_sandbox` controls the
+    /// loop-tracker key (canonicalize is a no-op against sandbox paths
+    /// since the LLM-supplied string is already absolute and untouched).
+    fn render_bytes_to_payload(
+        &self,
+        file_path: &str,
+        offset: usize,
+        limit: usize,
+        bytes: &[u8],
+        session_key: &str,
+        from_sandbox: bool,
+    ) -> Value {
+        if looks_binary(bytes) {
             #[cfg(feature = "metrics")]
             counter!(
                 tools_metrics::EXECUTIONS_TOTAL,
@@ -140,7 +202,7 @@ impl ReadTool {
                 labels::SUCCESS => "binary".to_string()
             )
             .increment(1);
-            return Ok(match self.binary_policy {
+            return match self.binary_policy {
                 BinaryPolicy::Reject => json!({
                     "kind": "binary",
                     "file_path": file_path,
@@ -153,16 +215,15 @@ impl ReadTool {
                         "kind": "binary",
                         "file_path": file_path,
                         "bytes": bytes.len(),
-                        "base64": BASE64.encode(&bytes),
+                        "base64": BASE64.encode(bytes),
                     })
                 },
-            });
+            };
         }
 
-        // Lossy decode so we never fail on invalid UTF-8 — we surface the
-        // bytes the LLM can see and let it decide. A stricter mode can come
-        // later via config.
-        let text = String::from_utf8(bytes).unwrap_or_else(|e| {
+        // Lossy decode so we never fail on invalid UTF-8 — surface
+        // whatever the LLM can see and let it decide.
+        let text = String::from_utf8(bytes.to_vec()).unwrap_or_else(|e| {
             let bytes = e.into_bytes();
             String::from_utf8_lossy(&bytes).into_owned()
         });
@@ -188,21 +249,24 @@ impl ReadTool {
         });
 
         // Record in the shared tracker if one is configured. Emit a
-        // `loop_warning` when the LLM is re-reading the same slice after
-        // context compression without doing any intervening work.
-        //
-        // Canonicalize first so Write/Edit's subsequent `has_been_read`
-        // check (which also canonicalizes) compares against the same
-        // resolved path. On macOS `/tmp` is a symlink to `/private/tmp`,
-        // so raw vs canonical disagree.
+        // `loop_warning` when the LLM is re-reading the same slice
+        // after context compression without doing any intervening work.
         if let Some(ref state) = self.fs_state {
-            let canonical_path = fs::canonicalize(file_path)
-                .await
-                .unwrap_or_else(|_| std::path::PathBuf::from(file_path));
+            let tracker_path = if from_sandbox {
+                // Sandbox paths are already absolute inside the container;
+                // there's no host-side symlink resolution to do.
+                std::path::PathBuf::from(file_path)
+            } else {
+                // On the host, canonicalize first so Write/Edit's
+                // subsequent has_been_read check (which also canonicalizes)
+                // matches. macOS /tmp → /private/tmp is the classic case.
+                std::fs::canonicalize(file_path)
+                    .unwrap_or_else(|_| std::path::PathBuf::from(file_path))
+            };
             let mut guard = state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let consecutive = guard.record_read(session_key, canonical_path, offset, limit);
+            let consecutive = guard.record_read(session_key, tracker_path, offset, limit);
             if consecutive >= READ_LOOP_THRESHOLD
                 && let Some(obj) = payload.as_object_mut()
             {
@@ -217,7 +281,7 @@ impl ReadTool {
             }
         }
 
-        Ok(payload)
+        payload
     }
 }
 

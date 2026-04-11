@@ -20,10 +20,14 @@ use crate::{
     Result,
     checkpoints::CheckpointManager,
     error::Error,
-    fs::shared::{
-        FsPathPolicy, FsState, canonicalize_for_create, enforce_must_read_before_write,
-        enforce_path_policy, note_fs_mutation, reject_if_symlink, session_key_from,
+    fs::{
+        sandbox_bridge::{ensure_sandbox, sandbox_write},
+        shared::{
+            FsPathPolicy, FsState, canonicalize_for_create, enforce_must_read_before_write,
+            enforce_path_policy, note_fs_mutation, reject_if_symlink, session_key_from,
+        },
     },
+    sandbox::SandboxRouter,
 };
 
 /// Native `Write` tool implementation.
@@ -32,6 +36,7 @@ pub struct WriteTool {
     fs_state: Option<FsState>,
     path_policy: Option<FsPathPolicy>,
     checkpoint_manager: Option<Arc<CheckpointManager>>,
+    sandbox_router: Option<Arc<SandboxRouter>>,
 }
 
 impl WriteTool {
@@ -62,8 +67,36 @@ impl WriteTool {
         self
     }
 
+    /// Attach a shared [`SandboxRouter`]. Sandboxed sessions dispatch
+    /// through the bridge.
+    #[must_use]
+    pub fn with_sandbox_router(mut self, router: Arc<SandboxRouter>) -> Self {
+        self.sandbox_router = Some(router);
+        self
+    }
+
     #[instrument(skip(self, content), fields(file_path = %file_path, bytes = content.len()))]
     async fn write_impl(&self, file_path: &str, content: &str, session_key: &str) -> Result<Value> {
+        // Sandbox dispatch: round-trip through the bridge when sandboxed.
+        // Sandbox path skips host-side canonicalization, symlink check,
+        // and must-read-before-write because those semantics are enforced
+        // by the bridge script / future phase 3 sandbox-side tracker.
+        if let Some(ref router) = self.sandbox_router
+            && router.is_sandboxed(session_key).await
+        {
+            let (backend, id) = ensure_sandbox(router, session_key).await?;
+            if let Some(payload) =
+                sandbox_write(&backend, &id, file_path, content.as_bytes()).await?
+            {
+                return Ok(payload);
+            }
+            return Ok(json!({
+                "file_path": file_path,
+                "bytes_written": content.len(),
+                "checkpoint_id": Value::Null,
+            }));
+        }
+
         let canonical = canonicalize_for_create(file_path).await?;
         let canonical_str = canonical
             .to_str()
