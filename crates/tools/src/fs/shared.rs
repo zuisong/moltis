@@ -5,6 +5,7 @@
 //! contents back to the LLM.
 
 use {
+    globset::{Glob, GlobSet, GlobSetBuilder},
     serde_json::{Value, json},
     std::{
         collections::{HashMap, HashSet},
@@ -191,6 +192,123 @@ pub fn new_fs_state(must_read_before_write: bool) -> FsState {
         sessions: HashMap::new(),
         must_read_before_write,
     }))
+}
+
+/// Path allow/deny policy shared across fs tools.
+///
+/// Built from `[tools.fs].allow_paths` / `[tools.fs].deny_paths` globs at
+/// gateway startup and checked at the tool boundary after path
+/// canonicalization. Deny always wins over allow. An empty allow list
+/// means "no allowlist — all paths are allowed unless explicitly denied."
+///
+/// Cheap to clone (compiled [`GlobSet`]s are `Arc`-backed internally).
+#[derive(Debug, Clone, Default)]
+pub struct FsPathPolicy {
+    allow: Option<GlobSet>,
+    deny: Option<GlobSet>,
+}
+
+impl FsPathPolicy {
+    /// Build a new [`FsPathPolicy`] from allow/deny glob lists.
+    ///
+    /// Returns an error if any glob fails to compile.
+    pub fn new(
+        allow_patterns: &[String],
+        deny_patterns: &[String],
+    ) -> std::result::Result<Self, String> {
+        let allow = if allow_patterns.is_empty() {
+            None
+        } else {
+            Some(build_globset(allow_patterns, "allow_paths")?)
+        };
+        let deny = if deny_patterns.is_empty() {
+            None
+        } else {
+            Some(build_globset(deny_patterns, "deny_paths")?)
+        };
+        Ok(Self { allow, deny })
+    }
+
+    /// Check whether `path` is permitted under the full allow+deny rules.
+    ///
+    /// Returns `None` on permit and `Some(reason)` on reject. Used for
+    /// individual file accesses (Read, Write, Edit, MultiEdit, single
+    /// Glob/Grep entries).
+    pub fn check(&self, path: &Path) -> Option<&'static str> {
+        if let Some(ref deny) = self.deny
+            && deny.is_match(path)
+        {
+            return Some("denied by tools.fs.deny_paths");
+        }
+        if let Some(ref allow) = self.allow
+            && !allow.is_match(path)
+        {
+            return Some("not permitted by tools.fs.allow_paths");
+        }
+        None
+    }
+
+    /// Check whether `path` is blocked by the deny list only.
+    ///
+    /// Used for directory walk roots (Glob/Grep) where the root itself
+    /// typically won't match a file-granular allow list but its children
+    /// might — so the allow list filters results rather than gating the
+    /// whole call. Deny-list matches still reject the entire call.
+    pub fn check_deny_only(&self, path: &Path) -> Option<&'static str> {
+        if let Some(ref deny) = self.deny
+            && deny.is_match(path)
+        {
+            return Some("denied by tools.fs.deny_paths");
+        }
+        None
+    }
+
+    /// Whether this policy is the permissive default (no rules).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.allow.is_none() && self.deny.is_none()
+    }
+}
+
+fn build_globset(patterns: &[String], field: &str) -> std::result::Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob =
+            Glob::new(pattern).map_err(|e| format!("invalid glob in {field}: '{pattern}': {e}"))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("failed to compile {field}: {e}"))
+}
+
+/// Check path policy and return a typed error payload if the path is
+/// denied. Canonicalize before calling so symlinks can't bypass the
+/// allowlist.
+#[must_use]
+pub fn enforce_path_policy(policy: &FsPathPolicy, path: &Path) -> Option<Value> {
+    let reason = policy.check(path)?;
+    Some(path_denied_payload(path, reason))
+}
+
+/// Variant of [`enforce_path_policy`] that only considers the deny list.
+///
+/// Directory walk roots (Glob/Grep) use this because the root typically
+/// won't match a file-granular allow list, but its children can. Per-
+/// file filtering still applies the full policy.
+#[must_use]
+pub fn enforce_path_policy_deny_only(policy: &FsPathPolicy, path: &Path) -> Option<Value> {
+    let reason = policy.check_deny_only(path)?;
+    Some(path_denied_payload(path, reason))
+}
+
+fn path_denied_payload(path: &Path, reason: &str) -> Value {
+    json!({
+        "kind": "path_denied",
+        "file_path": path.to_string_lossy(),
+        "error": "path is not permitted by tools.fs policy",
+        "detail": reason,
+    })
 }
 
 /// Check the must-read-before-write invariant against the shared state.

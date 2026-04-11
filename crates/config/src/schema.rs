@@ -1558,6 +1558,10 @@ pub struct ToolsConfig {
     pub web: WebConfig,
     pub maps: MapsConfig,
     pub browser: BrowserConfig,
+    /// Native filesystem tools (Read/Write/Edit/MultiEdit/Glob/Grep).
+    /// See moltis-org/moltis#657.
+    #[serde(default)]
+    pub fs: FsToolsConfig,
     /// Maximum wall-clock seconds for an agent run (0 = no timeout). Default 600.
     #[serde(default = "default_agent_timeout_secs")]
     pub agent_timeout_secs: u64,
@@ -1586,6 +1590,7 @@ impl Default for ToolsConfig {
             web: WebConfig::default(),
             maps: MapsConfig::default(),
             browser: BrowserConfig::default(),
+            fs: FsToolsConfig::default(),
             agent_timeout_secs: default_agent_timeout_secs(),
             agent_max_iterations: default_agent_max_iterations(),
             agent_max_auto_continues: default_agent_max_auto_continues(),
@@ -1594,6 +1599,80 @@ impl Default for ToolsConfig {
             registry_mode: ToolRegistryMode::default(),
         }
     }
+}
+
+/// Configuration for the native filesystem tools
+/// (Read / Write / Edit / MultiEdit / Glob / Grep).
+///
+/// Tracks GH moltis-org/moltis#657. Every field is optional and conservative
+/// by default — fs tools work out of the box with no configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FsToolsConfig {
+    /// Default search root used by `Glob` and `Grep` when the LLM call
+    /// omits the `path` argument. Must be an absolute path. When unset,
+    /// calls without an explicit `path` are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
+
+    /// Absolute path globs the tools are allowed to access. Empty list
+    /// means "all paths allowed". Evaluated after canonicalization, so
+    /// symlinks can't be used to escape the allowlist.
+    #[serde(default)]
+    pub allow_paths: Vec<String>,
+
+    /// Absolute path globs the tools must refuse. Deny wins over allow.
+    /// Evaluated after canonicalization.
+    #[serde(default)]
+    pub deny_paths: Vec<String>,
+
+    /// Whether to track per-session read history (files read, re-read
+    /// loop detection). Required for `must_read_before_write`. Default `false`.
+    #[serde(default)]
+    pub track_reads: bool,
+
+    /// Reject Write/Edit/MultiEdit calls targeting files the session has
+    /// not previously Read. Requires `track_reads = true`. Default `false`.
+    #[serde(default)]
+    pub must_read_before_write: bool,
+
+    /// Maximum bytes a single `Read` call can return before the file is
+    /// rejected with a typed `too_large` payload. Default 10 MB.
+    #[serde(default = "default_fs_max_read_bytes")]
+    pub max_read_bytes: u64,
+
+    /// What to do with binary files encountered by `Read`.
+    /// `"reject"` (default) returns a typed `binary` payload without
+    /// content. Other modes reserved for phase 4 follow-ups.
+    #[serde(default)]
+    pub binary_policy: FsBinaryPolicy,
+}
+
+impl Default for FsToolsConfig {
+    fn default() -> Self {
+        Self {
+            workspace_root: None,
+            allow_paths: Vec::new(),
+            deny_paths: Vec::new(),
+            track_reads: false,
+            must_read_before_write: false,
+            max_read_bytes: default_fs_max_read_bytes(),
+            binary_policy: FsBinaryPolicy::default(),
+        }
+    }
+}
+
+fn default_fs_max_read_bytes() -> u64 {
+    10 * 1024 * 1024
+}
+
+/// Strategy for handling binary files when encountered by `Read`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FsBinaryPolicy {
+    /// Return a typed `{kind: "binary", bytes: N}` payload without content.
+    #[default]
+    Reject,
 }
 
 fn default_agent_timeout_secs() -> u64 {

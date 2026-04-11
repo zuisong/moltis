@@ -18,8 +18,8 @@ use crate::{
     Result,
     error::Error,
     fs::shared::{
-        FsState, canonicalize_for_create, enforce_must_read_before_write, note_fs_mutation,
-        reject_if_symlink, session_key_from,
+        FsPathPolicy, FsState, canonicalize_for_create, enforce_must_read_before_write,
+        enforce_path_policy, note_fs_mutation, reject_if_symlink, session_key_from,
     },
 };
 
@@ -27,6 +27,7 @@ use crate::{
 #[derive(Default)]
 pub struct WriteTool {
     fs_state: Option<FsState>,
+    path_policy: Option<FsPathPolicy>,
 }
 
 impl WriteTool {
@@ -42,6 +43,13 @@ impl WriteTool {
         self
     }
 
+    /// Attach an allow/deny path policy.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
+        self.path_policy = Some(policy);
+        self
+    }
+
     #[instrument(skip(self, content), fields(file_path = %file_path, bytes = content.len()))]
     async fn write_impl(&self, file_path: &str, content: &str, session_key: &str) -> Result<Value> {
         let canonical = canonicalize_for_create(file_path).await?;
@@ -49,6 +57,15 @@ impl WriteTool {
             .to_str()
             .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?
             .to_string();
+
+        // Path policy check runs on the canonicalized path so the allow-
+        // list evaluates after symlink resolution.
+        if let Some(ref policy) = self.path_policy
+            && let Some(payload) = enforce_path_policy(policy, &canonical)
+        {
+            return Ok(payload);
+        }
+
         let target_exists = tokio::fs::try_exists(&canonical).await.unwrap_or(false);
 
         if target_exists {

@@ -26,7 +26,11 @@ use {
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, labels, tools as tools_metrics};
 
-use crate::{Result, error::Error, fs::shared::require_absolute};
+use crate::{
+    Result,
+    error::Error,
+    fs::shared::{FsPathPolicy, enforce_path_policy_deny_only, require_absolute},
+};
 
 /// Maximum bytes of a single file we will load for content searching.
 const DEFAULT_GREP_FILE_CAP: u64 = 5 * 1024 * 1024;
@@ -74,10 +78,11 @@ struct GrepOptions {
 #[derive(Default)]
 pub struct GrepTool {
     /// Optional default root used when the LLM call omits `path`.
-    ///
-    /// Set via [`with_workspace_root`](Self::with_workspace_root) at
-    /// registration time. When `None`, callers must supply an absolute `path`.
     workspace_root: Option<PathBuf>,
+    /// Optional allow/deny path policy. Rejects the whole call if the
+    /// search root is denied; filters individual matching files
+    /// otherwise.
+    path_policy: Option<FsPathPolicy>,
 }
 
 impl GrepTool {
@@ -90,6 +95,13 @@ impl GrepTool {
     #[must_use]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
+        self
+    }
+
+    /// Attach an allow/deny path policy.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 
@@ -108,6 +120,14 @@ impl GrepTool {
                 opts.path.display()
             ))
         })?;
+
+        // Reject the whole call only if the root is explicitly denied.
+        // Allow-list filtering happens per-file below.
+        if let Some(ref policy) = self.path_policy
+            && let Some(payload) = enforce_path_policy_deny_only(policy, &root_canonical)
+        {
+            return Ok(payload);
+        }
 
         // If the root is a single file, search just that file.
         let is_file = std::fs::metadata(&root_canonical)
@@ -141,6 +161,13 @@ impl GrepTool {
                 }
                 if let Some(ref ft) = opts.file_type
                     && !file_matches_type(&path, ft)
+                {
+                    continue;
+                }
+                // Per-file policy filter so allow/deny can carve
+                // sub-trees beneath the search root.
+                if let Some(ref policy) = self.path_policy
+                    && policy.check(&path).is_some()
                 {
                     continue;
                 }
@@ -480,8 +507,12 @@ impl AgentTool for GrepTool {
         };
 
         let workspace_root = self.workspace_root.clone();
+        let path_policy = self.path_policy.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let tool = Self { workspace_root };
+            let tool = Self {
+                workspace_root,
+                path_policy,
+            };
             tool.grep_impl(opts)
         })
         .await

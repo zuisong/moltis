@@ -3570,12 +3570,40 @@ pub async fn prepare_gateway_core(
         tool_registry.register(Box::new(exec_tool));
         tool_registry.register(Box::new(moltis_tools::calc::CalcTool::new()));
         // Native filesystem tools (Read/Write/Edit/MultiEdit/Glob/Grep).
-        // See moltis-org/moltis#657. Phase 1: host path only; sandbox
-        // routing ships in phase 2. workspace_root is None for now —
-        // [tools.fs].workspace_root lands with phase 4 config. Until then
-        // Glob/Grep callers must supply an absolute `path` argument.
+        // See moltis-org/moltis#657. Phase 4 wires [tools.fs] config into
+        // the tool context: workspace_root default for Glob/Grep, path
+        // allow/deny, and FsState for must-read-before-write + loop
+        // detection (gated by track_reads).
         #[cfg(feature = "fs-tools")]
-        moltis_tools::fs::register_fs_tools(&mut tool_registry, None, None);
+        {
+            let fs_cfg = &config.tools.fs;
+            let path_policy =
+                match moltis_tools::fs::FsPathPolicy::new(&fs_cfg.allow_paths, &fs_cfg.deny_paths) {
+                    Ok(p) => {
+                        if p.is_empty() {
+                            None
+                        } else {
+                            Some(p)
+                        }
+                    },
+                    Err(e) => {
+                        warn!(error = %e, "invalid tools.fs path policy — fs tools will run without path allow/deny");
+                        None
+                    },
+                };
+            let fs_state = if fs_cfg.track_reads {
+                Some(moltis_tools::fs::new_fs_state(fs_cfg.must_read_before_write))
+            } else {
+                None
+            };
+            let workspace_root = fs_cfg.workspace_root.as_ref().map(PathBuf::from);
+            let ctx = moltis_tools::fs::FsToolsContext {
+                workspace_root,
+                fs_state,
+                path_policy,
+            };
+            moltis_tools::fs::register_fs_tools(&mut tool_registry, ctx);
+        }
         #[cfg(feature = "wasm")]
         {
             let wasm_limits = sandbox_router

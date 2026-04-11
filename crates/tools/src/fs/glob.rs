@@ -22,7 +22,11 @@ use {
 #[cfg(feature = "metrics")]
 use moltis_metrics::{counter, labels, tools as tools_metrics};
 
-use crate::{Result, error::Error, fs::shared::require_absolute};
+use crate::{
+    Result,
+    error::Error,
+    fs::shared::{FsPathPolicy, enforce_path_policy_deny_only, require_absolute},
+};
 
 /// Maximum number of entries returned by a single `Glob` call.
 const DEFAULT_GLOB_LIMIT: usize = 1000;
@@ -31,11 +35,11 @@ const DEFAULT_GLOB_LIMIT: usize = 1000;
 #[derive(Default)]
 pub struct GlobTool {
     /// Optional default root used when the LLM call omits `path`.
-    ///
-    /// Set via [`with_workspace_root`](Self::with_workspace_root) at
-    /// registration time (typically from `[tools.fs].workspace_root` once
-    /// phase 4 lands). When `None`, callers must supply an absolute `path`.
     workspace_root: Option<PathBuf>,
+    /// Optional allow/deny path policy. Applied to the walk root (call
+    /// is rejected entirely if the root is denied) and to each matching
+    /// file (denied files are filtered out of results).
+    path_policy: Option<FsPathPolicy>,
 }
 
 impl GlobTool {
@@ -51,6 +55,13 @@ impl GlobTool {
     #[must_use]
     pub fn with_workspace_root(mut self, root: PathBuf) -> Self {
         self.workspace_root = Some(root);
+        self
+    }
+
+    /// Attach an allow/deny path policy.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 
@@ -83,6 +94,16 @@ impl GlobTool {
             ))
         })?;
 
+        // Reject the entire call only if the walk root is explicitly
+        // denied. Allow-list filtering happens per-file below — a
+        // directory root typically won't match a file-granular allow
+        // glob even if its children do.
+        if let Some(ref policy) = self.path_policy
+            && let Some(payload) = enforce_path_policy_deny_only(policy, &root_canonical)
+        {
+            return Ok(payload);
+        }
+
         let mut results: Vec<(PathBuf, SystemTime)> = Vec::new();
 
         let walker = WalkBuilder::new(&root_canonical)
@@ -105,6 +126,13 @@ impl GlobTool {
             // like `**/*.rs` work naturally.
             let relative = abs_path.strip_prefix(&root_canonical).unwrap_or(abs_path);
             if !matcher.is_match(relative) {
+                continue;
+            }
+            // Per-file path policy filter so allow/deny can carve out
+            // sub-trees underneath the walk root.
+            if let Some(ref policy) = self.path_policy
+                && policy.check(abs_path).is_some()
+            {
                 continue;
             }
             let mtime = entry
@@ -188,8 +216,12 @@ impl AgentTool for GlobTool {
             .map(PathBuf::from);
 
         let workspace_root = self.workspace_root.clone();
+        let path_policy = self.path_policy.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let tool = Self { workspace_root };
+            let tool = Self {
+                workspace_root,
+                path_policy,
+            };
             tool.glob_impl(&pattern, path.as_deref())
         })
         .await

@@ -24,66 +24,95 @@ pub use {
     grep::GrepTool,
     multi_edit::MultiEditTool,
     read::ReadTool,
-    shared::{FsState, new_fs_state},
+    shared::{FsPathPolicy, FsState, new_fs_state},
     write::WriteTool,
 };
 
 use {moltis_agents::tool_registry::ToolRegistry, std::path::PathBuf};
 
+/// Aggregated configuration for fs tool registration.
+///
+/// Phase 1 shipped with three bare positional parameters; phase 4 keeps
+/// adding knobs (path policy, max-read override, binary policy) so the
+/// registration signature is migrated to a single context struct now,
+/// while call sites are still minimal.
+#[derive(Debug, Clone, Default)]
+pub struct FsToolsContext {
+    /// Default search root for `Glob`/`Grep` when the LLM omits `path`.
+    /// Must be absolute. When `None`, calls without explicit `path` error.
+    pub workspace_root: Option<PathBuf>,
+    /// Shared per-session state for read tracking, loop detection, and
+    /// must-read-before-write enforcement. `None` disables all trackers.
+    pub fs_state: Option<FsState>,
+    /// Allow/deny path policy. Empty policy (`None`) permits everything.
+    /// Phase 4 adds this from `[tools.fs].allow_paths` / `deny_paths`.
+    pub path_policy: Option<FsPathPolicy>,
+}
+
 /// Register every native filesystem tool on a [`ToolRegistry`].
 ///
-/// - `workspace_root`, when set, is used as the default search root for
-///   `Glob` and `Grep` calls that omit the `path` argument. All fs tools
-///   still require absolute paths for any explicit `file_path` / `path`
-///   argument — the workspace root only affects the default for
-///   `Glob`/`Grep`, never silently resolves relative paths.
-/// - `fs_state`, when set, is shared across `Read`, `Write`, `Edit`, and
-///   `MultiEdit` to enable per-session read tracking, re-read loop
-///   detection, and (if the state's `must_read_before_write` flag is on)
-///   a hard rejection on writes to files the session hasn't read. Pass
-///   `None` to disable all of these trackers.
-///
-/// The `tools.policy` allow/deny layer still gates access per-agent, so
-/// registration is independent of authorization.
-pub fn register_fs_tools(
-    registry: &mut ToolRegistry,
-    workspace_root: Option<PathBuf>,
-    fs_state: Option<FsState>,
-) {
-    let read = match fs_state.clone() {
-        Some(s) => ReadTool::new().with_fs_state(s),
-        None => ReadTool::new(),
-    };
+/// See [`FsToolsContext`] for the individual knobs. The `tools.policy`
+/// allow/deny layer (per-tool names, not paths) still gates access
+/// per-agent; registration is independent of authorization.
+pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
+    let FsToolsContext {
+        workspace_root,
+        fs_state,
+        path_policy,
+    } = context;
+
+    let mut read = ReadTool::new();
+    if let Some(ref s) = fs_state {
+        read = read.with_fs_state(s.clone());
+    }
+    if let Some(ref p) = path_policy {
+        read = read.with_path_policy(p.clone());
+    }
     registry.register(Box::new(read));
 
-    let write = match fs_state.clone() {
-        Some(s) => WriteTool::new().with_fs_state(s),
-        None => WriteTool::new(),
-    };
+    let mut write = WriteTool::new();
+    if let Some(ref s) = fs_state {
+        write = write.with_fs_state(s.clone());
+    }
+    if let Some(ref p) = path_policy {
+        write = write.with_path_policy(p.clone());
+    }
     registry.register(Box::new(write));
 
-    let edit = match fs_state.clone() {
-        Some(s) => EditTool::new().with_fs_state(s),
-        None => EditTool::new(),
-    };
+    let mut edit = EditTool::new();
+    if let Some(ref s) = fs_state {
+        edit = edit.with_fs_state(s.clone());
+    }
+    if let Some(ref p) = path_policy {
+        edit = edit.with_path_policy(p.clone());
+    }
     registry.register(Box::new(edit));
 
-    let multi_edit = match fs_state {
-        Some(s) => MultiEditTool::new().with_fs_state(s),
-        None => MultiEditTool::new(),
-    };
+    let mut multi_edit = MultiEditTool::new();
+    if let Some(ref s) = fs_state {
+        multi_edit = multi_edit.with_fs_state(s.clone());
+    }
+    if let Some(ref p) = path_policy {
+        multi_edit = multi_edit.with_path_policy(p.clone());
+    }
     registry.register(Box::new(multi_edit));
 
-    let glob = match workspace_root.clone() {
-        Some(root) => GlobTool::new().with_workspace_root(root),
-        None => GlobTool::new(),
-    };
+    let mut glob = GlobTool::new();
+    if let Some(ref root) = workspace_root {
+        glob = glob.with_workspace_root(root.clone());
+    }
+    if let Some(ref p) = path_policy {
+        glob = glob.with_path_policy(p.clone());
+    }
     registry.register(Box::new(glob));
 
-    let grep = match workspace_root {
-        Some(root) => GrepTool::new().with_workspace_root(root),
-        None => GrepTool::new(),
-    };
+    let mut grep = GrepTool::new();
+    if let Some(root) = workspace_root {
+        grep = grep.with_workspace_root(root);
+    }
+    if let Some(p) = path_policy {
+        grep = grep.with_path_policy(p);
+    }
     registry.register(Box::new(grep));
 }
 
@@ -103,13 +132,28 @@ mod contract_tests {
 
     fn build_registry(workspace_root: Option<PathBuf>) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        register_fs_tools(&mut registry, workspace_root, None);
+        register_fs_tools(&mut registry, FsToolsContext {
+            workspace_root,
+            ..FsToolsContext::default()
+        });
         registry
     }
 
     fn build_registry_with_state(fs_state: FsState) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        register_fs_tools(&mut registry, None, Some(fs_state));
+        register_fs_tools(&mut registry, FsToolsContext {
+            fs_state: Some(fs_state),
+            ..FsToolsContext::default()
+        });
+        registry
+    }
+
+    fn build_registry_with_policy(policy: FsPathPolicy) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            path_policy: Some(policy),
+            ..FsToolsContext::default()
+        });
         registry
     }
 
@@ -338,6 +382,83 @@ mod contract_tests {
             third.get("loop_warning").is_some(),
             "warning missing: {third:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn path_policy_denies_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let secret = real.join("secret.txt");
+        let public = real.join("public.txt");
+        tokio::fs::write(&secret, "top secret").await.unwrap();
+        tokio::fs::write(&public, "open").await.unwrap();
+
+        // Deny the secret file specifically.
+        let policy = FsPathPolicy::new(&[], &[secret.to_string_lossy().into_owned()]).unwrap();
+        let registry = build_registry_with_policy(policy);
+
+        // Read on the denied path returns a typed path_denied payload.
+        let read = registry.get("Read").unwrap();
+        let r = read
+            .execute(json!({ "file_path": secret.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(r["kind"], "path_denied");
+
+        // Write on the denied path is rejected (file unchanged).
+        let write = registry.get("Write").unwrap();
+        let w = write
+            .execute(json!({
+                "file_path": secret.to_str().unwrap(),
+                "content": "overwritten",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(w["kind"], "path_denied");
+        let contents = tokio::fs::read_to_string(&secret).await.unwrap();
+        assert_eq!(contents, "top secret");
+
+        // The non-denied file still works.
+        let r2 = read
+            .execute(json!({ "file_path": public.to_str().unwrap() }))
+            .await
+            .unwrap();
+        assert_eq!(r2["kind"], "text");
+    }
+
+    #[tokio::test]
+    async fn path_policy_allow_list_filters_glob_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let allowed = real.join("allowed.rs");
+        let blocked = real.join("blocked.rs");
+        tokio::fs::write(&allowed, "// a").await.unwrap();
+        tokio::fs::write(&blocked, "// b").await.unwrap();
+
+        // Allow only *.rs files whose stem starts with "allowed".
+        let allow_glob = real.join("allowed*.rs").to_string_lossy().into_owned();
+        let policy = FsPathPolicy::new(&[allow_glob], &[]).unwrap();
+
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, FsToolsContext {
+            workspace_root: Some(real.clone()),
+            path_policy: Some(policy),
+            ..FsToolsContext::default()
+        });
+
+        let glob_tool = registry.get("Glob").unwrap();
+        let value = glob_tool
+            .execute(json!({ "pattern": "*.rs" }))
+            .await
+            .unwrap();
+        let paths: Vec<String> = value["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("allowed.rs"));
     }
 
     #[tokio::test]

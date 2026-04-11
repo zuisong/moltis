@@ -21,8 +21,9 @@ use crate::{
     fs::{
         edit::{apply_edit, persist_atomic},
         shared::{
-            FsState, canonicalize_existing, enforce_must_read_before_write, ensure_regular_file,
-            note_fs_mutation, reject_if_symlink, session_key_from,
+            FsPathPolicy, FsState, canonicalize_existing, enforce_must_read_before_write,
+            enforce_path_policy, ensure_regular_file, note_fs_mutation, reject_if_symlink,
+            session_key_from,
         },
     },
 };
@@ -31,6 +32,7 @@ use crate::{
 #[derive(Default)]
 pub struct MultiEditTool {
     fs_state: Option<FsState>,
+    path_policy: Option<FsPathPolicy>,
 }
 
 impl MultiEditTool {
@@ -43,6 +45,13 @@ impl MultiEditTool {
     #[must_use]
     pub fn with_fs_state(mut self, state: FsState) -> Self {
         self.fs_state = Some(state);
+        self
+    }
+
+    /// Attach an allow/deny path policy.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 
@@ -65,6 +74,12 @@ impl MultiEditTool {
             .to_str()
             .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?
             .to_string();
+
+        if let Some(ref policy) = self.path_policy
+            && let Some(payload) = enforce_path_policy(policy, &canonical)
+        {
+            return Ok(payload);
+        }
 
         if let Some(payload) =
             enforce_must_read_before_write(self.fs_state.as_ref(), session_key, &canonical_str)

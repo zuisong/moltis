@@ -240,6 +240,40 @@ provider = "google_maps"          # Map provider used by show_map:
                                   #   "apple_maps"
                                   #   "openstreetmap"
 
+# ── Native filesystem tools (Read/Write/Edit/MultiEdit/Glob/Grep) ─────────────
+# All fields are optional. Defaults are conservative — the fs tools work
+# out of the box with no configuration.
+
+[tools.fs]
+# workspace_root = "/home/user/projects/my-app"
+                                  # Absolute path used as the default search root
+                                  # for Glob/Grep when the LLM call omits `path`.
+                                  # Unset → calls without an explicit `path` are
+                                  # rejected with a clear error.
+allow_paths = []                  # Absolute path globs the fs tools are allowed
+                                  # to access. Empty = no allowlist (all paths OK).
+                                  # Evaluated after canonicalization so symlinks
+                                  # can't escape the list.
+                                  # Example: ["/data/home/*", "/srv/workspace/**"]
+deny_paths = []                   # Absolute path globs the fs tools must refuse.
+                                  # Deny wins over allow. Also evaluated after
+                                  # canonicalization. Example:
+                                  #   ["/data/secrets/**", "**/.env*", "/etc/**"]
+track_reads = false               # Record per-session Read history for loop
+                                  # detection and the must_read_before_write
+                                  # invariant. Cheap in-memory map keyed by
+                                  # session_key.
+must_read_before_write = false    # Refuse Write/Edit/MultiEdit calls targeting
+                                  # files the session has not previously Read.
+                                  # Requires track_reads = true. Returns a typed
+                                  # must_read_before_write payload the LLM can
+                                  # branch on.
+max_read_bytes = 10485760         # Maximum bytes a single Read can return before
+                                  # the file is rejected with a typed "too_large"
+                                  # payload (10 MB).
+binary_policy = "reject"          # How to handle binary files in Read:
+                                  #   "reject" — return typed binary marker (default)
+
 # ── Command Execution ─────────────────────────────────────────────────────────
 
 [tools.exec]

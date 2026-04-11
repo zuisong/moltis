@@ -20,8 +20,9 @@ use crate::{
     Result,
     error::Error,
     fs::shared::{
-        FsState, canonicalize_existing, enforce_must_read_before_write, ensure_regular_file,
-        note_fs_mutation, reject_if_symlink, session_key_from,
+        FsPathPolicy, FsState, canonicalize_existing, enforce_must_read_before_write,
+        enforce_path_policy, ensure_regular_file, note_fs_mutation, reject_if_symlink,
+        session_key_from,
     },
 };
 
@@ -128,6 +129,7 @@ fn finish_edit(
 #[derive(Default)]
 pub struct EditTool {
     fs_state: Option<FsState>,
+    path_policy: Option<FsPathPolicy>,
 }
 
 impl EditTool {
@@ -140,6 +142,13 @@ impl EditTool {
     #[must_use]
     pub fn with_fs_state(mut self, state: FsState) -> Self {
         self.fs_state = Some(state);
+        self
+    }
+
+    /// Attach an allow/deny path policy.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 
@@ -160,6 +169,12 @@ impl EditTool {
             .to_str()
             .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?
             .to_string();
+
+        if let Some(ref policy) = self.path_policy
+            && let Some(payload) = enforce_path_policy(policy, &canonical)
+        {
+            return Ok(payload);
+        }
 
         if let Some(payload) =
             enforce_must_read_before_write(self.fs_state.as_ref(), session_key, &canonical_str)

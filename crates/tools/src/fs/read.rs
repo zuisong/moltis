@@ -20,9 +20,9 @@ use crate::{
     Result,
     error::Error,
     fs::shared::{
-        DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, FsState, READ_LOOP_THRESHOLD,
-        format_numbered_lines, fs_error_payload, io_error_to_typed_payload, looks_binary,
-        require_absolute, session_key_from,
+        DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, FsPathPolicy, FsState,
+        READ_LOOP_THRESHOLD, enforce_path_policy, format_numbered_lines, fs_error_payload,
+        io_error_to_typed_payload, looks_binary, require_absolute, session_key_from,
     },
 };
 
@@ -30,6 +30,7 @@ use crate::{
 #[derive(Default)]
 pub struct ReadTool {
     fs_state: Option<FsState>,
+    path_policy: Option<FsPathPolicy>,
 }
 
 impl ReadTool {
@@ -46,6 +47,14 @@ impl ReadTool {
     #[must_use]
     pub fn with_fs_state(mut self, state: FsState) -> Self {
         self.fs_state = Some(state);
+        self
+    }
+
+    /// Attach an allow/deny path policy. Paths that fail the policy
+    /// check return a typed `path_denied` payload.
+    #[must_use]
+    pub fn with_path_policy(mut self, policy: FsPathPolicy) -> Self {
+        self.path_policy = Some(policy);
         self
     }
 
@@ -79,6 +88,17 @@ impl ReadTool {
                 "path is not a regular file",
                 None,
             ));
+        }
+
+        // Path policy check: canonicalize first so allowlist globs evaluate
+        // against the resolved path, not whatever the LLM supplied.
+        if let Some(ref policy) = self.path_policy {
+            let canonical = fs::canonicalize(file_path)
+                .await
+                .unwrap_or_else(|_| std::path::PathBuf::from(file_path));
+            if let Some(payload) = enforce_path_policy(policy, &canonical) {
+                return Ok(payload);
+            }
         }
 
         let size = meta.len();
