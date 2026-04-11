@@ -17,32 +17,53 @@ use moltis_metrics::{counter, labels, tools as tools_metrics};
 use crate::{
     Result,
     error::Error,
-    fs::shared::{canonicalize_for_create, reject_if_symlink},
+    fs::shared::{
+        FsState, canonicalize_for_create, enforce_must_read_before_write, note_fs_mutation,
+        reject_if_symlink, session_key_from,
+    },
 };
 
 /// Native `Write` tool implementation.
 #[derive(Default)]
-pub struct WriteTool;
+pub struct WriteTool {
+    fs_state: Option<FsState>,
+}
 
 impl WriteTool {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Attach shared [`FsState`] for must-read-before-write enforcement.
+    #[must_use]
+    pub fn with_fs_state(mut self, state: FsState) -> Self {
+        self.fs_state = Some(state);
+        self
     }
 
     #[instrument(skip(self, content), fields(file_path = %file_path, bytes = content.len()))]
-    async fn write_impl(&self, file_path: &str, content: &str) -> Result<Value> {
+    async fn write_impl(&self, file_path: &str, content: &str, session_key: &str) -> Result<Value> {
         let canonical = canonicalize_for_create(file_path).await?;
+        let canonical_str = canonical
+            .to_str()
+            .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?
+            .to_string();
+        let target_exists = tokio::fs::try_exists(&canonical).await.unwrap_or(false);
 
-        // If the target exists, reject symlinks so we don't unknowingly write
-        // through to another location. A new file naturally isn't a symlink.
-        if tokio::fs::try_exists(&canonical).await.unwrap_or(false) {
-            reject_if_symlink(
-                canonical
-                    .to_str()
-                    .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?,
-            )
-            .await?;
+        if target_exists {
+            // Reject symlinks so we don't unknowingly write through to
+            // another location. A new file naturally isn't a symlink.
+            reject_if_symlink(&canonical_str).await?;
+
+            // Must-read-before-write: reject if the target exists and the
+            // session hasn't read it. Skip this check for new files —
+            // there's nothing to have read.
+            if let Some(payload) =
+                enforce_must_read_before_write(self.fs_state.as_ref(), session_key, &canonical_str)
+            {
+                return Ok(payload);
+            }
         }
 
         let parent = canonical
@@ -76,6 +97,8 @@ impl WriteTool {
         })
         .await
         .map_err(|e| Error::message(format!("blocking write task failed: {e}")))??;
+
+        note_fs_mutation(self.fs_state.as_ref(), session_key, &canonical_str);
 
         #[cfg(feature = "metrics")]
         counter!(
@@ -130,8 +153,9 @@ impl AgentTool for WriteTool {
             .get("content")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::message("missing 'content' parameter"))?;
+        let session_key = session_key_from(&params).to_string();
 
-        match self.write_impl(file_path, content).await {
+        match self.write_impl(file_path, content, &session_key).await {
             Ok(value) => Ok(value),
             Err(e) => {
                 #[cfg(feature = "metrics")]

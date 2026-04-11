@@ -7,13 +7,19 @@
 use {
     serde_json::{Value, json},
     std::{
+        collections::{HashMap, HashSet},
         io,
         path::{Path, PathBuf},
+        sync::{Arc, Mutex},
     },
     tokio::fs,
 };
 
 use crate::{Result, error::Error};
+
+/// Number of consecutive identical reads before a `loop_warning` is added
+/// to Read's response payload. Ported from hermes's `_read_tracker`.
+pub const READ_LOOP_THRESHOLD: usize = 3;
 
 /// Typed error kinds that fs tools surface to the LLM as structured `Ok`
 /// payloads rather than plain `Err` strings.
@@ -32,6 +38,9 @@ pub enum FsErrorKind {
     PermissionDenied,
     TooLarge,
     NotRegularFile,
+    /// The session is configured with `must_read_before_write` and tried
+    /// to mutate a file it had not previously read.
+    MustReadBeforeWrite,
 }
 
 impl FsErrorKind {
@@ -42,6 +51,7 @@ impl FsErrorKind {
             Self::PermissionDenied => "permission_denied",
             Self::TooLarge => "too_large",
             Self::NotRegularFile => "not_regular_file",
+            Self::MustReadBeforeWrite => "must_read_before_write",
         }
     }
 }
@@ -133,17 +143,146 @@ pub fn require_absolute(path: &str, field: &str) -> Result<()> {
 }
 
 /// Extract the optional `_session_key` parameter threaded into every tool
-/// call by the chat loop.
-///
-/// Phase 1 callers don't actually use the value — it's just plumbed so
-/// phase 3's per-session read tracker can light it up without touching
-/// every tool. Returns `"default"` when absent.
+/// call by the chat loop. Returns `"default"` when absent.
 #[must_use]
 pub fn session_key_from(params: &Value) -> &str {
     params
         .get("_session_key")
         .and_then(Value::as_str)
         .unwrap_or("default")
+}
+
+/// Per-session fs tool state.
+///
+/// Tracks which files the session has read (for must-read-before-write
+/// enforcement) and how many consecutive identical reads it has made
+/// (for loop detection after context compression).
+#[derive(Debug, Default)]
+pub struct SessionFsState {
+    /// Canonical paths the session has successfully read.
+    pub read_files: HashSet<PathBuf>,
+    /// Most recent read signature: (path, offset, limit).
+    pub last_read_key: Option<(PathBuf, usize, usize)>,
+    /// Number of consecutive reads matching `last_read_key` with no
+    /// intervening mutation.
+    pub consecutive_reads: usize,
+}
+
+/// Shared fs state across all fs tool instances in one gateway.
+///
+/// `None` disables every phase-3 tracker: must-read-before-write does
+/// nothing, loop detection does nothing, read history is not recorded.
+/// The gateway currently passes `None` and phase 4 config will flip it
+/// on via `[tools.fs].track_reads` / `must_read_before_write`.
+pub type FsState = Arc<Mutex<FsStateInner>>;
+
+#[derive(Debug, Default)]
+pub struct FsStateInner {
+    sessions: HashMap<String, SessionFsState>,
+    /// When true, Write/Edit/MultiEdit refuse to mutate a file the
+    /// session has not read.
+    pub must_read_before_write: bool,
+}
+
+/// Construct a fresh [`FsState`] handle.
+#[must_use]
+pub fn new_fs_state(must_read_before_write: bool) -> FsState {
+    Arc::new(Mutex::new(FsStateInner {
+        sessions: HashMap::new(),
+        must_read_before_write,
+    }))
+}
+
+/// Check the must-read-before-write invariant against the shared state.
+///
+/// When `fs_state` is `Some` and [`FsStateInner::must_read_before_write`]
+/// is on, returns a typed `must_read_before_write` payload if the session
+/// has not read `file_path`. Otherwise returns `None` and mutation
+/// proceeds normally.
+///
+/// Designed to be called *after* path canonicalization and *after* the
+/// target file is known to exist. For Write to a new file, callers should
+/// skip this check since there's nothing to have read yet.
+#[must_use]
+pub fn enforce_must_read_before_write(
+    fs_state: Option<&FsState>,
+    session_key: &str,
+    file_path: &str,
+) -> Option<Value> {
+    let state = fs_state?;
+    let guard = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !guard.must_read_before_write {
+        return None;
+    }
+    let path = Path::new(file_path);
+    if guard.has_been_read(session_key, path) {
+        return None;
+    }
+    Some(fs_error_payload(
+        FsErrorKind::MustReadBeforeWrite,
+        file_path,
+        "cannot mutate a file this session has not read — call Read first",
+        Some("must_read_before_write policy is enabled"),
+    ))
+}
+
+/// Note a successful mutation so the per-session loop counter is reset
+/// for subsequent reads of the same path.
+pub fn note_fs_mutation(fs_state: Option<&FsState>, session_key: &str, file_path: &str) {
+    if let Some(state) = fs_state {
+        let mut guard = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.note_mutation(session_key, Path::new(file_path));
+    }
+}
+
+impl FsStateInner {
+    /// Record that `session_key` successfully read `(path, offset, limit)`.
+    ///
+    /// Returns the new consecutive-read count for this `(path, offset,
+    /// limit)` signature. A count of >= [`READ_LOOP_THRESHOLD`] signals a
+    /// re-read loop and Read should append a warning to its response.
+    pub fn record_read(
+        &mut self,
+        session_key: &str,
+        path: PathBuf,
+        offset: usize,
+        limit: usize,
+    ) -> usize {
+        let entry = self.sessions.entry(session_key.to_string()).or_default();
+        let key = (path.clone(), offset, limit);
+        if entry.last_read_key.as_ref() == Some(&key) {
+            entry.consecutive_reads = entry.consecutive_reads.saturating_add(1);
+        } else {
+            entry.last_read_key = Some(key);
+            entry.consecutive_reads = 1;
+        }
+        entry.read_files.insert(path);
+        entry.consecutive_reads
+    }
+
+    /// Whether `session_key` has successfully read `path`.
+    #[must_use]
+    pub fn has_been_read(&self, session_key: &str, path: &Path) -> bool {
+        self.sessions
+            .get(session_key)
+            .is_some_and(|state| state.read_files.contains(path))
+    }
+
+    /// Note a mutation to `path`: reset the loop counter if the most
+    /// recent read targeted the same file, and leave `read_files`
+    /// untouched so the LLM doesn't need to re-read after its own edit.
+    pub fn note_mutation(&mut self, session_key: &str, path: &Path) {
+        if let Some(entry) = self.sessions.get_mut(session_key)
+            && let Some((last_path, ..)) = entry.last_read_key.as_ref()
+            && last_path.as_path() == path
+        {
+            entry.consecutive_reads = 0;
+        }
+    }
 }
 
 /// Canonicalize a user-supplied path. Requires the path to exist and be absolute.
@@ -318,6 +457,57 @@ fn decimal_width(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use {super::*, std::io::Write};
+
+    #[test]
+    fn fs_state_records_read_and_tracks_consecutive_reads() {
+        let state = new_fs_state(false);
+        let mut inner = state.lock().unwrap();
+        let path = PathBuf::from("/tmp/x");
+
+        let c1 = inner.record_read("s1", path.clone(), 1, 100);
+        let c2 = inner.record_read("s1", path.clone(), 1, 100);
+        let c3 = inner.record_read("s1", path.clone(), 1, 100);
+        assert_eq!(c1, 1);
+        assert_eq!(c2, 2);
+        assert_eq!(c3, 3);
+        assert!(c3 >= READ_LOOP_THRESHOLD);
+    }
+
+    #[test]
+    fn fs_state_different_offsets_reset_counter() {
+        let state = new_fs_state(false);
+        let mut inner = state.lock().unwrap();
+        let path = PathBuf::from("/tmp/x");
+
+        assert_eq!(inner.record_read("s1", path.clone(), 1, 100), 1);
+        assert_eq!(inner.record_read("s1", path.clone(), 10, 100), 1);
+    }
+
+    #[test]
+    fn fs_state_has_been_read_tracks_across_reads() {
+        let state = new_fs_state(false);
+        let mut inner = state.lock().unwrap();
+        let path = PathBuf::from("/tmp/x");
+
+        assert!(!inner.has_been_read("s1", &path));
+        inner.record_read("s1", path.clone(), 1, 100);
+        assert!(inner.has_been_read("s1", &path));
+        // Session isolation: a different session_key sees nothing.
+        assert!(!inner.has_been_read("s2", &path));
+    }
+
+    #[test]
+    fn fs_state_note_mutation_resets_loop_counter() {
+        let state = new_fs_state(false);
+        let mut inner = state.lock().unwrap();
+        let path = PathBuf::from("/tmp/x");
+
+        inner.record_read("s1", path.clone(), 1, 100);
+        inner.record_read("s1", path.clone(), 1, 100);
+        inner.note_mutation("s1", &path);
+        // After note_mutation, the next read starts a fresh streak.
+        assert_eq!(inner.record_read("s1", path.clone(), 1, 100), 1);
+    }
 
     #[test]
     fn session_key_default_when_absent() {

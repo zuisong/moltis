@@ -19,7 +19,12 @@ pub mod shared;
 pub mod write;
 
 pub use {
-    edit::EditTool, glob::GlobTool, grep::GrepTool, multi_edit::MultiEditTool, read::ReadTool,
+    edit::EditTool,
+    glob::GlobTool,
+    grep::GrepTool,
+    multi_edit::MultiEditTool,
+    read::ReadTool,
+    shared::{FsState, new_fs_state},
     write::WriteTool,
 };
 
@@ -27,19 +32,47 @@ use {moltis_agents::tool_registry::ToolRegistry, std::path::PathBuf};
 
 /// Register every native filesystem tool on a [`ToolRegistry`].
 ///
-/// `workspace_root`, when set, is used as the default search root for
-/// `Glob` and `Grep` calls that omit the `path` argument. All fs tools
-/// still require absolute paths for any explicit `file_path` / `path`
-/// argument — the workspace root only affects the default for
-/// `Glob`/`Grep`, never silently resolves relative paths.
+/// - `workspace_root`, when set, is used as the default search root for
+///   `Glob` and `Grep` calls that omit the `path` argument. All fs tools
+///   still require absolute paths for any explicit `file_path` / `path`
+///   argument — the workspace root only affects the default for
+///   `Glob`/`Grep`, never silently resolves relative paths.
+/// - `fs_state`, when set, is shared across `Read`, `Write`, `Edit`, and
+///   `MultiEdit` to enable per-session read tracking, re-read loop
+///   detection, and (if the state's `must_read_before_write` flag is on)
+///   a hard rejection on writes to files the session hasn't read. Pass
+///   `None` to disable all of these trackers.
 ///
 /// The `tools.policy` allow/deny layer still gates access per-agent, so
 /// registration is independent of authorization.
-pub fn register_fs_tools(registry: &mut ToolRegistry, workspace_root: Option<PathBuf>) {
-    registry.register(Box::new(ReadTool::new()));
-    registry.register(Box::new(WriteTool::new()));
-    registry.register(Box::new(EditTool::new()));
-    registry.register(Box::new(MultiEditTool::new()));
+pub fn register_fs_tools(
+    registry: &mut ToolRegistry,
+    workspace_root: Option<PathBuf>,
+    fs_state: Option<FsState>,
+) {
+    let read = match fs_state.clone() {
+        Some(s) => ReadTool::new().with_fs_state(s),
+        None => ReadTool::new(),
+    };
+    registry.register(Box::new(read));
+
+    let write = match fs_state.clone() {
+        Some(s) => WriteTool::new().with_fs_state(s),
+        None => WriteTool::new(),
+    };
+    registry.register(Box::new(write));
+
+    let edit = match fs_state.clone() {
+        Some(s) => EditTool::new().with_fs_state(s),
+        None => EditTool::new(),
+    };
+    registry.register(Box::new(edit));
+
+    let multi_edit = match fs_state {
+        Some(s) => MultiEditTool::new().with_fs_state(s),
+        None => MultiEditTool::new(),
+    };
+    registry.register(Box::new(multi_edit));
 
     let glob = match workspace_root.clone() {
         Some(root) => GlobTool::new().with_workspace_root(root),
@@ -70,7 +103,13 @@ mod contract_tests {
 
     fn build_registry(workspace_root: Option<PathBuf>) -> ToolRegistry {
         let mut registry = ToolRegistry::new();
-        register_fs_tools(&mut registry, workspace_root);
+        register_fs_tools(&mut registry, workspace_root, None);
+        registry
+    }
+
+    fn build_registry_with_state(fs_state: FsState) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_fs_tools(&mut registry, None, Some(fs_state));
         registry
     }
 
@@ -186,6 +225,119 @@ mod contract_tests {
             .unwrap();
         let matches = gr["matches"].as_array().unwrap();
         assert!(!matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn must_read_before_write_rejects_unread_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.txt");
+        tokio::fs::write(&path, "original").await.unwrap();
+
+        let state = new_fs_state(true);
+        let registry = build_registry_with_state(state);
+
+        let write = registry.get("Write").unwrap();
+        let value = write
+            .execute(json!({
+                "file_path": path.to_str().unwrap(),
+                "content": "overwritten",
+                "_session_key": "s1",
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(value["kind"], "must_read_before_write");
+        // File must be unchanged.
+        let contents = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(contents, "original");
+    }
+
+    #[tokio::test]
+    async fn must_read_before_write_allows_after_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok.txt");
+        tokio::fs::write(&path, "original").await.unwrap();
+
+        let state = new_fs_state(true);
+        let registry = build_registry_with_state(state);
+
+        // Read first, same session_key.
+        let read = registry.get("Read").unwrap();
+        let r = read
+            .execute(json!({
+                "file_path": path.to_str().unwrap(),
+                "_session_key": "s1",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(r["kind"], "text");
+
+        // Now Write succeeds.
+        let write = registry.get("Write").unwrap();
+        let w = write
+            .execute(json!({
+                "file_path": path.to_str().unwrap(),
+                "content": "overwritten",
+                "_session_key": "s1",
+            }))
+            .await
+            .unwrap();
+        assert_eq!(w["bytes_written"], 11);
+    }
+
+    #[tokio::test]
+    async fn must_read_before_write_allows_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+
+        let state = new_fs_state(true);
+        let registry = build_registry_with_state(state);
+
+        let write = registry.get("Write").unwrap();
+        let value = write
+            .execute(json!({
+                "file_path": path.to_str().unwrap(),
+                "content": "hello",
+                "_session_key": "s1",
+            }))
+            .await
+            .unwrap();
+        // New file bypasses the check — nothing to have read yet.
+        assert_eq!(value["bytes_written"], 5);
+    }
+
+    #[tokio::test]
+    async fn re_read_loop_detection_fires_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot.txt");
+        tokio::fs::write(&path, "content").await.unwrap();
+
+        let state = new_fs_state(false);
+        let registry = build_registry_with_state(state);
+        let read = registry.get("Read").unwrap();
+
+        for _ in 0..2 {
+            let v = read
+                .execute(json!({
+                    "file_path": path.to_str().unwrap(),
+                    "_session_key": "s1",
+                }))
+                .await
+                .unwrap();
+            assert!(v.get("loop_warning").is_none(), "warning too early: {v:?}");
+        }
+
+        let third = read
+            .execute(json!({
+                "file_path": path.to_str().unwrap(),
+                "_session_key": "s1",
+            }))
+            .await
+            .unwrap();
+        assert!(
+            third.get("loop_warning").is_some(),
+            "warning missing: {third:?}"
+        );
     }
 
     #[tokio::test]

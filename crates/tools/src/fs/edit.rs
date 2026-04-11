@@ -19,7 +19,10 @@ use moltis_metrics::{counter, labels, tools as tools_metrics};
 use crate::{
     Result,
     error::Error,
-    fs::shared::{canonicalize_existing, ensure_regular_file, reject_if_symlink},
+    fs::shared::{
+        FsState, canonicalize_existing, enforce_must_read_before_write, ensure_regular_file,
+        note_fs_mutation, reject_if_symlink, session_key_from,
+    },
 };
 
 /// Outcome of a successful [`apply_edit`] call.
@@ -123,12 +126,21 @@ fn finish_edit(
 
 /// Native `Edit` tool implementation.
 #[derive(Default)]
-pub struct EditTool;
+pub struct EditTool {
+    fs_state: Option<FsState>,
+}
 
 impl EditTool {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Attach shared [`FsState`] for must-read-before-write enforcement.
+    #[must_use]
+    pub fn with_fs_state(mut self, state: FsState) -> Self {
+        self.fs_state = Some(state);
+        self
     }
 
     #[instrument(skip(self, old_string, new_string), fields(file_path = %file_path, replace_all))]
@@ -138,10 +150,22 @@ impl EditTool {
         old_string: &str,
         new_string: &str,
         replace_all: bool,
+        session_key: &str,
     ) -> Result<Value> {
         reject_if_symlink(file_path).await?;
         let canonical = canonicalize_existing(file_path).await?;
         ensure_regular_file(&canonical).await?;
+
+        let canonical_str = canonical
+            .to_str()
+            .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?
+            .to_string();
+
+        if let Some(payload) =
+            enforce_must_read_before_write(self.fs_state.as_ref(), session_key, &canonical_str)
+        {
+            return Ok(payload);
+        }
 
         let content = tokio::fs::read_to_string(&canonical)
             .await
@@ -150,6 +174,8 @@ impl EditTool {
         let outcome = apply_edit(&content, old_string, new_string, replace_all)?;
 
         persist_atomic(&canonical, &outcome.content).await?;
+
+        note_fs_mutation(self.fs_state.as_ref(), session_key, &canonical_str);
 
         #[cfg(feature = "metrics")]
         counter!(
@@ -254,9 +280,10 @@ impl AgentTool for EditTool {
             .get("replace_all")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let session_key = session_key_from(&params).to_string();
 
         match self
-            .edit_impl(file_path, old_string, new_string, replace_all)
+            .edit_impl(file_path, old_string, new_string, replace_all, &session_key)
             .await
         {
             Ok(value) => Ok(value),

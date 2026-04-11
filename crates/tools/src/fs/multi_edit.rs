@@ -20,22 +20,39 @@ use crate::{
     error::Error,
     fs::{
         edit::{apply_edit, persist_atomic},
-        shared::{canonicalize_existing, ensure_regular_file, reject_if_symlink},
+        shared::{
+            FsState, canonicalize_existing, enforce_must_read_before_write, ensure_regular_file,
+            note_fs_mutation, reject_if_symlink, session_key_from,
+        },
     },
 };
 
 /// Native `MultiEdit` tool implementation.
 #[derive(Default)]
-pub struct MultiEditTool;
+pub struct MultiEditTool {
+    fs_state: Option<FsState>,
+}
 
 impl MultiEditTool {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Attach shared [`FsState`] for must-read-before-write enforcement.
+    #[must_use]
+    pub fn with_fs_state(mut self, state: FsState) -> Self {
+        self.fs_state = Some(state);
+        self
     }
 
     #[instrument(skip(self, edits), fields(file_path = %file_path, edit_count = edits.len()))]
-    async fn multi_edit_impl(&self, file_path: &str, edits: Vec<ParsedEdit>) -> Result<Value> {
+    async fn multi_edit_impl(
+        &self,
+        file_path: &str,
+        edits: Vec<ParsedEdit>,
+        session_key: &str,
+    ) -> Result<Value> {
         if edits.is_empty() {
             return Err(Error::message("'edits' must contain at least one edit"));
         }
@@ -43,6 +60,17 @@ impl MultiEditTool {
         reject_if_symlink(file_path).await?;
         let canonical = canonicalize_existing(file_path).await?;
         ensure_regular_file(&canonical).await?;
+
+        let canonical_str = canonical
+            .to_str()
+            .ok_or_else(|| Error::message("file_path contains invalid UTF-8"))?
+            .to_string();
+
+        if let Some(payload) =
+            enforce_must_read_before_write(self.fs_state.as_ref(), session_key, &canonical_str)
+        {
+            return Ok(payload);
+        }
 
         let original = tokio::fs::read_to_string(&canonical)
             .await
@@ -68,6 +96,8 @@ impl MultiEditTool {
         }
 
         persist_atomic(&canonical, &buffer).await?;
+
+        note_fs_mutation(self.fs_state.as_ref(), session_key, &canonical_str);
 
         #[cfg(feature = "metrics")]
         counter!(
@@ -171,8 +201,9 @@ impl AgentTool for MultiEditTool {
             .get("edits")
             .ok_or_else(|| Error::message("missing 'edits' parameter"))?;
         let edits = parse_edits(edits_raw)?;
+        let session_key = session_key_from(&params).to_string();
 
-        match self.multi_edit_impl(file_path, edits).await {
+        match self.multi_edit_impl(file_path, edits, &session_key).await {
             Ok(value) => Ok(value),
             Err(e) => {
                 #[cfg(feature = "metrics")]

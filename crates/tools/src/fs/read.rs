@@ -20,23 +20,43 @@ use crate::{
     Result,
     error::Error,
     fs::shared::{
-        DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, format_numbered_lines,
-        fs_error_payload, io_error_to_typed_payload, looks_binary, require_absolute,
+        DEFAULT_MAX_READ_BYTES, DEFAULT_READ_LINE_LIMIT, FsErrorKind, FsState, READ_LOOP_THRESHOLD,
+        format_numbered_lines, fs_error_payload, io_error_to_typed_payload, looks_binary,
+        require_absolute, session_key_from,
     },
 };
 
 /// Native `Read` tool implementation.
 #[derive(Default)]
-pub struct ReadTool;
+pub struct ReadTool {
+    fs_state: Option<FsState>,
+}
 
 impl ReadTool {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Attach a shared [`FsState`] for per-session read tracking and
+    /// re-read loop detection. When set, each successful Read records the
+    /// file and, if the same `(path, offset, limit)` repeats beyond
+    /// [`READ_LOOP_THRESHOLD`] times without an intervening mutation, the
+    /// response payload gains a `loop_warning` field.
+    #[must_use]
+    pub fn with_fs_state(mut self, state: FsState) -> Self {
+        self.fs_state = Some(state);
+        self
     }
 
     #[instrument(skip(self), fields(file_path = %file_path))]
-    async fn read_impl(&self, file_path: &str, offset: usize, limit: usize) -> Result<Value> {
+    async fn read_impl(
+        &self,
+        file_path: &str,
+        offset: usize,
+        limit: usize,
+        session_key: &str,
+    ) -> Result<Value> {
         require_absolute(file_path, "file_path")?;
 
         // Stat first so we can surface not_found / permission_denied as
@@ -120,7 +140,7 @@ impl ReadTool {
         )
         .increment(1);
 
-        Ok(json!({
+        let mut payload = json!({
             "kind": "text",
             "file_path": file_path,
             "content": rendered.text,
@@ -128,7 +148,39 @@ impl ReadTool {
             "start_line": rendered.start_line,
             "rendered_lines": rendered.rendered_lines,
             "truncated": rendered.truncated,
-        }))
+        });
+
+        // Record in the shared tracker if one is configured. Emit a
+        // `loop_warning` when the LLM is re-reading the same slice after
+        // context compression without doing any intervening work.
+        //
+        // Canonicalize first so Write/Edit's subsequent `has_been_read`
+        // check (which also canonicalizes) compares against the same
+        // resolved path. On macOS `/tmp` is a symlink to `/private/tmp`,
+        // so raw vs canonical disagree.
+        if let Some(ref state) = self.fs_state {
+            let canonical_path = fs::canonicalize(file_path)
+                .await
+                .unwrap_or_else(|_| std::path::PathBuf::from(file_path));
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let consecutive = guard.record_read(session_key, canonical_path, offset, limit);
+            if consecutive >= READ_LOOP_THRESHOLD
+                && let Some(obj) = payload.as_object_mut()
+            {
+                obj.insert(
+                    "loop_warning".into(),
+                    json!(format!(
+                        "This exact read (file_path={file_path}, offset={offset}, limit={limit}) \
+                         has been repeated {consecutive} times with no intervening edit. The \
+                         file hasn't changed — stop re-reading it and make progress on the task."
+                    )),
+                );
+            }
+        }
+
+        Ok(payload)
     }
 }
 
@@ -186,8 +238,9 @@ impl AgentTool for ReadTool {
             .map(|v| v as usize)
             .unwrap_or(DEFAULT_READ_LINE_LIMIT)
             .max(1);
+        let session_key = session_key_from(&params).to_string();
 
-        match self.read_impl(file_path, offset, limit).await {
+        match self.read_impl(file_path, offset, limit, &session_key).await {
             Ok(value) => Ok(value),
             Err(e) => {
                 #[cfg(feature = "metrics")]
