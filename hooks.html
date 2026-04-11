@@ -218,17 +218,23 @@
 <tr><td><code>AfterLLMCall</code></td><td>After LLM response, before tool execution</td><td>yes</td><td>yes</td></tr>
 <tr><td><code>BeforeToolCall</code></td><td>Before a tool executes</td><td>yes</td><td>yes</td></tr>
 <tr><td><code>BeforeCompaction</code></td><td>Before context compaction</td><td>yes</td><td>yes</td></tr>
+<tr><td><code>MessageReceived</code></td><td>When an inbound channel/UI message arrives</td><td>yes</td><td>yes</td></tr>
 <tr><td><code>MessageSending</code></td><td>Before sending a response</td><td>yes</td><td>yes</td></tr>
 <tr><td><code>ToolResultPersist</code></td><td>When a tool result is persisted</td><td>yes</td><td>yes</td></tr>
 </tbody></table>
 </div>
+<p>For <code>MessageReceived</code>, <code>Block(reason)</code> aborts the turn — the user message is
+not persisted, no run starts, and the reason is delivered back to the sender
+via the originating channel (or broadcast as a <code>chat</code> rejection event for web
+clients). <code>ModifyPayload</code> must return an object of shape <code>{"content": "..."}</code>;
+the <code>content</code> string replaces the inbound text before it reaches the model or
+the session store.</p>
 <h3 id="read-only-events-parallel"><a class="header" href="#read-only-events-parallel">Read-Only Events (Parallel)</a></h3>
 <p>These events run hooks in parallel for performance. They cannot modify or block.</p>
 <div class="table-wrapper"><table><thead><tr><th>Event</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>AfterToolCall</code></td><td>After a tool completes</td></tr>
 <tr><td><code>AfterCompaction</code></td><td>After context is compacted</td></tr>
 <tr><td><code>AgentEnd</code></td><td>When agent loop completes</td></tr>
-<tr><td><code>MessageReceived</code></td><td>When a user message arrives</td></tr>
 <tr><td><code>MessageSent</code></td><td>After response is delivered</td></tr>
 <tr><td><code>SessionStart</code></td><td>When a new session begins</td></tr>
 <tr><td><code>SessionEnd</code></td><td>When a session ends</td></tr>
@@ -446,7 +452,7 @@ env = ["SLACK_WEBHOOK_URL"]    # Required environment variables
 <h2 id="circuit-breaker"><a class="header" href="#circuit-breaker">Circuit Breaker</a></h2>
 <p>Hooks that fail repeatedly are automatically disabled:</p>
 <ul>
-<li><strong>Threshold</strong>: 5 consecutive failures</li>
+<li><strong>Threshold</strong>: 3 consecutive failures</li>
 <li><strong>Cooldown</strong>: 60 seconds</li>
 <li><strong>Recovery</strong>: Auto-re-enabled after cooldown</li>
 </ul>
