@@ -4516,7 +4516,7 @@ impl ChatService for LiveChatService {
         let compacted_msg = PersistedMessage::User {
             content: MessageContent::Text(format!(
                 "[Conversation Summary]\n\n{}",
-                compaction::get_compact_continuation_message(&summary, true)
+                compaction::get_compact_continuation_message(&summary, false)
             )),
             created_at: Some(now_ms()),
             audio: None,
@@ -7031,7 +7031,7 @@ async fn compact_session(store: &Arc<SessionStore>, session_key: &str) -> error:
     let compacted_msg = PersistedMessage::User {
         content: MessageContent::Text(format!(
             "[Conversation Summary]\n\n{}",
-            compaction::get_compact_continuation_message(&summary, true)
+            compaction::get_compact_continuation_message(&summary, false)
         )),
         created_at: Some(now_ms()),
         audio: None,
