@@ -16,7 +16,9 @@ async-trait           = { workspace = true }
 base64                = { workspace = true }
 bytes                 = { workspace = true }
 futures               = { workspace = true }
+globset               = { workspace = true }
 html2text             = { workspace = true }
+ignore                = { workspace = true }
 image                 = { workspace = true }
 ipnet                 = { workspace = true }
 moltis-agents         = { workspace = true }
@@ -38,6 +40,7 @@ serde_json            = { workspace = true }
 sha2                  = { workspace = true }
 shell-words           = { optional = true, workspace = true }
 sqlx                  = { workspace = true }
+tempfile              = { workspace = true }
 thiserror             = { workspace = true }
 time                  = { workspace = true }
 tokio                 = { workspace = true }
@@ -50,7 +53,6 @@ wasmtime-wasi         = { optional = true, workspace = true }
 [dev-dependencies]
 mockito      = { workspace = true }
 rstest       = { workspace = true }
-tempfile     = { workspace = true }
 tokio        = { features = ["macros", "rt-multi-thread"], workspace = true }
 tokio-stream = { workspace = true }
 

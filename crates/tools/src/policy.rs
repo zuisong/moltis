@@ -31,7 +31,18 @@ pub fn profile_tools(profile: &str) -> ToolPolicy {
             deny: Vec::new(),
         },
         "coding" => ToolPolicy {
-            allow: vec!["exec".into(), "browser".into(), "memory".into()],
+            allow: vec![
+                "exec".into(),
+                "browser".into(),
+                "memory".into(),
+                // Native filesystem tools (moltis-org/moltis#657).
+                "Read".into(),
+                "Write".into(),
+                "Edit".into(),
+                "MultiEdit".into(),
+                "Glob".into(),
+                "Grep".into(),
+            ],
             deny: Vec::new(),
         },
         "full" => ToolPolicy {
