@@ -7153,6 +7153,249 @@ checkpoint.</p>
 <li>Checkpoints are internal safety artifacts, they do not touch the user’s git
 history.</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="compaction"><a class="header" href="#compaction">Compaction</a></h1>
+<p>When a chat session fills up the model’s context window, Moltis compacts the
+conversation so the agent can keep working. Compaction replaces (or rewrites)
+older messages with a summary so the retry fits inside the context budget.</p>
+<p>The <strong>compaction mode</strong> you choose controls the cost/fidelity trade-off:
+faster and free, or slower and higher quality. Moltis supports four modes
+out of the box.</p>
+<h2 id="why-compaction-matters"><a class="header" href="#why-compaction-matters">Why compaction matters</a></h2>
+<p>A long coding session can produce thousands of messages, tool calls, and
+tool results. Every turn has to re-send the full history, so eventually you
+hit the context window limit and the provider rejects the request. Without
+compaction the session is dead — you lose the thread of work. With
+compaction the agent keeps going.</p>
+<p>The trade-off: any compaction strategy loses <em>some</em> information. The
+different modes choose different things to preserve.</p>
+<h2 id="the-four-modes"><a class="header" href="#the-four-modes">The four modes</a></h2>
+<h3 id="deterministic-default"><a class="header" href="#deterministic-default"><code>deterministic</code> (default)</a></h3>
+<p><strong>Zero LLM calls, instant, offline.</strong> Inspects the message history directly
+and builds a structured summary: message counts, tool names, file-path
+mentions, recent user requests, keyword-matched pending work, and a
+head-3 + tail-5 timeline. Replaces the entire history with that one summary
+as a single user message.</p>
+<p><strong>Strengths</strong></p>
+<ul>
+<li>Free (no tokens, no network).</li>
+<li>Deterministic output — two runs on the same history produce the same
+summary, so debugging and testing is easy.</li>
+<li>Works offline and on air-gapped deployments.</li>
+<li>Zero prompt-injection surface (the LLM never sees the raw history).</li>
+</ul>
+<p><strong>Weaknesses</strong></p>
+<ul>
+<li>Can’t preserve decisions or reasoning chains — it’s a navigation index,
+not a narrative.</li>
+<li>“Pending work” relies on keyword matches (<code>todo</code>, <code>next</code>, <code>pending</code>…)
+which miss naturally-phrased follow-ups.</li>
+<li>Middle history is dropped entirely; only the head and tail show up in the
+timeline preview.</li>
+<li>Tail context is not preserved verbatim, so the LLM retry doesn’t see the
+most-recent turns word-for-word.</li>
+</ul>
+<p><strong>Pick this when</strong> the session is a short chat channel, you’re cost-sensitive,
+or you’re running without network access. This is the default so new
+installs don’t silently spend tokens on compaction.</p>
+<h3 id="recency_preserving"><a class="header" href="#recency_preserving"><code>recency_preserving</code></a></h3>
+<p><strong>Zero LLM calls, higher fidelity.</strong> Keeps the first few messages (system
+prompt + first exchange) and the most recent ~20 % of the context window
+verbatim. The middle region is collapsed into a short marker message
+(<code>"N earlier messages were elided… Recent messages are preserved verbatim below."</code>) and any bulky tool-result content in the retained slice is
+replaced with a placeholder so a single multi-KB tool output can’t blow
+through the context window on its own.</p>
+<p><strong>Strengths</strong></p>
+<ul>
+<li>No LLM cost, still offline-safe.</li>
+<li>Tail context is preserved verbatim, so the retry sees the most-recent
+turns exactly as they happened.</li>
+<li>Keeps reasoning chains from the middle that don’t depend on tool output.</li>
+<li>Repairs orphaned tool-call / tool-result pairs so strict providers
+(Anthropic, OpenAI strict mode) don’t reject the retry.</li>
+</ul>
+<p><strong>Weaknesses</strong></p>
+<ul>
+<li>Cannot merge redundant discussions (same topic raised five times
+survives five times).</li>
+<li>No semantic understanding of what’s important.</li>
+</ul>
+<p><strong>Pick this when</strong> you want a significant quality boost over <code>deterministic</code>
+without paying any tokens — the best free option for most agentic coding
+sessions.</p>
+<h3 id="structured"><a class="header" href="#structured"><code>structured</code></a></h3>
+<p><strong>Head + LLM structured summary + tail.</strong> The highest-fidelity mode. Same
+head and tail boundary logic as <code>recency_preserving</code>, but the middle is
+summarised with a single LLM call using a structured template:</p>
+<pre><code>## Goal
+## Constraints &amp; Preferences
+## Progress
+### Done / ### In Progress / ### Blocked
+## Key Decisions
+## Relevant Files
+## Next Steps
+## Critical Context
+</code></pre>
+<p>This is the same convention used by <code>hermes-agent</code>’s <code>ContextCompressor</code>
+and <code>openclaw</code>’s compaction safeguard. Iterative re-compaction preserves
+and updates prior summary sections (work moves from <em>In Progress</em> to
+<em>Done</em> as it completes).</p>
+<p><strong>Strengths</strong></p>
+<ul>
+<li>Highest fidelity — preserves reasoning, decisions, and cross-session
+context.</li>
+<li>Supports a cheap auxiliary summary model via <code>summary_model</code>, so you can
+run a big frontier model for coding and a small fast model for
+compaction.</li>
+<li>Automatic fallback to <code>recency_preserving</code> on LLM failure, so compaction
+never silently drops information.</li>
+</ul>
+<p><strong>Weaknesses</strong></p>
+<ul>
+<li>Costs a summary LLM call per compaction.</li>
+<li>Quality depends on the summary model’s instruction-following.</li>
+</ul>
+<p><strong>Pick this when</strong> session quality matters more than per-compaction cost —
+e.g. long agentic coding sessions where losing a decision would mean
+re-doing hours of work.</p>
+<h3 id="llm_replace"><a class="header" href="#llm_replace"><code>llm_replace</code></a></h3>
+<p><strong>Replace entire history with a single LLM-generated summary.</strong> The
+pre-PR-#653 behaviour: stream a plain-text summary from the session’s
+provider, replace the history with one user message containing the
+summary. No head/tail preservation.</p>
+<p><strong>Strengths</strong></p>
+<ul>
+<li>Maximum token reduction — the retry sees one message, period.</li>
+<li>Works with any provider that supports streaming.</li>
+</ul>
+<p><strong>Weaknesses</strong></p>
+<ul>
+<li>Loses recent turns verbatim (strictly worse than <code>structured</code> for the
+same cost).</li>
+<li>No structured template, so summary quality varies with the model.</li>
+<li>No automatic fallback — an LLM failure aborts compaction.</li>
+</ul>
+<p><strong>Pick this when</strong> you need the smallest possible post-compaction history
+and <code>structured</code> isn’t available yet (or you explicitly want the old
+behaviour).</p>
+<h2 id="comparison-at-a-glance"><a class="header" href="#comparison-at-a-glance">Comparison at a glance</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Feature</th><th><code>deterministic</code></th><th><code>recency_preserving</code></th><th><code>structured</code></th><th><code>llm_replace</code></th></tr></thead><tbody>
+<tr><td>LLM calls</td><td>0</td><td>0</td><td>1</td><td>1</td></tr>
+<tr><td>Token cost</td><td>none</td><td>none</td><td>medium</td><td>medium</td></tr>
+<tr><td>Latency</td><td>~0 ms</td><td>~0 ms</td><td>1–10 s</td><td>1–10 s</td></tr>
+<tr><td>Head preserved verbatim</td><td>✗</td><td>✓</td><td>✓</td><td>✗</td></tr>
+<tr><td>Tail preserved verbatim</td><td>✗</td><td>✓ (token-budget)</td><td>✓ (token-budget)</td><td>✗</td></tr>
+<tr><td>Middle strategy</td><td>drop</td><td>prune tool output</td><td>LLM summary</td><td>drop</td></tr>
+<tr><td>Decisions / rationale</td><td>✗</td><td>partial</td><td>✓</td><td>partial</td></tr>
+<tr><td>Iterative re-compaction</td><td>merge</td><td>N/A</td><td>template update</td><td>re-summarise</td></tr>
+<tr><td>Tool-pair integrity</td><td>N/A</td><td>✓</td><td>✓</td><td>N/A</td></tr>
+<tr><td>Fallback on LLM failure</td><td>N/A</td><td>N/A</td><td>→ <code>recency_preserving</code></td><td>abort</td></tr>
+<tr><td>Works offline</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td></tr>
+<tr><td>Deterministic</td><td>✓</td><td>✓</td><td>✗</td><td>✗</td></tr>
+<tr><td>Status</td><td>shipped</td><td>shipped</td><td>shipped</td><td>shipped</td></tr>
+</tbody></table>
+</div>
+<h2 id="configuration-17"><a class="header" href="#configuration-17">Configuration</a></h2>
+<p>All compaction settings live under <code>[chat.compaction]</code> in <code>moltis.toml</code>:</p>
+<pre><code class="language-toml">[chat.compaction]
+mode = "deterministic"              # "deterministic" | "recency_preserving" | "structured" | "llm_replace"
+threshold_percent = 0.95            # Auto-compact trigger AND tail-budget multiplier. See below.
+protect_head = 3                    # Head messages kept verbatim (recency/structured).
+protect_tail_min = 20               # Minimum tail messages kept verbatim (recency/structured).
+tail_budget_ratio = 0.20            # Tail size as fraction of threshold_percent × context_window.
+tool_prune_char_threshold = 200     # Middle tool results longer than this get placeholder-replaced.
+summary_model = "openrouter/google/gemini-2.5-flash"   # RESERVED — see note below.
+max_summary_tokens = 4096           # RESERVED — see note below.
+show_settings_hint = true           # Show "Change chat.compaction.mode in moltis.toml…" footer.
+</code></pre>
+<h3 id="hiding-the-settings-hint"><a class="header" href="#hiding-the-settings-hint">Hiding the settings hint</a></h3>
+<p>By default, every compaction notice (web UI compact card and channel
+messages) includes a short footer pointing at the config key:</p>
+<blockquote>
+<p><em>Change <code>chat.compaction.mode</code> in <code>moltis.toml</code> (or the web UI settings
+panel) to pick a different compaction strategy.</em></p>
+</blockquote>
+<p>Once you know the setting exists, this becomes noise. Set:</p>
+<pre><code class="language-toml">[chat.compaction]
+show_settings_hint = false
+</code></pre>
+<p>The mode and token counts still ship with every compaction notice — only
+the footer is stripped.</p>
+<p>All fields are optional. When a field is omitted the default shown above is
+used. <code>deterministic</code> mode ignores every field except <code>mode</code> and
+<code>threshold_percent</code>.</p>
+<h3 id="picking-a-threshold"><a class="header" href="#picking-a-threshold">Picking a threshold</a></h3>
+<p><code>threshold_percent</code> serves two related purposes:</p>
+<ol>
+<li><strong>Auto-compact trigger.</strong> When the estimated next request would
+exceed <code>threshold_percent × context_window</code> tokens, <code>send()</code> fires a
+compaction pre-emptively. On a 200 K model with the default <code>0.95</code>,
+compaction starts when the session reaches 190 K tokens. (The
+default matches the pre-PR-#653 hardcoded trigger so upgrades are
+behaviour-neutral.)</li>
+<li><strong>Tail-budget multiplier.</strong> For <code>recency_preserving</code> and <code>structured</code>
+modes, the size of the verbatim tail is
+<code>threshold_percent × tail_budget_ratio × context_window</code>. With the
+defaults that’s 200 K × 0.95 × 0.20 = 38 K tokens of tail preserved.</li>
+</ol>
+<p>Both uses move together: lowering <code>threshold_percent</code> compacts earlier
+<strong>and</strong> shrinks the preserved tail, which is usually what you want on a
+tight context window.</p>
+<ul>
+<li>Lower values (≈ 0.5) compact more aggressively and leave more headroom for
+a new burst of tool calls.</li>
+<li>Higher values (≈ 0.9) delay compaction as long as possible but risk
+blowing through the window on a single large tool result. The config
+validator clamps the effective value to <code>0.95</code> as an upper bound so
+auto-compact can’t be accidentally disabled.</li>
+</ul>
+<p>Manual <code>chat.compact</code> RPC calls ignore <code>threshold_percent</code> for the
+trigger check and compact whatever’s there, but still use it for the
+tail-budget math inside recency-preserving and structured modes.</p>
+<h3 id="picking-a-summary-model"><a class="header" href="#picking-a-summary-model">Picking a summary model</a></h3>
+<blockquote>
+<p>⚠️ <strong><code>summary_model</code> / <code>max_summary_tokens</code> are reserved for a
+follow-up</strong> — beads issue <strong>moltis-8me</strong>. They’re present in the
+config schema so you can start setting them today, but the
+<code>structured</code> and <code>llm_replace</code> strategies currently <strong>ignore</strong> them
+and always use the session’s primary provider. Setting either field
+to a non-default value triggers a one-shot runtime WARN that names
+the fields and the tracking issue so you’re not billed for the wrong
+model without warning.</p>
+</blockquote>
+<p>When the auxiliary-model subsystem lands, <code>summary_model</code> will take
+a provider-qualified model identifier understood by the provider
+registry (e.g. <code>"openrouter/google/gemini-2.5-flash"</code>,
+<code>"anthropic/claude-3-5-haiku-20241022"</code>). Leave it unset to reuse the
+session’s primary model.</p>
+<p>Small fast models are usually the right choice for compaction: they’re
+cheap, respond in seconds, and are good at instruction-following on a
+structured template. Reserve the frontier model for the actual coding work.</p>
+<h2 id="migration-notes"><a class="header" href="#migration-notes">Migration notes</a></h2>
+<p>Upgrading from a pre-PR-#653 install? The default changed from implicit
+LLM compaction to <code>deterministic</code>. If you want the old behaviour back,
+set:</p>
+<pre><code class="language-toml">[chat.compaction]
+mode = "llm_replace"
+</code></pre>
+<p>No other changes needed — <code>llm_replace</code> uses the session’s primary model
+just like the pre-PR behaviour did.</p>
+<h2 id="tracking-issues"><a class="header" href="#tracking-issues">Tracking issues</a></h2>
+<ul>
+<li>Epic: <strong>moltis-dxw</strong> — pluggable compaction modes</li>
+<li><strong>moltis-g37</strong> — config scaffolding, docs, <code>llm_replace</code> mode ✓</li>
+<li><strong>moltis-h0c</strong> — <code>recency_preserving</code> mode ✓</li>
+<li><strong>moltis-aff</strong> — <code>structured</code> mode ✓</li>
+<li><strong>moltis-8me</strong> — auxiliary-model subsystem for cheap summary models <em>(follow-up, lets users route compaction to a cheap auxiliary model instead of the session’s primary model)</em></li>
+</ul>
+<h2 id="further-reading"><a class="header" href="#further-reading">Further reading</a></h2>
+<ul>
+<li><code>hermes-agent/agent/context_compressor.py</code> — reference implementation of
+the head + LLM summary + tail strategy that inspired <code>structured</code> mode.</li>
+<li><code>openclaw/src/agents/compaction.ts</code> + <code>pi-hooks/compaction-safeguard.ts</code>
+— LLM compaction with quality auditing and tool-pair repair.</li>
+<li><code>crates/chat/src/compaction.rs</code> — current <code>deterministic</code> mode
+implementation.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="scheduling-cron-jobs"><a class="header" href="#scheduling-cron-jobs">Scheduling (Cron Jobs)</a></h1>
 <p>Moltis includes a built-in cron system that lets the agent schedule and manage
 recurring tasks. Jobs can fire agent turns, send system events, or trigger
@@ -7924,7 +8167,7 @@ any supplementary files written alongside <code>SKILL.md</code>.</p>
 }
 </code></pre>
 <p>Clicking a notification will open or focus the app and navigate to the relevant chat.</p>
-<h2 id="configuration-17"><a class="header" href="#configuration-17">Configuration</a></h2>
+<h2 id="configuration-18"><a class="header" href="#configuration-18">Configuration</a></h2>
 <h3 id="feature-flag-3"><a class="header" href="#feature-flag-3">Feature Flag</a></h3>
 <p>Push notifications are controlled by the <code>push-notifications</code> feature flag, which is enabled by default. To disable:</p>
 <pre><code class="language-toml"># In your Cargo.toml or when building
@@ -11436,7 +11679,7 @@ pub mod my_feature {
 
 counter!(my_feature::OPERATIONS_TOTAL).increment(1);
 <span class="boring">}</span></code></pre></pre>
-<h2 id="configuration-18"><a class="header" href="#configuration-18">Configuration</a></h2>
+<h2 id="configuration-19"><a class="header" href="#configuration-19">Configuration</a></h2>
 <p>Metrics configuration in <code>moltis.toml</code>:</p>
 <pre><code class="language-toml">[metrics]
 enabled = true              # Enable metrics collection (default: true)
@@ -11535,7 +11778,7 @@ tools grouped by origin.</p>
 With many MCP servers this can burn 15,000+ tokens per turn. <strong>Lazy mode</strong>
 replaces all tool schemas with a single <code>tool_search</code> meta-tool that the model
 uses to discover and activate tools on demand.</p>
-<h3 id="configuration-19"><a class="header" href="#configuration-19">Configuration</a></h3>
+<h3 id="configuration-20"><a class="header" href="#configuration-20">Configuration</a></h3>
 <pre><code class="language-toml">[tools]
 registry_mode = "lazy"   # default: "full"
 </code></pre>
