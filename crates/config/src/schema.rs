@@ -1540,12 +1540,48 @@ pub const KNOWN_CHANNEL_TYPES: &[&str] = &[
     "telegram", "whatsapp", "msteams", "discord", "slack", "matrix",
 ];
 
+/// Per-chat-type tool policy for a channel account.
+///
+/// Keyed by chat type (e.g. `"private"`, `"group"`, `"channel"`).
+/// Each entry can have an allow/deny policy and per-sender overrides.
+///
+/// Example TOML:
+/// ```toml
+/// [channels.telegram.my-bot.tools.groups.group]
+/// deny = ["exec"]
+///
+/// [channels.telegram.my-bot.tools.groups.group.by_sender]
+/// "123456" = { allow = ["*"], deny = [] }
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupToolPolicy {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Per-sender overrides within this group, keyed by sender/peer ID.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub by_sender: HashMap<String, ToolPolicyConfig>,
+}
+
+/// Tool policy overrides for a channel account.
+///
+/// Lives at `channels.<type>.<account_id>.tools` in the config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelToolPolicyOverride {
+    /// Per-chat-type policies, keyed by chat type (`"private"`, `"group"`, etc.).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub groups: HashMap<String, GroupToolPolicy>,
+}
+
 /// Channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelsConfig {
     /// Which channel types are offered in the web UI (onboarding + channels page).
-    /// Defaults to `["telegram", "msteams", "discord", "slack", "matrix"]`. Add `"whatsapp"` to opt in.
+    /// Defaults to `["telegram", "msteams", "discord", "slack", "matrix", "nostr"]`. Add `"whatsapp"` to opt in.
     #[serde(
         default = "default_channels_offered",
         skip_serializing_if = "Vec::is_empty"
@@ -1566,6 +1602,9 @@ pub struct ChannelsConfig {
     /// Slack bot accounts, keyed by account ID.
     #[serde(default)]
     pub slack: HashMap<String, serde_json::Value>,
+    /// Nostr DM accounts, keyed by account ID.
+    #[serde(default)]
+    pub nostr: HashMap<String, serde_json::Value>,
     /// Additional channel types not covered by the named fields above.
     ///
     /// This allows new channel plugins to be configured without changing
@@ -1579,13 +1618,14 @@ impl ChannelsConfig {
     ///
     /// This is the single source of truth for the set of named channel types.
     /// Keep in sync with the struct fields.
-    fn named_fields(&self) -> [(&str, &HashMap<String, serde_json::Value>); 5] {
+    fn named_fields(&self) -> [(&str, &HashMap<String, serde_json::Value>); 6] {
         [
             ("telegram", &self.telegram),
             ("whatsapp", &self.whatsapp),
             ("msteams", &self.msteams),
             ("discord", &self.discord),
             ("slack", &self.slack),
+            ("nostr", &self.nostr),
         ]
     }
 
@@ -1598,6 +1638,25 @@ impl ChannelsConfig {
         }
         v
     }
+
+    /// Extract the `tools` sub-object for a specific channel account.
+    ///
+    /// Channel accounts are stored as `serde_json::Value`, so we deserialize
+    /// just the `tools` key on demand.
+    pub fn tool_policy_for_account(
+        &self,
+        channel_type: &str,
+        account_id: &str,
+    ) -> Option<ChannelToolPolicyOverride> {
+        let accounts = self
+            .all_channel_configs()
+            .into_iter()
+            .find(|(ct, _)| *ct == channel_type)
+            .map(|(_, accounts)| accounts)?;
+        let account_val = accounts.get(account_id)?;
+        let tools_val = account_val.get("tools")?;
+        serde_json::from_value::<ChannelToolPolicyOverride>(tools_val.clone()).ok()
+    }
 }
 
 fn default_channels_offered() -> Vec<String> {
@@ -1607,6 +1666,7 @@ fn default_channels_offered() -> Vec<String> {
         "discord".into(),
         "slack".into(),
         "matrix".into(),
+        "nostr".into(),
     ]
 }
 
@@ -1619,6 +1679,7 @@ impl Default for ChannelsConfig {
             msteams: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
+            nostr: HashMap::new(),
             extra: HashMap::new(),
         }
     }
@@ -2595,6 +2656,10 @@ pub struct SandboxConfig {
     pub wasm_epoch_interval_ms: Option<u64>,
     /// Optional per-tool WASM limits (fuel + memory).
     pub wasm_tool_limits: Option<WasmToolLimitsConfig>,
+    /// Optional tool policy overrides applied when running inside this sandbox.
+    /// Acts as layer 6 in the policy resolution chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_policy: Option<ToolPolicyConfig>,
 }
 
 /// Default packages installed in sandbox containers.
@@ -2793,6 +2858,7 @@ impl Default for SandboxConfig {
             wasm_fuel_limit: None,
             wasm_epoch_interval_ms: None,
             wasm_tool_limits: None,
+            tools_policy: None,
         }
     }
 }
@@ -2984,6 +3050,12 @@ pub struct ProviderEntry {
     /// providers with automatic server-side caching (OpenAI, DeepSeek, Ollama).
     #[serde(default, skip_serializing_if = "is_default_cache_retention")]
     pub cache_retention: CacheRetention,
+
+    /// Tool policy override for this provider. When set, these allow/deny
+    /// rules are merged on top of the global `[tools.policy]` for requests
+    /// routed through this provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<ToolPolicyConfig>,
 }
 
 impl std::fmt::Debug for ProviderEntry {
@@ -2999,6 +3071,7 @@ impl std::fmt::Debug for ProviderEntry {
             .field("alias", &self.alias)
             .field("tool_mode", &self.tool_mode)
             .field("cache_retention", &self.cache_retention)
+            .field("policy", &self.policy)
             .finish()
     }
 }
@@ -3016,6 +3089,7 @@ impl Default for ProviderEntry {
             alias: None,
             tool_mode: ToolMode::Auto,
             cache_retention: CacheRetention::Short,
+            policy: None,
         }
     }
 }
@@ -3497,6 +3571,7 @@ deny = ["exec"]
             "discord".to_string(),
             "slack".to_string(),
             "matrix".to_string(),
+            "nostr".to_string(),
         ]);
     }
 
@@ -3509,6 +3584,7 @@ deny = ["exec"]
             "discord".to_string(),
             "slack".to_string(),
             "matrix".to_string(),
+            "nostr".to_string(),
         ]);
     }
 

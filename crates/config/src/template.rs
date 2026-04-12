@@ -100,6 +100,7 @@ auto_generate = true              # Auto-generate local CA and server certificat
 #   fetch_models - Discover models from provider API when available (default: true)
 #   stream_transport - Streaming transport: "sse", "websocket", or "auto" (default: "sse")
 #   alias     - Custom name for metrics labels (useful for multiple instances)
+#   policy    - Per-provider tool policy override (allow/deny lists)
 
 [providers]
 offered = ["local-llm", "github-copilot", "openai-codex", "openai", "anthropic", "openrouter", "ollama", "moonshot", "minimax", "zai"] # Enabled providers and those shown in onboarding/picker UI ([] = enable/show all)
@@ -119,6 +120,8 @@ offered = ["local-llm", "github-copilot", "openai-codex", "openai", "anthropic",
 # base_url = "https://api.anthropic.com"     # API endpoint
 # alias = "anthropic"                         # Custom name for metrics
 # cache_retention = "short"                    # Prompt caching: "none" | "short" | "long"
+# policy.deny = ["exec"]                       # Deny specific tools when using this provider
+# policy.allow = []                            # Restrict to only these tools (empty = all allowed)
 
 # ── OpenAI ────────────────────────────────────────────────────
 [providers.openai]
@@ -519,13 +522,25 @@ packages = [
 # cpu_quota = 0.5                 # CPU quota as fraction (0.5 = half a core, 2.0 = two cores)
 # pids_max = 100                  # Maximum number of processes
 
+# Tool policy overrides applied when commands run inside the sandbox (layer 6).
+# These narrow the effective policy for sandboxed execution only.
+# [tools.exec.sandbox.tools_policy]
+# allow = ["exec"]                # Only allow exec tool inside sandbox
+# deny = ["browser"]              # Deny browser tool inside sandbox
+
 # ── Tool Policy ───────────────────────────────────────────────────────────────
-# Control which tools the MAIN agent session can use.
+# Control which tools the agent can use. Policies are layered (later wins for
+# allow, deny always accumulates across layers):
 #
-# This is the tool policy for the main session. Preset tool policies under
-# `[agents.presets.*]` apply only to sub-agents spawned via `spawn_agent` and
-# are NOT read by the main session. If you want a deny list to harden the
-# main agent, it must live here.
+#   1. Global        — this section ([tools.policy])
+#   2. Per-provider  — [providers.<name>.policy]
+#   3. Per-agent     — [agents.presets.<id>.tools]
+#   4. Per-channel   — [channels.<type>.<account>.tools.groups.<chat_type>]
+#   5. Per-sender    — [...groups.<chat_type>.by_sender.<sender_id>]
+#   6. Sandbox       — [tools.exec.sandbox.tools_policy] (only when sandboxed)
+#
+# This is the base policy for all sessions. Provider and channel layers
+# narrow it further based on runtime context.
 
 [tools.policy]
 allow = []                        # Tools to always allow (e.g., ["exec", "web_fetch"])
@@ -829,18 +844,24 @@ reset_on_exit = true              # Reset serve/funnel when gateway shuts down
 
 [channels]
 # Which channel types appear in the web UI's "+ Add Channel" menu.
-# Default: ["telegram", "msteams", "discord", "slack", "matrix"]
+# Default: ["telegram", "msteams", "discord", "slack", "matrix", "nostr"]
 # Add "whatsapp" to enable it in the UI.
-# offered = ["telegram", "msteams", "discord", "slack", "matrix", "whatsapp"]
+# offered = ["telegram", "msteams", "discord", "slack", "matrix", "nostr", "whatsapp"]
 
 # WhatsApp linked-device accounts
 # [channels.whatsapp.my-bot]
 # dm_policy = "open"              # "open", "allowlist", or "disabled"
 # group_policy = "disabled"       # "open", "allowlist", or "disabled"
+# mention_mode = "always"         # "always", "mention", or "none"
 # model = "anthropic/claude-sonnet-4-20250514"
 # model_provider = "anthropic"
+# agent_id = "support"            # Default agent for this account
 # otp_self_approval = true        # OTP self-approval for non-allowlisted DM users
 # otp_cooldown_secs = 300         # Cooldown after 3 failed OTP attempts
+# [channels.whatsapp.my-bot.channel_overrides."120363456789@g.us"]
+# agent_id = "triage"
+# [channels.whatsapp.my-bot.user_overrides."15551234567@s.whatsapp.net"]
+# agent_id = "research"
 
 # Telegram bots
 # [channels.telegram.my-bot]
@@ -851,10 +872,23 @@ reset_on_exit = true              # Reset serve/funnel when gateway shuts down
 # allowlist = []                  # Telegram user IDs or usernames (strings)
 # group_allowlist = []            # Telegram group/chat IDs (strings)
 # reply_to_message = false        # Send responses as Telegram replies
+# agent_id = "research"           # Default agent for this bot
 # otp_self_approval = true        # OTP self-approval for non-allowlisted DM users
 # otp_cooldown_secs = 300         # Cooldown after 3 failed OTP attempts
 # stream_mode = "edit_in_place"   # "edit_in_place" or "off"
 # edit_throttle_ms = 300          # Min ms between streaming edits
+# [channels.telegram.my-bot.channel_overrides."-1001234567890"]
+# agent_id = "triage"
+# [channels.telegram.my-bot.user_overrides."123456789"]
+# agent_id = "research"
+#
+# Per-channel tool policy (restrict tools by chat type and sender):
+# [channels.telegram.my-bot.tools.groups.group]
+# deny = ["exec", "browser"]      # Deny dangerous tools in group chats
+# [channels.telegram.my-bot.tools.groups.group.by_sender."123456"]
+# allow = ["*"]                    # Override: trusted sender gets all tools
+# [channels.telegram.my-bot.tools.groups.private]
+# allow = []                       # DMs: allow all tools (default)
 
 # Microsoft Teams bots
 # [channels.msteams.my-bot]
@@ -885,6 +919,7 @@ reset_on_exit = true              # Reset serve/funnel when gateway shuts down
 # mention_mode = "mention"        # "mention", "always", or "none"
 # allowlist = []                  # Discord user IDs allowed to DM
 # guild_allowlist = []            # Discord guild/server IDs (empty = all)
+# agent_id = "research"           # Default agent for this bot
 # reply_to_message = false        # Send responses as Discord replies
 # ack_reaction = "👀"             # Emoji reaction while processing (omit to disable)
 # activity = "with AI"            # Bot activity status text
@@ -938,6 +973,20 @@ reset_on_exit = true              # Reset serve/funnel when gateway shuts down
 # ack_reaction = "👀"             # Emoji reaction while processing (omit to disable)
 # otp_self_approval = true        # OTP self-approval for non-allowlisted DM users
 # otp_cooldown_secs = 300         # Cooldown after 3 failed OTP attempts
+
+# Nostr DM bots (NIP-04 encrypted direct messages)
+# [channels.nostr.my-bot]
+# secret_key = "nsec1..."          # Secret key (nsec1 bech32 or 64-char hex)
+# relays = ["wss://relay.damus.io", "wss://relay.nostr.band", "wss://nos.lol"]
+# dm_policy = "allowlist"          # "open", "allowlist", or "disabled"
+# allowed_pubkeys = []             # Allowed sender public keys (npub1 or hex)
+# model = "anthropic/claude-sonnet-4-20250514"
+# model_provider = "anthropic"
+# otp_self_approval = true         # OTP self-approval for non-allowlisted DM users
+# otp_cooldown_secs = 300          # Cooldown after 3 failed OTP attempts
+# [channels.nostr.my-bot.profile]  # NIP-01 profile metadata (optional)
+# name = "Moltis Bot"
+# about = "AI assistant on Nostr"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HOOKS

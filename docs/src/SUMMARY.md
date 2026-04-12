@@ -37,6 +37,7 @@
   - [Slack](slack.md)
   - [Matrix](matrix.md)
   - [WhatsApp](whatsapp.md)
+  - [Nostr](nostr.md)
 - [Browser Automation](browser-automation.md)
 - [CalDAV (Calendars)](caldav.md)
 - [GraphQL API](graphql.md)
@@ -81,6 +82,7 @@
 - [SQLite Migrations](sqlite-migration.md)
 - [Metrics & Tracing](metrics-and-tracing.md)
 - [Tool Registry](tool-registry.md)
+- [Tool Policy](tool-policy.md)
 - [Agent Presets](agent-presets.md)
 - [Session Tools](session-tools.md)
 

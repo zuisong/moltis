@@ -49,7 +49,7 @@ use {
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
-    moltis_tools::policy::{ToolPolicy, profile_tools},
+    moltis_tools::policy::{PolicyContext, ToolPolicy, resolve_effective_policy},
 };
 
 mod compaction;
@@ -910,6 +910,202 @@ fn capped_tool_result_payload(result: &Value, max_len: usize) -> Value {
     capped
 }
 
+/// Maximum total characters for a compaction summary.
+const SUMMARY_MAX_CHARS: usize = 1_200;
+/// Maximum number of lines in a compaction summary (excluding omission notice).
+const SUMMARY_MAX_LINES: usize = 24;
+/// Maximum characters per line in a compaction summary.
+const SUMMARY_MAX_LINE_CHARS: usize = 160;
+
+/// Compress a compaction summary to fit within budget constraints.
+///
+/// Enforces: max 1,200 chars total, max 24 lines, max 160 chars per line.
+/// Deduplicates lines (case-insensitive), preserves headers and bullets,
+/// and appends an omission notice when lines are dropped.
+#[must_use]
+fn compress_summary(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Step 1: deduplicate lines (case-insensitive, keep first occurrence)
+    // and strip blank lines so they don't consume the 24-line budget.
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let key = line.trim().to_ascii_lowercase();
+        // Drop blank lines — they waste budget without adding content.
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key) {
+            deduped.push(if line.len() <= SUMMARY_MAX_LINE_CHARS {
+                line.to_string()
+            } else {
+                // Step 2: truncate individual lines exceeding 160 chars.
+                line[..line.floor_char_boundary(SUMMARY_MAX_LINE_CHARS)].to_string()
+            });
+        }
+    }
+    drop(seen);
+
+    // Step 3: check if already within budget.
+    let joined = deduped.join("\n");
+    if deduped.len() <= SUMMARY_MAX_LINES && joined.len() <= SUMMARY_MAX_CHARS {
+        return joined;
+    }
+
+    // Step 4: priority-based line dropping.
+    // Headers (starting with #) get highest priority, then bullets (- * •), then rest.
+    fn is_header(line: &str) -> bool {
+        line.trim_start().starts_with('#')
+    }
+    fn is_bullet(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ")
+    }
+
+    let mut headers: Vec<String> = Vec::new();
+    let mut bullet_lines: Vec<String> = Vec::new();
+    let mut other_lines: Vec<String> = Vec::new();
+
+    for line in deduped {
+        if is_header(&line) {
+            headers.push(line);
+        } else if is_bullet(&line) {
+            bullet_lines.push(line);
+        } else {
+            other_lines.push(line);
+        }
+    }
+
+    // Build ordered candidate list: bullets first, then others.
+    // Headers are always kept.
+    let mut candidates: Vec<String> = Vec::new();
+    candidates.extend(bullet_lines);
+    candidates.extend(other_lines);
+
+    let header_count = headers.len();
+
+    // Check if keeping all candidates fits.
+    if header_count + candidates.len() <= SUMMARY_MAX_LINES {
+        let total_len = headers.iter().chain(candidates.iter()).fold(0, |acc, l| {
+            acc + l.len() + 1 // +1 for newline
+        })
+        // fold overcounts by 1 (N newlines vs N-1 for join); subtract to correct.
+        .saturating_sub(1);
+        if total_len <= SUMMARY_MAX_CHARS {
+            let mut result = headers;
+            result.extend(candidates);
+            return result.join("\n");
+        }
+    }
+
+    // Need to drop lines from the end of candidates.
+    // Account for omission notice in budget.
+    fn make_notice(n: usize) -> String {
+        format!("[... {n} lines omitted for brevity]")
+    }
+
+    for drop_count in 1..=candidates.len() {
+        let keep_count = candidates.len() - drop_count;
+        let line_count = header_count + keep_count + 1; // +1 for omission notice
+        if line_count > SUMMARY_MAX_LINES {
+            continue;
+        }
+
+        let notice = make_notice(drop_count);
+        let kept_candidates = &candidates[..keep_count];
+        let total_len = headers
+            .iter()
+            .chain(kept_candidates.iter())
+            .fold(0, |acc, l| acc + l.len() + 1)
+            // fold overcounts by 1 (N newlines vs N-1 for join); subtract to correct.
+            .saturating_sub(1)
+            + notice.len()
+            + 1; // +1 for newline before notice
+
+        if total_len <= SUMMARY_MAX_CHARS {
+            let mut result = headers;
+            result.extend(kept_candidates.iter().cloned());
+            result.push(notice);
+            return result.join("\n");
+        }
+    }
+
+    // Edge case: even dropping all candidates, headers alone are too long.
+    // Force-truncate headers from the end.  Run two passes so the notice
+    // length is exact: first pass counts dropped headers, second pass
+    // builds the result with the correct budget.
+    let base_dropped = candidates.len();
+    let mut header_drop_count = 0usize;
+    {
+        // First pass: determine how many headers must be dropped.
+        let mut budget = SUMMARY_MAX_CHARS.saturating_sub(make_notice(base_dropped).len() + 1);
+        let mut kept = 0usize;
+        for line in &headers {
+            let needed = line.len() + if kept == 0 { 0 } else { 1 };
+            if needed > budget || kept + 1 >= SUMMARY_MAX_LINES {
+                header_drop_count += 1;
+            } else {
+                budget -= needed;
+                kept += 1;
+            }
+        }
+    }
+
+    let notice = make_notice(base_dropped + header_drop_count);
+    // Second pass: rebuild with exact budget including final notice length.
+    let mut char_budget = SUMMARY_MAX_CHARS.saturating_sub(notice.len() + 1);
+    let mut result: Vec<String> = Vec::new();
+    for line in &headers {
+        let needed = line.len() + if result.is_empty() { 0 } else { 1 };
+        if needed > char_budget || result.len() + 1 >= SUMMARY_MAX_LINES {
+            continue;
+        }
+        char_budget -= needed;
+        result.push(line.clone());
+    }
+    result.push(notice);
+    result.join("\n")
+}
+
+/// Apply [`compress_summary`] to any `[Conversation Summary]` or
+/// `[Conversation Compacted]` message in a compacted history.
+///
+/// Walks each message, detects the summary prefix, compresses the body, and
+/// replaces the content in place. Non-summary messages are passed through
+/// unchanged, preserving the head/tail structure of modes like
+/// `recency_preserving`.
+fn compress_summary_in_history(mut history: Vec<Value>) -> Vec<Value> {
+    for msg in &mut history {
+        let Some(content) = msg.get("content").and_then(Value::as_str).map(String::from) else {
+            continue;
+        };
+        for prefix in ["[Conversation Summary]\n\n", "[Conversation Compacted]\n\n"] {
+            if let Some(body) = content.strip_prefix(prefix) {
+                let compressed = compress_summary(body);
+                if compressed.len() < body.len() {
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.insert(
+                            "content".into(),
+                            Value::String(format!("{prefix}{compressed}")),
+                        );
+                    }
+                }
+                break;
+            }
+        }
+    }
+    history
+}
+
 fn shell_reply_text_from_exec_result(result: &Value) -> String {
     let stdout = result
         .get("stdout")
@@ -1424,7 +1620,7 @@ fn channel_binding_from_runtime_context(
         account_id: host.channel_account_id.clone(),
         chat_id: host.channel_chat_id.clone(),
         chat_type: host.channel_chat_type.clone(),
-        sender_id: None,
+        sender_id: host.channel_sender_id.clone(),
     };
     (!binding.is_empty()).then_some(binding)
 }
@@ -1660,6 +1856,15 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // Extract sender_id from channel metadata (set by channel handlers).
+    if host.channel_sender_id.is_none() {
+        host.channel_sender_id = params
+            .get("channel")
+            .and_then(|ch| ch.get("sender_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+
     if let Some(timezone) =
         normalized_iana_timezone(params.get("_timezone").and_then(|v| v.as_str()))
             .or_else(default_user_prompt_timezone)
@@ -1680,25 +1885,12 @@ fn prompt_sandbox_no_network_state(backend: &str, configured_no_network: bool) -
     }
 }
 
-fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
-    let mut effective = ToolPolicy::default();
-    if let Some(profile) = config.tools.policy.profile.as_deref()
-        && !profile.is_empty()
-    {
-        effective = effective.merge_with(&profile_tools(profile));
-    }
-    let configured = ToolPolicy {
-        allow: config.tools.policy.allow.clone(),
-        deny: config.tools.policy.deny.clone(),
-    };
-    effective.merge_with(&configured)
-}
-
 fn apply_runtime_tool_filters(
     base: &ToolRegistry,
     config: &moltis_config::MoltisConfig,
     _skills: &[moltis_skills::types::SkillMetadata],
     mcp_disabled: bool,
+    policy_context: &PolicyContext,
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
         base.clone_without_mcp()
@@ -1706,13 +1898,42 @@ fn apply_runtime_tool_filters(
         base.clone_without(&[])
     };
 
-    let policy = effective_tool_policy(config);
+    let policy = resolve_effective_policy(config, policy_context);
     // NOTE: Do not globally restrict tools by discovered skill `allowed_tools`.
     // Skills are always discovered for prompt injection; applying those lists at
     // runtime can unintentionally remove unrelated tools (for example, leaving
     // only `web_fetch` and preventing `create_skill` from being called).
     // Tool availability here is controlled by configured runtime policy.
     base_registry.clone_allowed_by(|name| policy.is_allowed(name))
+}
+
+/// Build a `PolicyContext` from runtime context and request parameters.
+fn build_policy_context(
+    agent_id: &str,
+    runtime_context: Option<&PromptRuntimeContext>,
+    params: Option<&Value>,
+) -> PolicyContext {
+    let host = runtime_context.map(|rc| &rc.host);
+    // sender_id: prefer params["channel"]["sender_id"] (fresh from channel
+    // dispatch), fall back to host.channel_sender_id (set by
+    // apply_request_runtime_context earlier in the call chain).
+    let sender_id = params
+        .and_then(|p| p.get("channel"))
+        .and_then(|ch| ch.get("sender_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| host.and_then(|h| h.channel_sender_id.clone()));
+    PolicyContext {
+        agent_id: agent_id.to_string(),
+        provider: host.and_then(|h| h.provider.clone()),
+        channel: host.and_then(|h| h.channel_type.clone()),
+        channel_account_id: host.and_then(|h| h.channel_account_id.clone()),
+        group_id: host.and_then(|h| h.channel_chat_type.clone()),
+        sender_id,
+        sandboxed: runtime_context
+            .and_then(|rc| rc.sandbox.as_ref())
+            .is_some_and(|s| s.exec_sandboxed),
+    }
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -4986,6 +5207,11 @@ impl ChatService for LiveChatService {
             "chat.compact: strategy dispatched"
         );
 
+        // Enforce summary budget discipline: max 1,200 chars, 24 lines,
+        // 160 chars/line.  Mutate the compacted history in place so the
+        // compressed text is what gets persisted and broadcast.
+        let compacted = compress_summary_in_history(compacted);
+
         // Replace the session history BEFORE broadcasting or notifying
         // channels. If we did it the other way around, a concurrent
         // `send()` RPC that landed between the broadcast and the store
@@ -5191,8 +5417,12 @@ impl ChatService for LiveChatService {
         let config = moltis_config::discover_and_load();
         let tools: Vec<Value> = if supports_tools {
             let registry_guard = self.tool_registry.read().await;
+            let list_ctx = PolicyContext {
+                agent_id: "main".into(),
+                ..Default::default()
+            };
             let effective_registry =
-                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled);
+                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled, &list_ctx);
             effective_registry
                 .list_schemas()
                 .iter()
@@ -5396,6 +5626,7 @@ impl ChatService for LiveChatService {
             .unwrap_or(false);
 
         // Build filtered tool registry.
+        let policy_ctx = build_policy_context("main", Some(&runtime_context), Some(&params));
         let filtered_registry = {
             let registry_guard = self.tool_registry.read().await;
             if tools_enabled {
@@ -5404,6 +5635,7 @@ impl ChatService for LiveChatService {
                     &persona.config,
                     &discovered_skills,
                     mcp_disabled,
+                    &policy_ctx,
                 )
             } else {
                 registry_guard.clone_without(&[])
@@ -5519,6 +5751,7 @@ impl ChatService for LiveChatService {
             .unwrap_or(false);
 
         // Build filtered tool registry.
+        let policy_ctx = build_policy_context("main", Some(&runtime_context), Some(&params));
         let filtered_registry = {
             let registry_guard = self.tool_registry.read().await;
             if tools_enabled {
@@ -5527,6 +5760,7 @@ impl ChatService for LiveChatService {
                     &persona.config,
                     &discovered_skills,
                     mcp_disabled,
+                    &policy_ctx,
                 )
             } else {
                 registry_guard.clone_without(&[])
@@ -6648,10 +6882,17 @@ async fn run_with_tools(
     let native_tools = matches!(tool_mode, ToolMode::Native);
     let tools_enabled = !matches!(tool_mode, ToolMode::Off);
 
+    let policy_ctx = build_policy_context(agent_id, runtime_context, None);
     let mut filtered_registry = {
         let registry_guard = tool_registry.read().await;
         if tools_enabled {
-            apply_runtime_tool_filters(&registry_guard, &persona.config, skills, mcp_disabled)
+            apply_runtime_tool_filters(
+                &registry_guard,
+                &persona.config,
+                skills,
+                mcp_disabled,
+                &policy_ctx,
+            )
         } else {
             registry_guard.clone_without(&[])
         }
@@ -7677,9 +7918,12 @@ async fn compact_session(
         .await
         .map_err(|source| error::Error::external("failed to read session history", source))?;
 
-    let outcome = compaction_run::run_compaction(&history, config, provider)
+    let mut outcome = compaction_run::run_compaction(&history, config, provider)
         .await
         .map_err(|e| error::Error::message(e.to_string()))?;
+
+    // Enforce summary budget discipline on the compacted history.
+    outcome.history = compress_summary_in_history(outcome.history);
 
     store
         .replace_history(session_key, outcome.history.clone())
@@ -10134,6 +10378,7 @@ mod tests {
                 channel_account_id: Some("bot-main".to_string()),
                 channel_chat_id: Some("-100123".to_string()),
                 channel_chat_type: Some("channel_or_supergroup".to_string()),
+                channel_sender_id: Some("42".to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -10155,6 +10400,7 @@ mod tests {
             tool_context["_channel"]["chat_type"],
             "channel_or_supergroup"
         );
+        assert_eq!(tool_context["_channel"]["sender_id"], "42");
     }
 
     #[test]
@@ -10386,7 +10632,9 @@ mod tests {
     }
 
     async fn sqlite_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
             .await
             .expect("sqlite memory pool");
         moltis_projects::run_migrations(&pool)
@@ -12455,7 +12703,11 @@ mod tests {
         cfg.tools.policy.profile = Some("full".into());
         cfg.tools.policy.deny = vec!["exec".into()];
 
-        let policy = effective_tool_policy(&cfg);
+        let ctx = PolicyContext {
+            agent_id: "main".into(),
+            ..Default::default()
+        };
+        let policy = resolve_effective_policy(&cfg, &ctx);
         assert!(!policy.is_allowed("exec"));
         assert!(policy.is_allowed("web_fetch"));
     }
@@ -12486,7 +12738,11 @@ mod tests {
             ..Default::default()
         }];
 
-        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        let ctx = PolicyContext {
+            agent_id: "main".into(),
+            ..Default::default()
+        };
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false, &ctx);
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("create_skill").is_some());
@@ -12513,7 +12769,11 @@ mod tests {
             ..Default::default()
         }];
 
-        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        let ctx = PolicyContext {
+            agent_id: "main".into(),
+            ..Default::default()
+        };
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false, &ctx);
         assert!(filtered.get("create_skill").is_some());
         assert!(filtered.get("web_fetch").is_some());
     }
@@ -15291,6 +15551,133 @@ mod tests {
         assert!(
             err.contains("timed out"),
             "error should mention timeout: {err}"
+        );
+    }
+
+    // ── compress_summary tests ──────────────────────────────────────────────
+
+    #[test]
+    fn compress_summary_under_budget_returns_unchanged() {
+        let input = "# Summary\n- Key point one\n- Key point two\nDone.";
+        let result = compress_summary(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn compress_summary_strips_blank_lines() {
+        let input = "# Summary\n\n- Point one\n\n- Point two\n\nDone.";
+        let result = compress_summary(input);
+        assert_eq!(result, "# Summary\n- Point one\n- Point two\nDone.");
+    }
+
+    #[test]
+    fn compress_summary_over_char_limit() {
+        let mut lines = vec!["# Summary".to_string()];
+        for i in 0..30 {
+            lines.push(format!(
+                "- This is line {i} with some padding text to make it longer than usual"
+            ));
+        }
+        let input = lines.join("\n");
+        assert!(input.len() > 1_200, "input should exceed 1200 chars");
+
+        let result = compress_summary(&input);
+        assert!(
+            result.len() <= 1_200,
+            "result must be <= 1200 chars, got {}",
+            result.len()
+        );
+        assert!(
+            result.contains("lines omitted"),
+            "should have omission notice"
+        );
+    }
+
+    #[test]
+    fn compress_summary_over_line_count() {
+        let mut lines = vec!["# Summary".to_string()];
+        for i in 0..40 {
+            lines.push(format!("Line {i}"));
+        }
+        let input = lines.join("\n");
+
+        let result = compress_summary(&input);
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert!(
+            result_lines.len() <= 25,
+            "result should be <= 25 lines (24 + notice), got {}",
+            result_lines.len()
+        );
+        assert!(result.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compress_summary_long_line_truncation() {
+        let long_line: String = "x".repeat(200);
+        let input = format!("Header\n{long_line}");
+        let result = compress_summary(&input);
+
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines.len(), 2);
+        // The long line should be truncated to 160 chars.
+        assert!(
+            result_lines[1].len() <= 160,
+            "long line should be <= 160 chars, got {}",
+            result_lines[1].len()
+        );
+    }
+
+    #[test]
+    fn compress_summary_deduplication() {
+        let input = "Alpha\nalpha\nBeta\nBETA\nGamma";
+        let result = compress_summary(input);
+        // Case-insensitive dedup: should keep first occurrence of each.
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines, vec!["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn compress_summary_header_preservation() {
+        let mut lines = vec!["# Section One".to_string()];
+        for i in 0..30 {
+            lines.push(format!(
+                "Body line {i} with enough text to fill up space here"
+            ));
+        }
+        lines.push("## Section Two".to_string());
+        for i in 0..10 {
+            lines.push(format!("- Bullet {i} important"));
+        }
+        let input = lines.join("\n");
+
+        let result = compress_summary(&input);
+        assert!(
+            result.contains("# Section One"),
+            "headers should be preserved"
+        );
+        assert!(
+            result.contains("## Section Two"),
+            "second header should be preserved"
+        );
+        assert!(result.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compress_summary_empty_input() {
+        assert_eq!(compress_summary(""), "");
+        assert_eq!(compress_summary("   "), "");
+    }
+
+    #[test]
+    fn compress_summary_single_very_long_line() {
+        let long_line = "a".repeat(2_000);
+        let result = compress_summary(&long_line);
+
+        // Should be truncated to 160 chars.
+        assert!(
+            result.len() <= 160,
+            "single long line should be truncated, got {} chars",
+            result.len()
         );
     }
 

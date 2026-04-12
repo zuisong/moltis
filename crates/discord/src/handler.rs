@@ -21,6 +21,7 @@ use {
     moltis_channels::{
         ChannelEvent, ChannelType, Error as ChannelError, InboundMediaDownloader,
         InboundMediaSource, Result as ChannelsResult,
+        config_view::ChannelConfigView,
         gating::DmPolicy,
         message_log::MessageLogEntry,
         otp::{
@@ -841,7 +842,7 @@ impl EventHandler for Handler {
             .await;
 
             let response_text = match sink
-                .dispatch_command(command.trim(), reply_to.clone())
+                .dispatch_command(command.trim(), reply_to.clone(), Some(&peer_id))
                 .await
             {
                 Ok(response) => response,
@@ -984,8 +985,12 @@ impl EventHandler for Handler {
             channel_type: ChannelType::Discord,
             sender_name,
             username,
+            sender_id: Some(peer_id.clone()),
             message_kind: Some(inferred_kind),
-            model: config.model.clone(),
+            model: config.resolve_model(&chat_id, &peer_id).map(String::from),
+            agent_id: config
+                .resolve_agent_id(&chat_id, &peer_id)
+                .map(String::from),
             audio_filename,
         };
 
@@ -1284,12 +1289,24 @@ fn chunk_message(text: &str, max_len: usize) -> Vec<&str> {
     chunks
 }
 
+fn split_window_end(text: &str, max_len: usize) -> usize {
+    let split_window_end = text.floor_char_boundary(max_len);
+    if split_window_end > 0 {
+        return split_window_end;
+    }
+    text.chars()
+        .next()
+        .map(char::len_utf8)
+        .unwrap_or(text.len())
+}
+
 /// Find the best position to split `text` within `max_len` bytes.
 ///
 /// Avoids splitting inside fenced code blocks. Prefers newlines outside of code
 /// fences, falls back to `max_len` if no better boundary is found.
 fn find_split_point(text: &str, max_len: usize) -> usize {
-    let window = &text[..max_len];
+    let split_window_end = split_window_end(text, max_len);
+    let window = &text[..split_window_end];
 
     // Track whether each newline position is inside a fenced code block.
     let mut in_fence = false;
@@ -1302,7 +1319,7 @@ fn find_split_point(text: &str, max_len: usize) -> usize {
         Some((start, line))
     }) {
         let newline_pos = i + line.len(); // position of the '\n' itself
-        if newline_pos >= max_len {
+        if window.as_bytes().get(newline_pos) != Some(&b'\n') {
             break;
         }
 
@@ -1320,7 +1337,9 @@ fn find_split_point(text: &str, max_len: usize) -> usize {
 
     // Prefer splitting outside a code fence; fall back to any newline; finally
     // fall back to the hard limit.
-    best_outside_fence.or(best_any_newline).unwrap_or(max_len)
+    best_outside_fence
+        .or(best_any_newline)
+        .unwrap_or(split_window_end)
 }
 
 #[cfg(test)]
@@ -1436,6 +1455,17 @@ mod tests {
         for chunk in &chunks {
             let opens = chunk.matches("```").count();
             assert_eq!(opens % 2, 0, "unbalanced code fence in chunk: {chunk:?}");
+        }
+    }
+
+    #[test]
+    fn chunk_message_handles_multibyte_boundary() {
+        let text = format!("{} tail", "😀".repeat(600));
+        let chunks = chunk_message(&text, 2001);
+        assert!(chunks.len() >= 2);
+        assert_eq!(chunks.concat(), text);
+        for chunk in chunks {
+            assert!(chunk.is_char_boundary(chunk.len()));
         }
     }
 
@@ -1817,6 +1847,7 @@ mod tests {
             &self,
             _command: &str,
             _reply_to: ChannelReplyTarget,
+            _sender_id: Option<&str>,
         ) -> ChannelsResult<String> {
             Ok(String::new())
         }

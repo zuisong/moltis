@@ -22,6 +22,7 @@ pub enum ChannelType {
     Discord,
     Slack,
     Matrix,
+    Nostr,
 }
 
 impl ChannelType {
@@ -34,6 +35,7 @@ impl ChannelType {
             Self::Discord => "discord",
             Self::Slack => "slack",
             Self::Matrix => "matrix",
+            Self::Nostr => "nostr",
         }
     }
 
@@ -46,6 +48,7 @@ impl ChannelType {
             Self::Discord => "Discord",
             Self::Slack => "Slack",
             Self::Matrix => "Matrix",
+            Self::Nostr => "Nostr",
         }
     }
 
@@ -62,6 +65,7 @@ impl ChannelType {
                     Some("private".to_string())
                 }
             },
+            Self::Nostr => Some("dm".to_string()),
             _ => None,
         }
     }
@@ -75,6 +79,7 @@ impl ChannelType {
             Self::Discord => &["token"],
             Self::Slack => &["bot_token", "app_token", "signing_secret"],
             Self::Matrix => &["access_token", "password"],
+            Self::Nostr => &["secret_key"],
         }
     }
 }
@@ -96,6 +101,7 @@ impl std::str::FromStr for ChannelType {
             "discord" => Ok(Self::Discord),
             "slack" => Ok(Self::Slack),
             "matrix" | "element" => Ok(Self::Matrix),
+            "nostr" => Ok(Self::Nostr),
             other => Err(Error::invalid_input(format!(
                 "unknown channel type: {other}"
             ))),
@@ -112,6 +118,7 @@ impl ChannelType {
         Self::Discord,
         Self::Slack,
         Self::Matrix,
+        Self::Nostr,
     ];
 
     /// Returns the static descriptor for this channel type.
@@ -212,6 +219,22 @@ impl ChannelType {
                     supports_otp: true,
                     supports_reactions: true,
                     supports_location: true,
+                },
+            },
+            Self::Nostr => ChannelDescriptor {
+                channel_type: *self,
+                display_name: "Nostr",
+                capabilities: ChannelCapabilities {
+                    inbound_mode: InboundMode::GatewayLoop,
+                    supports_outbound: true,
+                    supports_streaming: false,
+                    supports_interactive: false,
+                    supports_threads: false,
+                    supports_voice_ingest: false,
+                    supports_pairing: false,
+                    supports_otp: true,
+                    supports_reactions: false,
+                    supports_location: false,
                 },
             },
         }
@@ -348,8 +371,17 @@ pub trait ChannelEventSink: Send + Sync {
 
     /// Dispatch a slash command (e.g. "new", "clear", "compact", "context")
     /// and return a text result to send back to the channel.
-    async fn dispatch_command(&self, command: &str, reply_to: ChannelReplyTarget)
-    -> Result<String>;
+    ///
+    /// `sender_id` identifies the message sender. Privileged commands
+    /// (`/approve`, `/deny`) are restricted to senders on the channel
+    /// account's allowlist — authorization is enforced centrally by the
+    /// gateway, so channel implementations do not need to handle it.
+    async fn dispatch_command(
+        &self,
+        command: &str,
+        reply_to: ChannelReplyTarget,
+        sender_id: Option<&str>,
+    ) -> Result<String>;
 
     /// Request disabling a channel account due to a runtime error.
     ///
@@ -458,12 +490,19 @@ pub struct ChannelMessageMeta {
     pub channel_type: ChannelType,
     pub sender_name: Option<String>,
     pub username: Option<String>,
+    /// Platform-specific sender/peer ID (e.g. Telegram user ID, Discord user ID).
+    /// Used for per-sender tool policy resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_id: Option<String>,
     /// Original inbound message media kind (voice, audio, photo, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_kind: Option<ChannelMessageKind>,
     /// Default model configured for this channel account.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Default agent configured for this channel account or chat override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
     /// Filename of saved voice audio (set by `save_channel_voice`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_filename: Option<String>,
@@ -912,6 +951,7 @@ mod tests {
             &self,
             _command: &str,
             _reply_to: ChannelReplyTarget,
+            _sender_id: Option<&str>,
         ) -> Result<String> {
             Ok(String::new())
         }
@@ -1173,7 +1213,7 @@ mod tests {
     #[test]
     fn all_covers_every_variant() {
         // If a new variant is added to ChannelType, this test forces updating ALL.
-        assert_eq!(ChannelType::ALL.len(), 6);
+        assert_eq!(ChannelType::ALL.len(), 7);
         for ct in ChannelType::ALL {
             // descriptor() must not panic
             let desc = ct.descriptor();
@@ -1192,6 +1232,7 @@ mod tests {
         assert_eq!(ChannelType::Discord.descriptor().display_name, "Discord");
         assert_eq!(ChannelType::Slack.descriptor().display_name, "Slack");
         assert_eq!(ChannelType::Matrix.descriptor().display_name, "Matrix");
+        assert_eq!(ChannelType::Nostr.descriptor().display_name, "Nostr");
     }
 
     #[test]

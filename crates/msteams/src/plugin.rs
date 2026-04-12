@@ -407,7 +407,7 @@ impl MsTeamsPlugin {
         let dispatch_text = text.as_deref().unwrap_or("");
         if let Some(command) = dispatch_text.strip_prefix('/') {
             match sink
-                .dispatch_command(command.trim(), reply_to.clone())
+                .dispatch_command(command.trim(), reply_to.clone(), Some(&peer_id))
                 .await
             {
                 Ok(response) => {
@@ -465,12 +465,16 @@ impl MsTeamsPlugin {
             channel_type: ChannelType::MsTeams,
             sender_name,
             username: None,
+            sender_id: Some(peer_id.clone()),
             message_kind: Some(if !downloaded_attachments.is_empty() {
                 ChannelMessageKind::Photo
             } else {
                 ChannelMessageKind::Text
             }),
-            model: config.model.clone(),
+            model: config.resolve_model(&chat_id, &peer_id).map(String::from),
+            agent_id: config
+                .resolve_agent_id(&chat_id, &peer_id)
+                .map(String::from),
             audio_filename: None,
         };
 
