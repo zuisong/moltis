@@ -833,21 +833,37 @@ directory, reject path traversal and symlink escapes, and are recorded in
 replay queued messages one-by-one or merge them into a single follow-up message.</p>
 <pre><code class="language-toml">[chat]
 message_queue_mode = "followup"  # Default: one-by-one replay
+prompt_memory_mode = "live-reload"
 
 # Options:
 #   "followup" - Queue each message and run them sequentially
 #   "collect"  - Merge queued text and run once after the active run
+#   "live-reload" - Re-read MEMORY.md before each turn
+#   "frozen-at-session-start" - Keep the first MEMORY.md snapshot for the session
 </code></pre>
 <h2 id="memory-system"><a class="header" href="#memory-system">Memory System</a></h2>
 <p>Long-term memory uses embeddings for semantic search:</p>
 <pre><code class="language-toml">[memory]
+style = "hybrid"              # Or "prompt-only", "search-only", "off"
+agent_write_mode = "hybrid"   # Or "prompt-only", "search-only", "off"
+user_profile_write_mode = "explicit-and-auto" # Or "explicit-only", "off"
 backend = "builtin"             # Or "qmd"
 provider = "openai"             # Or "local", "ollama", "custom"
 model = "text-embedding-3-small"
 citations = "auto"              # "on", "off", or "auto"
 llm_reranking = false
-session_export = false
+search_merge_strategy = "rrf"   # Or "linear"
+session_export = "on-new-or-reset" # Or "off"
 </code></pre>
+<p>See <a href="memory-surfaces.html">Memory Surfaces</a> for the boundary between
+<code>session_state</code>, prompt memory, searchable memory, and sandbox persistence.
+<code>memory.style</code> chooses the high-level behavior, while
+<code>chat.prompt_memory_mode</code> only affects prompt-visible <code>MEMORY.md</code>.
+<code>memory.agent_write_mode</code> controls where agent-authored writes are allowed to
+land. <code>memory.user_profile_write_mode</code> controls whether Moltis writes the
+managed <code>USER.md</code> surface, and whether browser/channel timezone or location
+signals may update it silently. <code>memory.session_export</code> controls whether
+session rollover exports are written at all.</p>
 <h2 id="authentication"><a class="header" href="#authentication">Authentication</a></h2>
 <p>Authentication is <strong>only required when accessing Moltis from a non-localhost address</strong>. When running on <code>localhost</code> or <code>127.0.0.1</code>, no authentication is needed by default.</p>
 <p>When you access Moltis from a network address (e.g., <code>http://192.168.1.100:13131</code>), a one-time setup code is printed to the terminal. Use it to set up a password or passkey.</p>
@@ -1920,6 +1936,9 @@ args = ["run", "--rm", "-i", "mcp/memory"]
 </ul>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="memory-system-1"><a class="header" href="#memory-system-1">Memory System</a></h1>
 <p>Moltis provides a powerful memory system that enables the agent to recall past conversations, notes, and context across sessions. This document explains the available backends, features, and configuration options.</p>
+<p>If you are trying to understand the difference between short-term session
+state, long-term memory files, and sandbox persistence, start with
+<a href="memory-surfaces.html">Memory Surfaces</a>.</p>
 <h2 id="backends"><a class="header" href="#backends">Backends</a></h2>
 <p>Moltis supports two memory backends:</p>
 <div class="table-wrapper"><table><thead><tr><th>Feature</th><th>Built-in</th><th>QMD</th></tr></thead><tbody>
@@ -1952,7 +1971,7 @@ args = ["run", "--rm", "-i", "mcp/memory"]
 </ul>
 <p>To use QMD:</p>
 <ol>
-<li>Install the QMD CLI from <a href="https://github.com/tobi/qmd">github.com/tobi/qmd</a>: <code>npm install -g --ignore-scripts @tobilu/qmd</code> or <code>bun add -g @tobilu/qmd</code></li>
+<li>Install the QMD CLI from <a href="https://github.com/tobi/qmd">github.com/tobi/qmd</a>: <code>npm install -g @tobilu/qmd</code> or <code>bun install -g @tobilu/qmd</code></li>
 <li>Verify the binary is on your <code>PATH</code>: <code>qmd --version</code></li>
 <li>Enable it in Settings &gt; Memory &gt; Backend</li>
 </ol>
@@ -1972,7 +1991,9 @@ Source: memory/notes.md#42
 <li><code>off</code>: Never include citations</li>
 </ul>
 <h3 id="session-export"><a class="header" href="#session-export">Session Export</a></h3>
-<p>When enabled, session transcripts are automatically exported to the memory system for cross-run recall. This allows the agent to remember past conversations even after restarts.</p>
+<p>Session transcripts can be exported into searchable memory on <code>/new</code> and
+<code>/reset</code>. This allows the agent to remember past conversations even after
+restarts.</p>
 <p>Exported sessions are:</p>
 <ul>
 <li>Stored in <code>memory/sessions/</code> as markdown files</li>
@@ -1990,11 +2011,22 @@ Source: memory/notes.md#42
 <h2 id="configuration-3"><a class="header" href="#configuration-3">Configuration</a></h2>
 <p>Memory settings can be configured in <code>moltis.toml</code>:</p>
 <pre><code class="language-toml">[memory]
+# Orchestration style: "hybrid", "prompt-only", "search-only", or "off"
+style = "hybrid"
+
+# Agent-authored write target policy: "hybrid", "prompt-only", "search-only", or "off"
+agent_write_mode = "hybrid"
+
+# Managed USER.md write policy: "explicit-and-auto", "explicit-only", or "off"
+user_profile_write_mode = "explicit-and-auto"
+
 # Backend: "builtin" (default) or "qmd"
 backend = "builtin"
 
-# Embedding provider: "local", "ollama", "openai", "custom", or auto-detect
-provider = "local"
+# Embedding provider for the built-in backend: "local", "ollama", "openai", "custom", or auto-detect
+# Ignored while backend = "qmd", but preserved for switching back later
+# Omit this field for the real default, which is auto-detect
+provider = "auto"
 
 # Disable RAG embeddings and force keyword-only search
 disable_rag = false
@@ -2008,8 +2040,11 @@ citations = "auto"
 # Enable LLM reranking for hybrid search
 llm_reranking = false
 
-# Export sessions to memory for cross-run recall
-session_export = true
+# Merge vector and keyword results with "rrf" or "linear"
+search_merge_strategy = "rrf"
+
+# Export sessions to memory for cross-run recall: "on-new-or-reset" or "off"
+session_export = "on-new-or-reset"
 
 # QMD-specific settings (only used when backend = "qmd")
 [memory.qmd]
@@ -2017,7 +2052,75 @@ command = "qmd"
 max_results = 10
 timeout_ms = 30000
 </code></pre>
+<p>Real defaults, if you leave the fields unset:</p>
+<ul>
+<li><code>style = "hybrid"</code></li>
+<li><code>agent_write_mode = "hybrid"</code></li>
+<li><code>user_profile_write_mode = "explicit-and-auto"</code></li>
+<li><code>backend = "builtin"</code></li>
+<li><code>provider = auto-detect</code> (unset, not hardcoded <code>local</code>)</li>
+<li><code>disable_rag = false</code></li>
+<li><code>citations = "auto"</code></li>
+<li><code>llm_reranking = false</code></li>
+<li><code>search_merge_strategy = "rrf"</code></li>
+<li><code>session_export = "on-new-or-reset"</code></li>
+<li><code>[chat].prompt_memory_mode = "live-reload"</code></li>
+</ul>
+<p><code>style</code> is separate from <code>[chat].prompt_memory_mode</code>. Style controls whether
+<code>MEMORY.md</code> is injected and whether memory tools are exposed. Prompt memory
+mode controls whether prompt-visible <code>MEMORY.md</code> is live-reloaded or frozen
+per session.</p>
+<p>The web settings page exposes both knobs in the Memory section so you can
+experiment without hand-editing <code>moltis.toml</code>.</p>
+<p><code>agent_write_mode</code> is a separate axis again. It controls where agent-authored
+memory writes may land:</p>
+<ul>
+<li><code>hybrid</code> allows both <code>MEMORY.md</code> and <code>memory/*.md</code></li>
+<li><code>prompt-only</code> allows only <code>MEMORY.md</code></li>
+<li><code>search-only</code> allows only <code>memory/*.md</code></li>
+<li><code>off</code> disables agent-authored memory writes, including <code>memory_save</code> and the
+silent pre-compaction memory flush</li>
+</ul>
+<p><code>user_profile_write_mode</code> is about the managed <code>USER.md</code> surface, not agent
+memory files:</p>
+<ul>
+<li><code>explicit-and-auto</code> mirrors explicit settings saves to <code>USER.md</code> and also
+allows silent browser/channel timezone or location capture</li>
+<li><code>explicit-only</code> mirrors explicit settings saves to <code>USER.md</code>, but disables
+silent browser/channel capture</li>
+<li><code>off</code> stops Moltis from writing <code>USER.md</code>; the canonical user profile remains
+in <code>moltis.toml [user]</code></li>
+</ul>
+<p><code>citations</code> and <code>search_merge_strategy</code> are typed config enums too:</p>
+<ul>
+<li><code>citations = "auto" | "on" | "off"</code></li>
+<li><code>search_merge_strategy = "rrf" | "linear"</code></li>
+</ul>
+<p>Interaction rules that matter in practice:</p>
+<ul>
+<li><code>provider</code>, <code>base_url</code>, <code>model</code>, and <code>api_key</code> only apply to
+<code>backend = "builtin"</code>. QMD ignores them.</li>
+<li><code>[chat].prompt_memory_mode</code> only matters when <code>style</code> still allows prompt
+memory, <code>hybrid</code> or <code>prompt-only</code>.</li>
+<li><code>llm_reranking</code> is only meaningful when RAG is enabled. If
+<code>disable_rag = true</code>, memory falls back to keyword search.</li>
+<li><code>session_export</code> exports transcripts into searchable memory files. It does
+not inject those transcripts into the prompt directly.</li>
+</ul>
 <p>Or via the web UI: <strong>Settings &gt; Memory</strong></p>
+<h2 id="recipes"><a class="header" href="#recipes">Recipes</a></h2>
+<p>Common combinations:</p>
+<div class="table-wrapper"><table><thead><tr><th>Goal</th><th>Settings</th></tr></thead><tbody>
+<tr><td>Default everyday setup</td><td><code>style = "hybrid"</code>, <code>backend = "builtin"</code>, <code>prompt_memory_mode = "live-reload"</code></td></tr>
+<tr><td>Deterministic prompt memory</td><td><code>style = "hybrid"</code>, <code>prompt_memory_mode = "frozen-at-session-start"</code></td></tr>
+<tr><td>Search-only long-term memory</td><td><code>style = "search-only"</code></td></tr>
+<tr><td>Prompt-only memory, no recall tools</td><td><code>style = "prompt-only"</code></td></tr>
+<tr><td>Disable agent memory writes</td><td><code>agent_write_mode = "off"</code></td></tr>
+<tr><td>Keep <code>USER.md</code> from silent enrichment</td><td><code>user_profile_write_mode = "explicit-only"</code></td></tr>
+<tr><td>Keep user profile only in config</td><td><code>user_profile_write_mode = "off"</code></td></tr>
+<tr><td>QMD backend experiment</td><td><code>backend = "qmd"</code></td></tr>
+</tbody></table>
+</div>
 <h2 id="embedding-providers"><a class="header" href="#embedding-providers">Embedding Providers</a></h2>
 <p>The built-in backend supports multiple embedding providers:</p>
 <div class="table-wrapper"><table><thead><tr><th>Provider</th><th>Model</th><th>Dimensions</th><th>Notes</th></tr></thead><tbody>
@@ -2040,6 +2143,14 @@ timeout_ms = 30000
 <li><code>~/.moltis/memory/*.md</code> - Additional memory files</li>
 <li><code>~/.moltis/memory/sessions/*.md</code> - Exported session transcripts</li>
 </ul>
+<p>Prompt injection from <code>MEMORY.md</code> is controlled separately via
+<code>[chat].prompt_memory_mode</code>. Use <code>live-reload</code> to reread <code>MEMORY.md</code> before
+each turn, or <code>frozen-at-session-start</code> to keep a stable prompt-memory
+snapshot for the lifetime of a session.</p>
+<p>If sandboxing is enabled with the default <code>workspace_mount = "ro"</code>, sandboxed
+commands may still read mounted memory files, but they cannot modify them
+directly. Durable memory writes should use <code>memory_save</code> rather than shell
+redirection or direct file editing inside the sandbox.</p>
 <h2 id="tools"><a class="header" href="#tools">Tools</a></h2>
 <p>The memory system exposes three agent tools:</p>
 <h3 id="memory_search"><a class="header" href="#memory_search">memory_search</a></h3>
@@ -2060,7 +2171,9 @@ result found via <code>memory_search</code>.</p>
 <h3 id="memory_save"><a class="header" href="#memory_save">memory_save</a></h3>
 <p>Save content to long-term memory files. The agent uses this tool when you ask
 it to remember something (“remember that I prefer dark mode”) or when it
-decides certain information is worth persisting.</p>
+decides certain information is worth persisting. This is the preferred
+long-term write path even when memory files are visible through a read-only
+sandbox mount.</p>
 <pre><code class="language-json">{
   "content": "User prefers dark mode and Vim keybindings.",
   "file": "MEMORY.md",
@@ -2076,6 +2189,9 @@ back with <code>checkpoint_restore</code>.</p>
 <tr><td><code>append</code></td><td>boolean</td><td><code>true</code></td><td>Append to existing file (<code>true</code>) or overwrite (<code>false</code>)</td></tr>
 </tbody></table>
 </div>
+<p>If <code>memory.agent_write_mode = "search-only"</code> and <code>file</code> is omitted,
+<code>memory_save</code> defaults to <code>memory/notes.md</code>. The write mode can also reject
+targets that are otherwise valid paths.</p>
 <p><strong>Path validation:</strong> The tool enforces a strict allowlist of write targets
 to prevent path traversal attacks. Only these patterns are accepted:</p>
 <ul>
@@ -2103,8 +2219,10 @@ asking the agent to save noteworthy information</li>
 internal <code>write_file</code> tool backed by the same <code>MemoryWriter</code> as
 <code>memory_save</code></li>
 <li>The LLM’s response text is discarded (the user sees nothing)</li>
-<li>Written files are automatically re-indexed for future search</li>
 </ol>
+<p>This pre-compaction flush obeys <code>memory.agent_write_mode</code>. In <code>off</code> mode, the
+flush is skipped entirely.
+5. Written files are automatically re-indexed for future search</p>
 <p><strong>What gets saved:</strong></p>
 <ul>
 <li>User preferences and working style</li>
@@ -2168,11 +2286,149 @@ systems.</p>
 </ol>
 <h3 id="qmd-not-available"><a class="header" href="#qmd-not-available">QMD not available</a></h3>
 <ol>
-<li>Install QMD if needed: <code>npm install -g --ignore-scripts @tobilu/qmd</code> or <code>bun add -g @tobilu/qmd</code></li>
+<li>Install QMD if needed: <code>npm install -g @tobilu/qmd</code> or <code>bun install -g @tobilu/qmd</code></li>
 <li>Verify QMD is installed: <code>qmd --version</code></li>
 <li>Check that the path is correct in settings</li>
-<li>Ensure QMD has indexed your collections: <code>qmd stats</code></li>
+<li>Ensure QMD can see its index and collections: <code>qmd status</code></li>
 </ol>
+<div style="break-before: page; page-break-before: always;"></div><h1 id="memory-surfaces"><a class="header" href="#memory-surfaces">Memory Surfaces</a></h1>
+<p>Moltis has several different places where information can persist. They solve
+different problems, and confusing them leads to very weird debugging sessions.</p>
+<h2 id="quick-table"><a class="header" href="#quick-table">Quick Table</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Surface</th><th>Purpose</th><th>Lifetime</th><th>Scope</th><th>Backing store</th></tr></thead><tbody>
+<tr><td><code>session_state</code></td><td>Short-term structured state for a session</td><td>Until the session is deleted</td><td>One session key</td><td>SQLite <code>session_state</code> table</td></tr>
+<tr><td>Managed user profile (<code>USER.md</code>)</td><td>User name, timezone, and optional location hints</td><td>Persistent</td><td>Whole workspace</td><td><code>USER.md</code> in <code>data_dir()</code> plus <code>[user]</code> in <code>moltis.toml</code></td></tr>
+<tr><td>Prompt memory (<code>MEMORY.md</code>)</td><td>High-signal facts injected into the system prompt</td><td>Persistent</td><td>Agent workspace</td><td><code>MEMORY.md</code> in <code>data_dir()</code> or <code>agents/&lt;id&gt;/MEMORY.md</code></td></tr>
+<tr><td>Searchable memory (<code>memory_search</code>)</td><td>Long-term recall without spending prompt tokens</td><td>Persistent</td><td>Agent workspace</td><td><code>MEMORY.md</code>, <code>memory/*.md</code>, optional exported session files</td></tr>
+<tr><td>Sandbox workspace mount</td><td>Lets sandboxed commands see Moltis files</td><td>Only while mounted</td><td>Depends on sandbox session/container</td><td>Mounted <code>data_dir()</code> path</td></tr>
+<tr><td>Sandbox home (<code>/home/sandbox</code>)</td><td>Command-side scratch files and tool caches</td><td>Depends on <code>home_persistence</code></td><td>Shared, per-session, or none</td><td>Sandbox home volume/dir</td></tr>
+</tbody></table>
+</div>
+<h2 id="short-term-memory"><a class="header" href="#short-term-memory">Short-Term Memory</a></h2>
+<p><code>session_state</code> is Moltis’s short-term memory layer. It is:</p>
+<ul>
+<li>keyed by <code>(session_key, namespace, key)</code></li>
+<li>isolated between sessions</li>
+<li>available to tools and runtime features that need structured, mutable state</li>
+<li>not automatically injected into the prompt</li>
+</ul>
+<p>This is the right place for session-scoped control data, counters, cursors, or
+snapshots that should not become part of long-term memory.</p>
+<h2 id="long-term-memory"><a class="header" href="#long-term-memory">Long-Term Memory</a></h2>
+<p>Long-term memory lives in Markdown files inside the Moltis data directory.</p>
+<ul>
+<li>Main agent prompt memory:
+<code>~/.moltis/MEMORY.md</code></li>
+<li>Main agent searchable memory:
+<code>~/.moltis/memory/*.md</code></li>
+<li>Non-main agent prompt memory:
+<code>~/.moltis/agents/&lt;agent_id&gt;/MEMORY.md</code></li>
+<li>Non-main agent searchable memory:
+<code>~/.moltis/agents/&lt;agent_id&gt;/memory/*.md</code></li>
+</ul>
+<p><code>USER.md</code> is not part of agent long-term memory. It is a managed user profile
+surface used for things like name, timezone, and cached location. Moltis also
+stores the canonical user profile in <code>moltis.toml [user]</code>, then overlays
+<code>USER.md</code> when that file exists.</p>
+<p>For <code>main</code>, Moltis currently prefers <code>agents/main/MEMORY.md</code> if it exists and
+falls back to the root <code>MEMORY.md</code>. Non-main agents do not fall back to the
+root file.</p>
+<h2 id="prompt-memory-loading"><a class="header" href="#prompt-memory-loading">Prompt Memory Loading</a></h2>
+<p><code>MEMORY.md</code> can reach the prompt in two modes:</p>
+<pre><code class="language-toml">[memory]
+style = "hybrid"
+
+[chat]
+prompt_memory_mode = "live-reload"
+</code></pre>
+<ul>
+<li><code>hybrid</code> injects <code>MEMORY.md</code> into the prompt and keeps <code>memory_search</code>,
+<code>memory_get</code>, and <code>memory_save</code> available</li>
+<li><code>prompt-only</code> injects <code>MEMORY.md</code> into the prompt, but hides memory tools</li>
+<li><code>search-only</code> skips prompt injection and relies on memory tools for recall</li>
+<li><code>off</code> disables both prompt memory injection and memory tools</li>
+<li><code>live-reload</code> reads <code>MEMORY.md</code> again before each turn</li>
+<li><code>frozen-at-session-start</code> captures the first <code>MEMORY.md</code> snapshot seen by a
+session and reuses it for later turns in that same session</li>
+</ul>
+<p>The style and the mode control different things. Style decides whether prompt
+memory exists at all, and whether memory tools are exposed. Mode only matters
+when prompt memory is enabled. Frozen snapshots are stored in <code>session_state</code>,
+so they are session-scoped rather than a process-global cache.</p>
+<p>Defaults today:</p>
+<ul>
+<li><code>memory.style = "hybrid"</code></li>
+<li><code>memory.agent_write_mode = "hybrid"</code></li>
+<li><code>memory.user_profile_write_mode = "explicit-and-auto"</code></li>
+<li><code>memory.backend = "builtin"</code></li>
+<li><code>memory.session_export = "on-new-or-reset"</code></li>
+<li><code>chat.prompt_memory_mode = "live-reload"</code></li>
+</ul>
+<p><code>memory.agent_write_mode</code> is a third axis:</p>
+<ul>
+<li><code>hybrid</code> allows agent-authored writes to both <code>MEMORY.md</code> and <code>memory/*.md</code></li>
+<li><code>prompt-only</code> restricts agent-authored writes to <code>MEMORY.md</code></li>
+<li><code>search-only</code> restricts agent-authored writes to <code>memory/*.md</code></li>
+<li><code>off</code> disables agent-authored writes, including <code>memory_save</code> and the silent
+pre-compaction memory flush</li>
+</ul>
+<p><code>memory.session_export</code> is separate again:</p>
+<ul>
+<li><code>on-new-or-reset</code> exports session transcripts into <code>memory/sessions/*.md</code></li>
+<li><code>off</code> disables that export hook entirely</li>
+</ul>
+<p><code>memory.user_profile_write_mode</code> is a fourth axis for the managed <code>USER.md</code>
+surface:</p>
+<ul>
+<li><code>explicit-and-auto</code> allows settings saves and silent timezone/location capture</li>
+<li><code>explicit-only</code> allows settings saves, but disables silent timezone/location capture</li>
+<li><code>off</code> stops Moltis from writing <code>USER.md</code>; user profile data stays in
+<code>moltis.toml [user]</code></li>
+</ul>
+<p><code>memory.citations</code> and <code>memory.search_merge_strategy</code> are typed retrieval
+knobs:</p>
+<ul>
+<li><code>citations</code>: <code>auto</code>, <code>on</code>, or <code>off</code></li>
+<li><code>search_merge_strategy</code>: <code>rrf</code> or <code>linear</code></li>
+</ul>
+<p>Two easy-to-miss interaction rules:</p>
+<ul>
+<li>builtin embedding knobs such as <code>memory.provider</code>, <code>memory.base_url</code>,
+<code>memory.model</code>, and <code>memory.api_key</code> do nothing while
+<code>memory.backend = "qmd"</code></li>
+<li><code>memory.session_export</code> affects searchable transcript files under
+<code>memory/sessions/*.md</code>, not prompt memory injection</li>
+</ul>
+<p>The chat UI exposes the active prompt-memory mode in the toolbar and full
+context view. Frozen sessions can also refresh their snapshot manually without
+restarting the session.</p>
+<h2 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h2>
+<p>Sandboxes have two separate persistence surfaces:</p>
+<ul>
+<li>Workspace mount, this is how commands can read or write Moltis memory files
+when <code>workspace_mount</code> is not <code>none</code></li>
+<li>Sandbox home, this is <code>/home/sandbox</code> and is controlled by
+<code>tools.exec.sandbox.home_persistence</code></li>
+</ul>
+<p>Those are not the same thing.</p>
+<p>If a file exists only in <code>/home/sandbox</code>, <code>memory_search</code> will not index it.
+If a file exists in the mounted Moltis workspace, it is part of Moltis’s
+normal memory surface, regardless of whether the command that wrote it ran in a
+sandbox or not.</p>
+<p>With the default <code>workspace_mount = "ro"</code>, sandboxed commands may still read
+mounted files such as <code>MEMORY.md</code>, but they cannot modify them directly.
+Durable long-term writes should still happen through Moltis memory tools such
+as <code>memory_save</code>, not via shell redirection inside the sandbox.</p>
+<h2 id="between-sandboxes"><a class="header" href="#between-sandboxes">Between Sandboxes</a></h2>
+<p>Sandbox-to-sandbox sharing depends on <code>home_persistence</code>:</p>
+<ul>
+<li><code>off</code>: nothing in sandbox home persists</li>
+<li><code>session</code>: sandbox home persists only for that session</li>
+<li><code>shared</code>: sandbox home is reused across sessions/containers that share the
+configured home</li>
+</ul>
+<p>This affects <code>/home/sandbox</code>, not <code>MEMORY.md</code> semantics. Long-term memory is
+still governed by the mounted Moltis workspace and agent-scoped memory files.</p>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="memory-moltis-vs-openclaw"><a class="header" href="#memory-moltis-vs-openclaw">Memory: Moltis vs OpenClaw</a></h1>
 <p>This page provides a detailed comparison of the memory systems in Moltis and
 <a href="https://github.com/openclaw/openclaw">OpenClaw</a>. Both projects share the
@@ -2220,7 +2476,7 @@ general-purpose).</p>
 <tr><td><strong>Daily logs</strong></td><td><code>memory/YYYY-MM-DD.md</code></td><td><code>memory/YYYY-MM-DD.md</code></td></tr>
 <tr><td><strong>Session transcripts</strong></td><td><code>memory/sessions/*.md</code></td><td>Session JSONL files (separate)</td></tr>
 <tr><td><strong>Extra paths</strong></td><td>Via <code>memory_dirs</code> config</td><td>Via <code>memorySearch.extraPaths</code></td></tr>
-<tr><td><strong>MEMORY.md loading</strong></td><td>Always available in system prompt</td><td>Only in private sessions (not group chats)</td></tr>
+<tr><td><strong>MEMORY.md loading</strong></td><td>Available in system prompt, with configurable live reload or frozen-per-session mode</td><td>Only in private sessions (not group chats)</td></tr>
 </tbody></table>
 </div>
 <h3 id="agent-tools"><a class="header" href="#agent-tools">Agent Tools</a></h3>
@@ -2269,7 +2525,7 @@ memory paths and the file watcher to re-index.</p>
 <div class="table-wrapper"><table><thead><tr><th>Feature</th><th>Moltis</th><th>OpenClaw</th></tr></thead><tbody>
 <tr><td><strong>Session storage</strong></td><td>SQLite database</td><td>JSONL files (append-only, tree structure)</td></tr>
 <tr><td><strong>Auto-compaction</strong></td><td>Yes, near context window limit</td><td>Yes, near context window limit</td></tr>
-<tr><td><strong>Manual compaction</strong></td><td>Not yet</td><td><code>/compact</code> command with optional instructions</td></tr>
+<tr><td><strong>Manual compaction</strong></td><td><code>/compact</code> (uses <a href="compaction.html#the-four-modes">configured compaction strategy</a>)</td><td><code>/compact</code> command with optional instructions</td></tr>
 <tr><td><strong>Pre-compaction memory flush</strong></td><td>Silent turn via <code>MemoryWriter</code> trait</td><td>Silent turn via <code>write_file</code> tool</td></tr>
 <tr><td><strong>Flush visibility</strong></td><td>Completely hidden from user</td><td>Hidden via <code>NO_REPLY</code> convention</td></tr>
 <tr><td><strong>Session export to memory</strong></td><td>Markdown files in <code>memory/sessions/</code></td><td>Optional (<code>sessionMemory</code> experimental flag)</td></tr>
@@ -2359,7 +2615,6 @@ re-indexing, reducing reliance on the system prompt for write guidance</li>
 </ul>
 <h2 id="what-openclaw-has-that-moltis-does-not-yet"><a class="header" href="#what-openclaw-has-that-moltis-does-not-yet">What OpenClaw Has That Moltis Does Not (Yet)</a></h2>
 <ul>
-<li><strong>Manual <code>/compact</code> command</strong> with user-specified instructions</li>
 <li><strong>CLI memory commands</strong> (<code>status</code>, <code>index</code>, <code>search</code>) for debugging</li>
 <li><strong>Session pruning</strong> (cache-TTL based trimming of old tool results)</li>
 <li><strong>Gemini and Voyage embedding providers</strong></li>
