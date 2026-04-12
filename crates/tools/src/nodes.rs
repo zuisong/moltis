@@ -5,83 +5,12 @@
 
 use std::sync::Arc;
 
-use {
-    async_trait::async_trait,
-    serde::{Deserialize, Serialize},
-};
+use async_trait::async_trait;
 
 use moltis_agents::tool_registry::AgentTool;
 
-// ── Domain types ────────────────────────────────────────────────────────────
-
-/// Serializable summary of a connected node, returned by the list/describe tools.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeInfo {
-    pub node_id: String,
-    pub display_name: Option<String>,
-    pub platform: String,
-    pub capabilities: Vec<String>,
-    pub commands: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remote_ip: Option<String>,
-    // Telemetry
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem_total: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem_available: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_count: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu_usage: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uptime_secs: Option<u64>,
-    pub services: Vec<String>,
-    pub telemetry_stale: bool,
-    // P1 fields (populated when provider discovery / richer telemetry lands)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_total: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disk_available: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub runtimes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<NodeProviderInfo>,
-}
-
-/// A provider discovered on a remote node (e.g. ollama, openai env key).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeProviderInfo {
-    pub provider: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub models: Vec<String>,
-}
-
-// ── Provider trait ──────────────────────────────────────────────────────────
-
-/// Abstraction that the gateway implements to supply node data to the tools
-/// crate without a direct dependency.
-///
-/// Follows the same pattern as [`crate::exec::NodeExecProvider`].
-#[async_trait]
-pub trait NodeInfoProvider: Send + Sync {
-    /// List all currently connected nodes.
-    async fn list_nodes(&self) -> Vec<NodeInfo>;
-
-    /// Describe a single node by id or display name.
-    async fn describe_node(&self, node_ref: &str) -> Option<NodeInfo>;
-
-    /// Assign (or clear) a node for a chat session.
-    /// `node_ref` is an id or display name; `None` clears the assignment.
-    async fn set_session_node(
-        &self,
-        session_key: &str,
-        node_ref: Option<&str>,
-    ) -> anyhow::Result<Option<String>>;
-
-    /// Resolve a node reference (id or display name) to a canonical node_id.
-    async fn resolve_node_id(&self, node_ref: &str) -> Option<String>;
-}
+// Re-export core node types and trait from the dedicated crate.
+pub use moltis_node_exec_types::{NodeInfo, NodeInfoProvider, NodeProviderInfo};
 
 // ── NodesListTool ───────────────────────────────────────────────────────────
 

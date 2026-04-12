@@ -30,13 +30,13 @@ use crate::{
 
 // Re-export core node execution types from the dedicated crate.
 pub use moltis_node_exec_types::{
-    BLOCKED_ENV_PREFIXES, NodeExecResult, SAFE_ENV_ALLOWLIST, SAFE_ENV_PREFIX_ALLOWLIST,
-    SSH_ID_PREFIX, SSH_TARGET_ID_PREFIX, filter_env, is_safe_env, is_valid_env_key, ssh_node_id,
-    ssh_stored_node_id, ssh_target_matches,
+    BLOCKED_ENV_PREFIXES, NodeExecResult, NodeInfo, NodeInfoProvider, NodeProviderInfo,
+    SAFE_ENV_ALLOWLIST, SAFE_ENV_PREFIX_ALLOWLIST, SSH_ID_PREFIX, SSH_TARGET_ID_PREFIX, filter_env,
+    is_safe_env, is_valid_env_key, ssh_node_id, ssh_stored_node_id, ssh_target_matches,
 };
 
-pub(crate) fn ssh_node_info(target: &str) -> moltis_tools::nodes::NodeInfo {
-    moltis_tools::nodes::NodeInfo {
+pub(crate) fn ssh_node_info(target: &str) -> NodeInfo {
+    NodeInfo {
         node_id: ssh_node_id(target),
         display_name: Some(format!("SSH: {target}")),
         platform: "ssh".to_string(),
@@ -57,12 +57,12 @@ pub(crate) fn ssh_node_info(target: &str) -> moltis_tools::nodes::NodeInfo {
     }
 }
 
-fn ssh_target_node_info(target: &SshResolvedTarget) -> moltis_tools::nodes::NodeInfo {
+fn ssh_target_node_info(target: &SshResolvedTarget) -> NodeInfo {
     let auth_service = match target.auth_mode {
         SshAuthMode::System => "ssh-system",
         SshAuthMode::Managed => "ssh-managed",
     };
-    moltis_tools::nodes::NodeInfo {
+    NodeInfo {
         node_id: ssh_stored_node_id(target.id),
         display_name: Some(format!("SSH: {}", target.label)),
         platform: "ssh".to_string(),
@@ -660,8 +660,8 @@ impl moltis_tools::exec::NodeExecProvider for GatewayNodeExecProvider {
 // ── Node info provider ──────────────────────────────────────────────────────
 
 /// Convert a `NodeSession` into a serializable `NodeInfo`.
-fn node_to_info(n: &crate::nodes::NodeSession) -> moltis_tools::nodes::NodeInfo {
-    moltis_tools::nodes::NodeInfo {
+fn node_to_info(n: &crate::nodes::NodeSession) -> NodeInfo {
+    NodeInfo {
         node_id: n.node_id.clone(),
         display_name: n.display_name.clone(),
         platform: n.platform.clone(),
@@ -683,7 +683,7 @@ fn node_to_info(n: &crate::nodes::NodeSession) -> moltis_tools::nodes::NodeInfo 
         providers: n
             .providers
             .iter()
-            .map(|p| moltis_tools::nodes::NodeProviderInfo {
+            .map(|p| NodeProviderInfo {
                 provider: p.provider.clone(),
                 models: p.models.clone(),
             })
@@ -691,7 +691,7 @@ fn node_to_info(n: &crate::nodes::NodeSession) -> moltis_tools::nodes::NodeInfo 
     }
 }
 
-/// Bridge that implements [`moltis_tools::nodes::NodeInfoProvider`] by
+/// Bridge that implements [`NodeInfoProvider`] by
 /// reading from the `NodeRegistry` and session metadata in `GatewayState`.
 pub struct GatewayNodeInfoProvider {
     state: Arc<GatewayState>,
@@ -708,8 +708,8 @@ impl GatewayNodeInfoProvider {
 }
 
 #[async_trait]
-impl moltis_tools::nodes::NodeInfoProvider for GatewayNodeInfoProvider {
-    async fn list_nodes(&self) -> Vec<moltis_tools::nodes::NodeInfo> {
+impl NodeInfoProvider for GatewayNodeInfoProvider {
+    async fn list_nodes(&self) -> Vec<NodeInfo> {
         let inner = self.state.inner.read().await;
         let mut nodes: Vec<_> = inner.nodes.list().iter().map(|n| node_to_info(n)).collect();
         drop(inner);
@@ -743,7 +743,7 @@ impl moltis_tools::nodes::NodeInfoProvider for GatewayNodeInfoProvider {
         nodes
     }
 
-    async fn describe_node(&self, node_ref: &str) -> Option<moltis_tools::nodes::NodeInfo> {
+    async fn describe_node(&self, node_ref: &str) -> Option<NodeInfo> {
         if let Some(store) = self.state.credential_store.as_ref() {
             match store.resolve_ssh_target(node_ref).await {
                 Ok(Some(target)) => return Some(ssh_target_node_info(&target)),

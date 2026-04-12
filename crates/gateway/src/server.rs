@@ -3966,7 +3966,7 @@ pub async fn prepare_gateway_core(
 
         // Register node info tools (list, describe, select).
         {
-            let node_info_provider: Arc<dyn moltis_tools::nodes::NodeInfoProvider> =
+            let node_info_provider: Arc<dyn moltis_node_exec_types::NodeInfoProvider> =
                 Arc::new(crate::node_exec::GatewayNodeInfoProvider::new(
                     Arc::clone(&state),
                     config.tools.exec.ssh_target.clone(),

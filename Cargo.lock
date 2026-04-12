@@ -7387,6 +7387,8 @@ dependencies = [
 name = "moltis-node-exec-types"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "moltis-metrics",
  "serde",
  "tracing",
@@ -7813,6 +7815,7 @@ dependencies = [
  "moltis-media",
  "moltis-metrics",
  "moltis-network-filter",
+ "moltis-node-exec-types",
  "moltis-providers",
  "moltis-sessions",
  "moltis-skills",
