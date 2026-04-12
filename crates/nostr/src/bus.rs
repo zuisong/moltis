@@ -152,24 +152,53 @@ async fn handle_event(
         return;
     }
 
-    // 5. Access control (BEFORE decryption).
-    //    Read the config and cached allowlist, extract what we need, then drop
-    //    the guards before any `.await` to avoid holding RwLockReadGuard across
-    //    yield points.
-    let (dm_policy, otp_self_approval) = {
-        let cfg = config.read().await;
-        (cfg.dm_policy.clone(), cfg.otp_self_approval)
-    };
-
-    let allowed = cached_allowlist.read().await;
-    let access_result = access::check_dm_access(&event.pubkey, &dm_policy, &allowed);
-    drop(allowed);
-
     let sender_hex = event.pubkey.to_hex();
     let sender_npub = event
         .pubkey
         .to_bech32()
         .unwrap_or_else(|_| sender_hex.clone());
+
+    // 5. Read config fields (drop guard before any .await).
+    let (dm_policy, otp_self_approval) = {
+        let cfg = config.read().await;
+        (cfg.dm_policy.clone(), cfg.otp_self_approval)
+    };
+
+    // 5a. OTP verification — if this sender has a pending challenge, decrypt
+    //     first to check if the message is a 6-digit code, and verify it.
+    //     This must run BEFORE the access-control gate because the sender is
+    //     not yet on the allowlist when they reply with the OTP code.
+    let has_pending = {
+        let guard = otp.lock().unwrap_or_else(|e| e.into_inner());
+        guard.has_pending(&sender_hex)
+    };
+    if has_pending {
+        if let Some(plaintext) = try_decrypt(keys, &event.pubkey, &event.content) {
+            let trimmed = plaintext.trim();
+            if trimmed.len() == 6 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                handle_otp_verification(
+                    otp,
+                    client,
+                    keys,
+                    &event.pubkey,
+                    account_id,
+                    &sender_hex,
+                    &sender_npub,
+                    trimmed,
+                    event_sink,
+                )
+                .await;
+                return;
+            }
+        }
+        // Non-code reply while challenge pending — silently ignore.
+        return;
+    }
+
+    // 5b. Normal access-control gate.
+    let allowed = cached_allowlist.read().await;
+    let access_result = access::check_dm_access(&event.pubkey, &dm_policy, &allowed);
+    drop(allowed);
 
     match &access_result {
         Ok(()) => {},
@@ -268,6 +297,83 @@ async fn handle_event(
     };
 
     event_sink.dispatch_to_chat(text, reply_to, meta).await;
+}
+
+/// Try to decrypt a DM (NIP-04, then NIP-44). Returns `None` on failure.
+fn try_decrypt(keys: &Keys, sender: &PublicKey, content: &str) -> Option<String> {
+    nip04::decrypt(keys.secret_key(), sender, content)
+        .ok()
+        .or_else(|| nip44::decrypt(keys.secret_key(), sender, content).ok())
+}
+
+/// Handle an OTP verification reply (sender sent a 6-digit code).
+#[allow(clippy::too_many_arguments)]
+async fn handle_otp_verification(
+    otp: &SharedOtp,
+    client: &Client,
+    keys: &Keys,
+    sender_pubkey: &PublicKey,
+    account_id: &str,
+    sender_hex: &str,
+    sender_npub: &str,
+    code: &str,
+    event_sink: &Arc<dyn moltis_channels::ChannelEventSink>,
+) {
+    use moltis_channels::otp::{OtpVerifyResult, emit_otp_resolution};
+
+    let result = {
+        let mut guard = otp.lock().unwrap_or_else(|e| e.into_inner());
+        guard.verify(sender_hex, code)
+    };
+
+    let (reply_text, resolution) = match result {
+        OtpVerifyResult::Approved => {
+            // Request the gateway to add this sender to the approved list.
+            event_sink
+                .request_sender_approval("nostr", account_id, sender_hex)
+                .await;
+            ("Access granted. You can now send messages.", "approved")
+        },
+        OtpVerifyResult::WrongCode { attempts_left } => (
+            if attempts_left > 0 {
+                "Wrong code. Please try again."
+            } else {
+                "Too many failed attempts. You are temporarily locked out."
+            },
+            "wrong_code",
+        ),
+        OtpVerifyResult::LockedOut => (
+            "Too many failed attempts. You are temporarily locked out.",
+            "locked_out",
+        ),
+        OtpVerifyResult::NoPending => ("No pending challenge.", "no_pending"),
+        OtpVerifyResult::Expired => (
+            "Challenge expired. Send another message to get a new code.",
+            "expired",
+        ),
+    };
+
+    // Send the reply to the sender.
+    if let Ok(encrypted) = nip04::encrypt(keys.secret_key(), sender_pubkey, reply_text) {
+        let tag = nostr_sdk::prelude::Tag::public_key(*sender_pubkey);
+        let builder =
+            nostr_sdk::prelude::EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted)
+                .tag(tag);
+        if let Err(e) = client.send_event_builder(builder).await {
+            tracing::warn!(account_id, "failed to send OTP verification reply: {e}");
+        }
+    }
+
+    // Emit resolution event for admin UI.
+    emit_otp_resolution(
+        Some(event_sink.as_ref()),
+        moltis_channels::ChannelType::Nostr,
+        account_id,
+        sender_hex,
+        Some(sender_npub),
+        resolution,
+    )
+    .await;
 }
 
 /// Initiate an OTP challenge for a non-allowlisted sender.
