@@ -163,6 +163,7 @@ impl MultiEditTool {
             {
                 return Ok(payload);
             }
+            note_fs_mutation(self.fs_state.as_ref(), session_key, file_path);
             return Ok(json!({
                 "file_path": file_path,
                 "edits_applied": edits.len(),

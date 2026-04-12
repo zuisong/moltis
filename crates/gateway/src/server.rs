@@ -3644,6 +3644,7 @@ pub async fn prepare_gateway_core(
                     .require_approval
                     .then(|| Arc::clone(&approval_manager)),
                 broadcaster: fs_cfg.require_approval.then(|| Arc::clone(&broadcaster)),
+                max_read_bytes: Some(fs_cfg.max_read_bytes),
                 context_window_tokens: fs_cfg.context_window_tokens,
             };
             moltis_tools::fs::register_fs_tools(&mut tool_registry, ctx);

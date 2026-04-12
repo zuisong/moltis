@@ -40,6 +40,8 @@ pub struct ReadTool {
     path_policy: Option<FsPathPolicy>,
     binary_policy: BinaryPolicy,
     sandbox_router: Option<Arc<SandboxRouter>>,
+    /// Override for the file-size gate. `None` → `DEFAULT_MAX_READ_BYTES`.
+    max_read_bytes: Option<u64>,
     /// Optional context window in tokens. When set, Read's byte cap
     /// scales adaptively with the model's working set
     /// (`ctx * 4 chars * 0.2`, clamped to `[50 KB, 512 KB]`).
@@ -85,6 +87,15 @@ impl ReadTool {
         self
     }
 
+    /// Override the maximum file size `Read` will accept. Larger files
+    /// return a typed `too_large` payload. Wired from
+    /// `[tools.fs].max_read_bytes`. Default: `DEFAULT_MAX_READ_BYTES`.
+    #[must_use]
+    pub fn with_max_read_bytes(mut self, max: u64) -> Self {
+        self.max_read_bytes = Some(max);
+        self
+    }
+
     /// Configure the model context window in tokens. Enables the
     /// adaptive byte cap so per-Read payloads scale with the model's
     /// working set instead of using a fixed ceiling.
@@ -92,6 +103,11 @@ impl ReadTool {
     pub fn with_context_window_tokens(mut self, tokens: u64) -> Self {
         self.context_window_tokens = Some(tokens);
         self
+    }
+
+    /// Effective file-size cap: config override or default.
+    fn effective_max_read_bytes(&self) -> u64 {
+        self.max_read_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES)
     }
 
     #[instrument(skip(self), fields(file_path = %file_path))]
@@ -117,7 +133,8 @@ impl ReadTool {
                 return Ok(payload);
             }
             let (backend, id) = ensure_sandbox(router, session_key).await?;
-            let result = sandbox_read(&backend, &id, file_path, DEFAULT_MAX_READ_BYTES).await?;
+            let max = self.effective_max_read_bytes();
+            let result = sandbox_read(&backend, &id, file_path, max).await?;
             match result {
                 SandboxReadResult::Ok(bytes) => {
                     return Ok(self.render_bytes_to_payload(
@@ -131,7 +148,7 @@ impl ReadTool {
                 },
                 other => {
                     return Ok(other
-                        .into_typed_payload(file_path, DEFAULT_MAX_READ_BYTES)
+                        .into_typed_payload(file_path, max)
                         .unwrap_or(json!({})));
                 },
             }
@@ -171,17 +188,18 @@ impl ReadTool {
         }
 
         let size = meta.len();
-        if size > DEFAULT_MAX_READ_BYTES {
+        let max_read = self.effective_max_read_bytes();
+        if size > max_read {
             return Ok(json!({
                 "kind": FsErrorKind::TooLarge.as_str(),
                 "file_path": file_path,
                 "error": format!(
                     "file is too large ({:.1} MB) — maximum is {:.0} MB",
                     size as f64 / (1024.0 * 1024.0),
-                    DEFAULT_MAX_READ_BYTES as f64 / (1024.0 * 1024.0),
+                    max_read as f64 / (1024.0 * 1024.0),
                 ),
                 "bytes": size,
-                "max_bytes": DEFAULT_MAX_READ_BYTES,
+                "max_bytes": max_read,
             }));
         }
 

@@ -420,12 +420,13 @@ fn apply_head_offset<T: Clone>(
     let total = rows.len();
     let start = offset.min(total);
     let slice = &rows[start..];
-    let offset_truncated = start > 0;
-    let (capped, head_truncated) = match head_limit {
+    // Match host-path semantics: truncated means items were *dropped*
+    // by head_limit, not merely that offset was nonzero.
+    let (capped, truncated) = match head_limit {
         Some(limit) if slice.len() > limit => (&slice[..limit], true),
         _ => (slice, false),
     };
-    (capped.to_vec(), offset_truncated || head_truncated)
+    (capped.to_vec(), truncated)
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]

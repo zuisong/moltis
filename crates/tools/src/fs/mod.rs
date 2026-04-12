@@ -72,6 +72,10 @@ pub struct FsToolsContext {
     /// Optional broadcaster paired with [`approval_manager`] so pending
     /// fs mutation approvals show up in the gateway UI.
     pub broadcaster: Option<Arc<dyn ApprovalBroadcaster>>,
+    /// Override for the maximum bytes a single `Read` can return
+    /// before a `too_large` typed error. Wired from
+    /// `[tools.fs].max_read_bytes`. `None` → `DEFAULT_MAX_READ_BYTES`.
+    pub max_read_bytes: Option<u64>,
     /// Model context window in tokens. When set, enables `Read`'s
     /// adaptive byte cap so per-call output scales with the working
     /// set instead of using a fixed 256 KB ceiling.
@@ -92,6 +96,7 @@ impl Default for FsToolsContext {
             sandbox_router: None,
             approval_manager: None,
             broadcaster: None,
+            max_read_bytes: None,
             context_window_tokens: None,
         }
     }
@@ -120,10 +125,14 @@ pub fn register_fs_tools(registry: &mut ToolRegistry, context: FsToolsContext) {
         sandbox_router,
         approval_manager,
         broadcaster,
+        max_read_bytes,
         context_window_tokens,
     } = context;
 
     let mut read = ReadTool::new().with_binary_policy(binary_policy);
+    if let Some(max) = max_read_bytes {
+        read = read.with_max_read_bytes(max);
+    }
     if let Some(tokens) = context_window_tokens {
         read = read.with_context_window_tokens(tokens);
     }

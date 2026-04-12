@@ -122,9 +122,10 @@ pub fn io_error_to_typed_payload(err: &io::Error, file_path: &str) -> Option<Val
     ))
 }
 
-/// Maximum file size the fs tools will read in a single call (phase 1 cap).
+/// Default maximum file size the fs tools will read in a single call.
 ///
-/// Phase 4 will make this configurable via `[tools.fs] max_read_bytes`.
+/// Overridden per-tool via `ReadTool::with_max_read_bytes`, wired from
+/// `[tools.fs].max_read_bytes`.
 pub const DEFAULT_MAX_READ_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Maximum number of lines returned by a single `Read` call when no explicit
