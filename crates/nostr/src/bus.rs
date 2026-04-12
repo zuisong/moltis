@@ -279,21 +279,22 @@ async fn handle_event(
         .await;
 
     // 9. Dispatch to gateway
+    let meta = moltis_channels::ChannelMessageMeta {
+        channel_type: moltis_channels::ChannelType::Nostr,
+        sender_name: None,
+        username: Some(sender_npub),
+        sender_id: Some(sender_hex.clone()),
+        message_kind: Some(moltis_channels::ChannelMessageKind::Text),
+        model: None,
+        audio_filename: None,
+    };
+
     let reply_to = moltis_channels::ChannelReplyTarget {
         channel_type: moltis_channels::ChannelType::Nostr,
         account_id: account_id.to_string(),
         chat_id: sender_hex,
         message_id: Some(event.id.to_hex()),
         thread_id: None,
-    };
-
-    let meta = moltis_channels::ChannelMessageMeta {
-        channel_type: moltis_channels::ChannelType::Nostr,
-        sender_name: None,
-        username: Some(sender_npub),
-        message_kind: Some(moltis_channels::ChannelMessageKind::Text),
-        model: None,
-        audio_filename: None,
     };
 
     event_sink.dispatch_to_chat(text, reply_to, meta).await;
