@@ -392,6 +392,33 @@ fn collect_content_matches(
     rows
 }
 
+/// Post-filter sandbox Grep results against the path policy.
+///
+/// The sandbox bridge can't evaluate the policy inside the container,
+/// so we filter the structured JSON on the host side after the results
+/// come back. Mirrors the per-file filter in the host `grep_impl` and
+/// in `Glob`'s sandbox branch.
+fn filter_sandbox_grep_by_policy(result: &mut Value, policy: &FsPathPolicy) {
+    let denied = |path_value: &Value| -> bool {
+        path_value
+            .as_str()
+            .is_some_and(|p| policy.check(Path::new(p)).is_some())
+    };
+
+    // files_with_matches mode
+    if let Some(arr) = result.get_mut("files").and_then(Value::as_array_mut) {
+        arr.retain(|f| !denied(f));
+    }
+    // content mode
+    if let Some(arr) = result.get_mut("matches").and_then(Value::as_array_mut) {
+        arr.retain(|m| !denied(m.get("path").unwrap_or(&Value::Null)));
+    }
+    // count mode
+    if let Some(arr) = result.get_mut("counts").and_then(Value::as_array_mut) {
+        arr.retain(|c| !denied(c.get("path").unwrap_or(&Value::Null)));
+    }
+}
+
 fn apply_head_offset<T: Clone>(
     rows: Vec<T>,
     offset: usize,
@@ -711,7 +738,7 @@ impl AgentTool for GrepTool {
                         .unwrap_or_default()
                         .to_vec(),
                 };
-                return Ok(sandbox_grep(&backend, &id, SandboxGrepOptions {
+                let mut result = sandbox_grep(&backend, &id, SandboxGrepOptions {
                     pattern: &pattern,
                     path: path_str,
                     mode,
@@ -722,7 +749,16 @@ impl AgentTool for GrepTool {
                     match_cap: (output_mode == OutputMode::Content)
                         .then_some(DEFAULT_GREP_MATCH_CAP),
                 })
-                .await?);
+                .await?;
+
+                // Per-file path policy filter on sandbox results,
+                // mirroring what Glob's sandbox branch does and what
+                // the host grep_impl does via its walk filter.
+                if let Some(ref policy) = self.path_policy {
+                    filter_sandbox_grep_by_policy(&mut result, policy);
+                }
+
+                return Ok(result);
             }
         }
 
