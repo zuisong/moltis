@@ -5,12 +5,18 @@ test.describe("Terminal disabled state", () => {
 	test("shows disabled message when terminal_enabled is false in gon", async ({ page }) => {
 		var errors = watchPageErrors(page);
 
-		// Override gon before the page loads.
+		// Intercept the server's inline `window.__MOLTIS__ = {...}` assignment and
+		// force terminal_enabled off while preserving the rest of the gon payload.
 		await page.addInitScript(() => {
+			var gonValue = { terminal_enabled: false };
 			Object.defineProperty(window, "__MOLTIS__", {
 				configurable: true,
-				writable: true,
-				value: { terminal_enabled: false },
+				get() {
+					return gonValue;
+				},
+				set(value) {
+					gonValue = { ...(value || {}), terminal_enabled: false };
+				},
 			});
 		});
 
@@ -18,7 +24,7 @@ test.describe("Terminal disabled state", () => {
 		await waitForWsConnected(page);
 
 		// The disabled message should be visible.
-		await expect(page.getByText("host terminal has been disabled")).toBeVisible({ timeout: 10_000 });
+		await expect(page.getByText(/host terminal has been disabled/i)).toBeVisible({ timeout: 10_000 });
 
 		// The xterm container should NOT be present.
 		await expect(page.locator("#terminalOutput")).not.toBeVisible();
@@ -33,7 +39,7 @@ test.describe("Terminal disabled state", () => {
 		await waitForWsConnected(page);
 
 		// The disabled message should NOT be visible (terminal_enabled defaults to true).
-		await expect(page.getByText("host terminal has been disabled")).not.toBeVisible();
+		await expect(page.getByText(/host terminal has been disabled/i)).not.toBeVisible();
 
 		// The terminal container or status should be present.
 		await expect(page.locator(".terminal-page")).toBeVisible({ timeout: 10_000 });
