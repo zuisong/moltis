@@ -1973,6 +1973,9 @@ function EditChannelModal() {
 		}
 		if (isNostr) {
 			updateConfig.allowed_pubkeys = allowlistItems.value;
+			// Preserve OTP settings that have no dedicated UI fields yet.
+			updateConfig.otp_self_approval = cfg.otp_self_approval !== false;
+			updateConfig.otp_cooldown_secs = cfg.otp_cooldown_secs ?? 300;
 		}
 		if (!isWhatsApp && !isNostr) {
 			updateConfig.mention_mode = form.querySelector("[data-field=mentionMode]")?.value || "mention";
