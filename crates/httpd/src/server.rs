@@ -2617,6 +2617,12 @@ pub async fn start_gateway(
     if banner.sandbox_backend_name == "none" {
         lines.push("⚠ no container runtime found; commands run on host".into());
     }
+    // Warn when TLS is off and the server is not localhost-only.
+    if !tls_active && !is_localhost {
+        lines.push(
+            "⚠ TLS is disabled on a non-localhost bind address; session cookies will be sent over unencrypted HTTP".into(),
+        );
+    }
     // Display setup code if one was generated.
     if let Some(ref code) = banner.setup_code_display {
         lines.extend(startup_setup_code_lines(code));
@@ -2835,8 +2841,8 @@ async fn ws_upgrade_handler(
     let remote_ip = extract_ws_client_ip(&headers, addr).filter(|ip| is_public_ip(ip));
 
     let is_local = is_local_connection(&headers, addr, state.gateway.behind_proxy);
-    let header_authenticated =
-        websocket_header_authenticated(&headers, state.gateway.credential_store.as_ref(), is_local)
+    let header_identity =
+        websocket_header_authenticate(&headers, state.gateway.credential_store.as_ref(), is_local)
             .await;
     ws.on_upgrade(move |socket| {
         handle_connection(
@@ -2846,7 +2852,7 @@ async fn ws_upgrade_handler(
             addr,
             accept_language,
             remote_ip,
-            header_authenticated,
+            header_identity,
             is_local,
         )
     })
@@ -2939,19 +2945,17 @@ fn is_public_ip(ip: &str) -> bool {
 
 pub(crate) use moltis_auth::locality::is_local_connection;
 
-async fn websocket_header_authenticated(
+async fn websocket_header_authenticate(
     headers: &axum::http::HeaderMap,
     credential_store: Option<&Arc<auth::CredentialStore>>,
     is_local: bool,
-) -> bool {
-    let Some(store) = credential_store else {
-        return false;
-    };
+) -> Option<auth::AuthIdentity> {
+    let store = credential_store?;
 
-    matches!(
-        crate::auth_middleware::check_auth(store, headers, is_local).await,
-        crate::auth_middleware::AuthResult::Allowed(_)
-    )
+    match crate::auth_middleware::check_auth(store, headers, is_local).await {
+        crate::auth_middleware::AuthResult::Allowed(identity) => Some(identity),
+        _ => None,
+    }
 }
 
 /// Resolve the machine's primary outbound IP address.

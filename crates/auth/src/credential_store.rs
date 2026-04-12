@@ -18,6 +18,12 @@ use {
 #[cfg(feature = "vault")]
 use moltis_vault::Vault;
 
+/// Pre-computed Argon2 hash used for constant-time dummy verification when no
+/// password is set. This prevents timing side channels that would reveal
+/// whether a password exists. The actual value doesn't matter — it will
+/// never match any real input.
+const DUMMY_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,13 +497,22 @@ impl CredentialStore {
     }
 
     /// Verify a password against the stored hash.
+    ///
+    /// When no password is set, a dummy Argon2 verification is performed
+    /// to prevent timing side channels that would reveal whether a password
+    /// exists.
     pub async fn verify_password(&self, password: &str) -> anyhow::Result<bool> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT password_hash FROM auth_password WHERE id = 1")
                 .fetch_optional(&self.pool)
                 .await?;
-        let Some((hash,)) = row else {
-            return Ok(false);
+        let hash = match row {
+            Some((h,)) => h,
+            None => {
+                // Perform dummy verification to avoid timing leak.
+                let _ = verify_password(password, DUMMY_ARGON2_HASH);
+                return Ok(false);
+            },
         };
         Ok(verify_password(password, &hash))
     }

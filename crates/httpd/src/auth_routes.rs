@@ -458,6 +458,8 @@ struct ChangePasswordRequest {
 async fn change_password_handler(
     _session: AuthSession,
     State(state): State<AuthState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
     if body.new_password.len() < 12 {
@@ -515,6 +517,17 @@ async fn change_password_handler(
         };
     }
 
+    let client_ip = crate::request_throttle::resolve_client_ip(
+        &headers,
+        addr,
+        state.gateway_state.behind_proxy,
+    );
+    const PASSWORD_CHANGE_ACCOUNT: &str = "__password_change__";
+
+    if let Some(block) = state.login_guard.check(client_ip, PASSWORD_CHANGE_ACCOUNT) {
+        return blocked_response(block);
+    }
+
     let current_password = body.current_password.unwrap_or_default();
     match state
         .credential_store
@@ -522,6 +535,7 @@ async fn change_password_handler(
         .await
     {
         Ok(()) => {
+            state.login_guard.record_success(client_ip);
             // Best-effort vault password rotation.
             #[cfg(feature = "vault")]
             if let Some(ref vault) = state.gateway_state.vault {
@@ -542,6 +556,9 @@ async fn change_password_handler(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("incorrect") {
+                state
+                    .login_guard
+                    .record_failure(client_ip, PASSWORD_CHANGE_ACCOUNT);
                 (StatusCode::FORBIDDEN, msg).into_response()
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
@@ -593,7 +610,17 @@ async fn create_api_key_handler(
         .create_api_key(body.label.trim(), body.scopes.as_deref())
         .await
     {
-        Ok((id, key)) => Json(serde_json::json!({ "id": id, "key": key })).into_response(),
+        Ok((id, key)) => {
+            state
+                .credential_store
+                .audit_log(
+                    "key_created",
+                    None,
+                    Some(&format!("id={id}, label={}", body.label.trim())),
+                )
+                .await;
+            Json(serde_json::json!({ "id": id, "key": key })).into_response()
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -604,7 +631,13 @@ async fn revoke_api_key_handler(
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
     match state.credential_store.revoke_api_key(id).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            state
+                .credential_store
+                .audit_log("key_revoked", None, Some(&format!("id={id}")))
+                .await;
+            Json(serde_json::json!({ "ok": true })).into_response()
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
