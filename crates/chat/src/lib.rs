@@ -1424,7 +1424,7 @@ fn channel_binding_from_runtime_context(
         account_id: host.channel_account_id.clone(),
         chat_id: host.channel_chat_id.clone(),
         chat_type: host.channel_chat_type.clone(),
-        sender_id: None,
+        sender_id: host.channel_sender_id.clone(),
     };
     (!binding.is_empty()).then_some(binding)
 }
@@ -1660,6 +1660,15 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    // Extract sender_id from channel metadata (set by channel handlers).
+    if host.channel_sender_id.is_none() {
+        host.channel_sender_id = params
+            .get("channel")
+            .and_then(|ch| ch.get("sender_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+
     if let Some(timezone) =
         normalized_iana_timezone(params.get("_timezone").and_then(|v| v.as_str()))
             .or_else(default_user_prompt_timezone)
@@ -1709,17 +1718,22 @@ fn build_policy_context(
     params: Option<&Value>,
 ) -> PolicyContext {
     let host = runtime_context.map(|rc| &rc.host);
+    // sender_id: prefer params["channel"]["sender_id"] (fresh from channel
+    // dispatch), fall back to host.channel_sender_id (set by
+    // apply_request_runtime_context earlier in the call chain).
+    let sender_id = params
+        .and_then(|p| p.get("channel"))
+        .and_then(|ch| ch.get("sender_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| host.and_then(|h| h.channel_sender_id.clone()));
     PolicyContext {
         agent_id: agent_id.to_string(),
         provider: host.and_then(|h| h.provider.clone()),
         channel: host.and_then(|h| h.channel_type.clone()),
         channel_account_id: host.and_then(|h| h.channel_account_id.clone()),
         group_id: host.and_then(|h| h.channel_chat_type.clone()),
-        sender_id: params
-            .and_then(|p| p.get("channel"))
-            .and_then(|ch| ch.get("sender_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        sender_id,
         sandboxed: false,
     }
 }
@@ -10158,6 +10172,7 @@ mod tests {
                 channel_account_id: Some("bot-main".to_string()),
                 channel_chat_id: Some("-100123".to_string()),
                 channel_chat_type: Some("channel_or_supergroup".to_string()),
+                channel_sender_id: Some("42".to_string()),
                 ..Default::default()
             },
             ..Default::default()
@@ -10179,6 +10194,7 @@ mod tests {
             tool_context["_channel"]["chat_type"],
             "channel_or_supergroup"
         );
+        assert_eq!(tool_context["_channel"]["sender_id"], "42");
     }
 
     #[test]

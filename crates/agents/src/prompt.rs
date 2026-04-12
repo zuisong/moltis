@@ -69,6 +69,8 @@ pub struct PromptHostRuntimeContext {
     pub channel_chat_id: Option<String>,
     /// Best-effort channel chat type (for example `private`, `group`, `channel`).
     pub channel_chat_type: Option<String>,
+    /// Platform-specific sender/peer ID for the current channel message.
+    pub channel_sender_id: Option<String>,
     /// Persistent Moltis workspace root (`data_dir`), e.g. `~/.moltis`
     /// or `/home/moltis/.moltis` in containerized deploys.
     pub data_dir: Option<String>,
