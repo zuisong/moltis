@@ -1,6 +1,6 @@
 //! Per-account runtime state for Nostr.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use {
     moltis_channels::otp::OtpState,
@@ -16,6 +16,9 @@ use crate::config::NostrAccountConfig;
 /// effect immediately without restarting the account.
 pub type SharedConfig = Arc<RwLock<NostrAccountConfig>>;
 
+/// Shared OTP state — bus loop initiates challenges, plugin reads pending list.
+pub type SharedOtp = Arc<Mutex<OtpState>>;
+
 /// Runtime state for a single active Nostr account.
 pub struct AccountState {
     /// The nostr-sdk client connected to relays.
@@ -28,8 +31,8 @@ pub struct AccountState {
     pub cached_allowlist: Arc<RwLock<Vec<PublicKey>>>,
     /// Cancellation token for the subscription loop.
     pub cancel: CancellationToken,
-    /// OTP self-approval state for non-allowlisted senders.
-    pub otp: OtpState,
+    /// OTP self-approval state — shared with bus loop.
+    pub otp: SharedOtp,
 }
 
 impl std::fmt::Debug for AccountState {

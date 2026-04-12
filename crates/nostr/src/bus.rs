@@ -19,6 +19,7 @@ use crate::{
     access::{self, AccessDenied},
     config::NostrAccountConfig,
     seen::SeenTracker,
+    state::SharedOtp,
 };
 
 #[cfg(feature = "metrics")]
@@ -26,6 +27,9 @@ use moltis_metrics::{counter, nostr as nostr_metrics};
 
 /// Maximum plaintext message size in bytes.
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Message sent to non-allowlisted senders as an OTP challenge prompt.
+const OTP_CHALLENGE_MSG: &str = "You are not on the allowlist. A PIN challenge has been sent to the admin. Reply with the 6-digit code to gain access.";
 
 /// Run the relay subscription loop for a single Nostr account.
 ///
@@ -37,6 +41,7 @@ pub async fn run_subscription_loop(
     keys: Keys,
     config: Arc<RwLock<NostrAccountConfig>>,
     cached_allowlist: Arc<RwLock<Vec<PublicKey>>>,
+    otp: SharedOtp,
     account_id: String,
     event_sink: Arc<dyn moltis_channels::ChannelEventSink>,
     cancel: CancellationToken,
@@ -81,26 +86,26 @@ pub async fn run_subscription_loop(
                     Ok(RelayPoolNotification::Event { event, .. }) => {
                         handle_event(
                             &event,
+                            &client,
                             &keys,
                             &bot_pubkey,
                             since,
                             &mut seen,
                             &config,
                             &cached_allowlist,
+                            &otp,
                             &account_id,
                             &event_sink,
                         ).await;
                     }
                     Ok(RelayPoolNotification::Shutdown) => {
                         tracing::warn!(account_id, "relay pool shutdown — requesting account disable");
-                        // Propagate shutdown to the plugin layer so the account
-                        // can be restarted by the operator or auto-recovery.
                         event_sink
                             .request_disable_account("nostr", &account_id, "relay pool shutdown")
                             .await;
                         break;
                     }
-                    Ok(_) => {} // Message, etc.
+                    Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(account_id, "notification channel error: {e}");
                     }
@@ -116,12 +121,14 @@ pub async fn run_subscription_loop(
 #[allow(clippy::too_many_arguments)]
 async fn handle_event(
     event: &Event,
+    client: &Client,
     keys: &Keys,
     bot_pubkey: &PublicKey,
     since: Timestamp,
     seen: &mut SeenTracker,
     config: &Arc<RwLock<NostrAccountConfig>>,
     cached_allowlist: &Arc<RwLock<Vec<PublicKey>>>,
+    otp: &SharedOtp,
     account_id: &str,
     event_sink: &Arc<dyn moltis_channels::ChannelEventSink>,
 ) {
@@ -178,26 +185,24 @@ async fn handle_event(
             counter!(nostr_metrics::ACCESS_CONTROL_DENIALS_TOTAL, "reason" => "not_allowlisted")
                 .increment(1);
             if otp_self_approval {
-                #[cfg(feature = "metrics")]
-                counter!(nostr_metrics::OTP_CHALLENGES_TOTAL).increment(1);
-                event_sink
-                    .emit(moltis_channels::ChannelEvent::InboundMessage {
-                        channel_type: moltis_channels::ChannelType::Nostr,
-                        account_id: account_id.to_string(),
-                        peer_id: sender_hex.clone(),
-                        username: Some(sender_npub.clone()),
-                        sender_name: None,
-                        message_count: None,
-                        access_granted: false,
-                    })
-                    .await;
-                return;
+                handle_otp_challenge(
+                    client,
+                    keys,
+                    &event.pubkey,
+                    otp,
+                    account_id,
+                    &sender_hex,
+                    &sender_npub,
+                    event_sink,
+                )
+                .await;
+            } else {
+                tracing::debug!(
+                    account_id,
+                    sender = sender_hex,
+                    "DM rejected: not allowlisted"
+                );
             }
-            tracing::debug!(
-                account_id,
-                sender = sender_hex,
-                "DM rejected: not allowlisted"
-            );
             return;
         },
     }
@@ -205,21 +210,18 @@ async fn handle_event(
     // 6. Decrypt content — try NIP-04 first, fall back to NIP-44
     let plaintext = match nip04::decrypt(keys.secret_key(), &event.pubkey, &event.content) {
         Ok(text) => text,
-        Err(_nip04_err) => {
-            // NIP-04 failed — try NIP-44 (some clients use it for kind:4 events)
-            match nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) {
-                Ok(text) => text,
-                Err(nip44_err) => {
-                    #[cfg(feature = "metrics")]
-                    counter!(nostr_metrics::DECRYPT_ERRORS_TOTAL).increment(1);
-                    tracing::warn!(
-                        account_id,
-                        event_id = %event.id,
-                        "decrypt failed (NIP-04 and NIP-44): {nip44_err}"
-                    );
-                    return;
-                },
-            }
+        Err(_nip04_err) => match nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) {
+            Ok(text) => text,
+            Err(nip44_err) => {
+                #[cfg(feature = "metrics")]
+                counter!(nostr_metrics::DECRYPT_ERRORS_TOTAL).increment(1);
+                tracing::warn!(
+                    account_id,
+                    event_id = %event.id,
+                    "decrypt failed (NIP-04 and NIP-44): {nip44_err}"
+                );
+                return;
+            },
         },
     };
 
@@ -266,6 +268,81 @@ async fn handle_event(
     };
 
     event_sink.dispatch_to_chat(text, reply_to, meta).await;
+}
+
+/// Initiate an OTP challenge for a non-allowlisted sender.
+///
+/// Generates a 6-digit code via `OtpState::initiate()`, sends the challenge
+/// prompt to the sender as an encrypted DM, and emits an `OtpChallenge` event
+/// for the admin web UI.
+#[allow(clippy::too_many_arguments)]
+async fn handle_otp_challenge(
+    client: &Client,
+    keys: &Keys,
+    sender_pubkey: &PublicKey,
+    otp: &SharedOtp,
+    account_id: &str,
+    sender_hex: &str,
+    sender_npub: &str,
+    event_sink: &Arc<dyn moltis_channels::ChannelEventSink>,
+) {
+    use moltis_channels::otp::{OtpInitResult, emit_otp_challenge};
+
+    let init_result = {
+        let mut otp_guard = otp.lock().unwrap_or_else(|e| e.into_inner());
+        otp_guard.initiate(sender_hex, Some(sender_npub.to_string()), None)
+    };
+
+    match init_result {
+        OtpInitResult::Created(code) => {
+            // Send challenge prompt to the sender via encrypted DM.
+            if let Ok(encrypted) =
+                nip04::encrypt(keys.secret_key(), sender_pubkey, OTP_CHALLENGE_MSG)
+            {
+                let tag = nostr_sdk::prelude::Tag::public_key(*sender_pubkey);
+                let builder =
+                    nostr_sdk::prelude::EventBuilder::new(Kind::EncryptedDirectMessage, &encrypted)
+                        .tag(tag);
+                if let Err(e) = client.send_event_builder(builder).await {
+                    tracing::warn!(account_id, "failed to send OTP challenge DM: {e}");
+                }
+            }
+
+            // Emit OTP challenge event for the admin UI.
+            let expires_at = ::time::OffsetDateTime::now_utc().unix_timestamp() + 300;
+
+            emit_otp_challenge(
+                Some(event_sink.as_ref()),
+                moltis_channels::ChannelType::Nostr,
+                account_id,
+                sender_hex,
+                Some(sender_npub),
+                None,
+                code,
+                expires_at,
+            )
+            .await;
+
+            #[cfg(feature = "metrics")]
+            counter!(nostr_metrics::OTP_CHALLENGES_TOTAL).increment(1);
+        },
+        OtpInitResult::AlreadyPending | OtpInitResult::LockedOut => {
+            // Silent — don't spam the sender.
+        },
+    }
+
+    // Always emit InboundMessage with access_granted: false for the UI.
+    event_sink
+        .emit(moltis_channels::ChannelEvent::InboundMessage {
+            channel_type: moltis_channels::ChannelType::Nostr,
+            account_id: account_id.to_string(),
+            peer_id: sender_hex.to_string(),
+            username: Some(sender_npub.to_string()),
+            sender_name: None,
+            message_count: None,
+            access_granted: false,
+        })
+        .await;
 }
 
 #[cfg(test)]

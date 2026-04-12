@@ -68,7 +68,10 @@ impl NostrPlugin {
         let accounts = self.accounts.blocking_read();
         accounts
             .get(account_id)
-            .map(|state| state.otp.list_pending())
+            .map(|state| {
+                let otp = state.otp.lock().unwrap_or_else(|e| e.into_inner());
+                otp.list_pending()
+            })
             .unwrap_or_default()
     }
 }
@@ -151,11 +154,15 @@ impl ChannelPlugin for NostrPlugin {
         )));
         let otp_cooldown = nostr_config.otp_cooldown_secs;
         let shared_config = Arc::new(RwLock::new(nostr_config));
+        let shared_otp = Arc::new(std::sync::Mutex::new(moltis_channels::otp::OtpState::new(
+            otp_cooldown,
+        )));
 
         let loop_client = client.clone();
         let loop_keys = bot_keys.clone();
         let loop_config = Arc::clone(&shared_config);
         let loop_allowlist = Arc::clone(&cached_allowlist);
+        let loop_otp = Arc::clone(&shared_otp);
         let loop_account_id = account_id.to_string();
         let loop_cancel = cancel.clone();
         let loop_sink = Arc::clone(&event_sink);
@@ -166,6 +173,7 @@ impl ChannelPlugin for NostrPlugin {
                 loop_keys,
                 loop_config,
                 loop_allowlist,
+                loop_otp,
                 loop_account_id,
                 loop_sink,
                 loop_cancel,
@@ -180,7 +188,7 @@ impl ChannelPlugin for NostrPlugin {
             config: shared_config,
             cached_allowlist,
             cancel,
-            otp: moltis_channels::otp::OtpState::new(otp_cooldown),
+            otp: shared_otp,
         };
 
         self.accounts
