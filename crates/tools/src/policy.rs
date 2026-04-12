@@ -292,15 +292,17 @@ mod tests {
         let mut cfg = moltis_config::MoltisConfig::default();
         cfg.tools.policy.allow = vec!["*".into()];
 
-        let mut provider_entry = moltis_config::schema::ProviderEntry::default();
-        provider_entry.policy = Some(moltis_config::schema::ToolPolicyConfig {
-            allow: Vec::new(),
-            deny: vec!["exec".into()],
-            profile: None,
-        });
-        cfg.providers
-            .providers
-            .insert("openai".into(), provider_entry);
+        cfg.providers.providers.insert(
+            "openai".into(),
+            moltis_config::schema::ProviderEntry {
+                policy: Some(moltis_config::schema::ToolPolicyConfig {
+                    allow: Vec::new(),
+                    deny: vec!["exec".into()],
+                    profile: None,
+                }),
+                ..Default::default()
+            },
+        );
 
         let ctx = PolicyContext {
             agent_id: "test".into(),
