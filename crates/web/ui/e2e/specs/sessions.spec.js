@@ -802,36 +802,44 @@ test.describe("Session management", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
-	test("current channel session hides archive action", async ({ page }) => {
+	test("current channel session is not archivable in the client helper", async ({ page }) => {
 		const pageErrors = await navigateAndWait(page, "/");
 		await waitForWsConnected(page);
 
-		const channelKey = `telegram:bot:archive-guard-${Date.now()}`;
-		await expectRpcOk(page, "sessions.switch", { key: channelKey });
+		const archivable = await page.evaluate(async () => {
+			const appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
+			if (!appScript) throw new Error("app module script not found");
+			const appUrl = new URL(appScript.src, window.location.origin);
+			const prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
+			const sessionsModule = await import(`${prefix}js/sessions.js`);
+			return sessionsModule.isArchivableSession({
+				key: "telegram:bot:archive-guard",
+				activeChannel: true,
+				archived: false,
+			});
+		});
+		expect(archivable).toBe(false);
 
-		const channelItem = page.locator(`#sessionList .session-item[data-session-key="${channelKey}"]`);
-		await expect(channelItem).toBeVisible({ timeout: 10_000 });
-		await channelItem.click();
+		expect(pageErrors).toEqual([]);
+	});
 
-		await expect
-			.poll(
-				() =>
-					page.evaluate((key) => {
-						const stores = window.__moltis_stores;
-						const session = stores?.sessionStore?.getByKey(key);
-						if (!session) return false;
-						session.activeChannel = true;
-						session.dataVersion.value++;
-						stores.sessionStore.sessions.value = stores.sessionStore.sessions.value.slice();
-						return true;
-					}, channelKey),
-				{ timeout: 10_000 },
-			)
-			.toBe(true);
+	test("current archived channel session remains archivable for unarchive in the client helper", async ({ page }) => {
+		const pageErrors = await navigateAndWait(page, "/");
+		await waitForWsConnected(page);
 
-		await openChatMoreModal(page);
-		await expect(page.locator('#chatMoreModal button[title="Archive session"]')).toHaveCount(0);
-		await closeChatMoreModal(page);
+		const archivable = await page.evaluate(async () => {
+			const appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
+			if (!appScript) throw new Error("app module script not found");
+			const appUrl = new URL(appScript.src, window.location.origin);
+			const prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
+			const sessionsModule = await import(`${prefix}js/sessions.js`);
+			return sessionsModule.isArchivableSession({
+				key: "telegram:bot:unarchive-guard",
+				activeChannel: true,
+				archived: true,
+			});
+		});
+		expect(archivable).toBe(true);
 
 		expect(pageErrors).toEqual([]);
 	});

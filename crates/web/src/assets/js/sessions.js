@@ -545,7 +545,7 @@ newSessionBtn.addEventListener("click", () => {
 });
 
 export function isArchivableSession(session) {
-	return session.key !== "main" && session.activeChannel !== true;
+	return session.key !== "main" && (session.activeChannel !== true || session.archived === true);
 }
 
 function isClearableSession(session) {

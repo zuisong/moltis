@@ -467,7 +467,7 @@ impl SessionService for LiveSessionService {
             .get(key)
             .await
             .ok_or_else(|| format!("session '{key}' not found"))?;
-        if p.archived.is_some() && !is_archivable_entry(&self.metadata, &entry).await {
+        if p.archived == Some(true) && !is_archivable_entry(&self.metadata, &entry).await {
             return Err(ServiceError::message(format!(
                 "session '{key}' cannot be archived"
             )));
