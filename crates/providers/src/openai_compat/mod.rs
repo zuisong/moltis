@@ -3,9 +3,11 @@
 //! This module provides reusable functions for parsing OpenAI-style SSE streams
 //! that include tool calls. Used by openai.rs, github_copilot.rs, and kimi_code.rs.
 
+mod schema_normalization;
+
 use std::collections::{HashMap, HashSet};
 
-use {serde::Serialize, tracing::trace};
+use {schema_normalization::sanitize_schema_for_openai_compat, serde::Serialize, tracing::trace};
 
 use moltis_agents::model::{
     ChatMessage, CompletionResponse, StreamEvent, ToolCall, Usage, UserContent,
@@ -226,6 +228,7 @@ pub fn to_openai_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
         .filter_map(|t| {
             // Clone parameters and patch for strict mode
             let mut params = t["parameters"].clone();
+            sanitize_schema_for_openai_compat(&mut params);
             patch_schema_for_strict_mode(&mut params);
 
             let name = t["name"].as_str()?.to_string();
@@ -273,6 +276,7 @@ pub fn to_responses_api_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Va
         .filter_map(|t| {
             // Clone parameters and patch for strict mode
             let mut params = t["parameters"].clone();
+            sanitize_schema_for_openai_compat(&mut params);
             patch_schema_for_strict_mode(&mut params);
 
             let name = t["name"].as_str()?.to_string();
@@ -1111,7 +1115,10 @@ pub fn parse_responses_completion(resp: &serde_json::Value) -> CompletionRespons
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_responses_completion, parse_tool_calls};
+    use super::{
+        parse_responses_completion, parse_tool_calls, sanitize_schema_for_openai_compat,
+        to_responses_api_tools,
+    };
 
     #[test]
     fn parse_tool_calls_preserves_native_falsy_types() {
@@ -1206,5 +1213,167 @@ mod tests {
         assert_eq!(result.tool_calls[0].arguments["offset"], 0);
         assert_eq!(result.tool_calls[0].arguments["multiline"], false);
         assert!(result.tool_calls[0].arguments["type"].is_null());
+    }
+
+    #[test]
+    fn responses_tools_strip_nested_not_schemas() {
+        let tools = vec![serde_json::json!({
+            "name": "mcp__attio__list-attribute-definitions",
+            "description": "Attio test tool",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "anyOf": [
+                            {
+                                "anyOf": [
+                                    {
+                                        "not": {
+                                            "const": ""
+                                        }
+                                    },
+                                    {
+                                        "type": "string"
+                                    }
+                                ]
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    }
+                }
+            }
+        })];
+
+        let converted = to_responses_api_tools(&tools);
+        let params = &converted[0]["parameters"];
+        let encoded = params.to_string();
+
+        assert_eq!(converted[0]["strict"], true);
+        assert!(!encoded.contains("\"not\""));
+        assert_eq!(params["type"], "object");
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["required"], serde_json::json!(["query"]));
+    }
+
+    #[test]
+    fn sanitize_schema_for_openai_compat_strips_recursive_unsupported_keywords() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": {
+                        "mode": { "type": "string" }
+                    },
+                    "if": {
+                        "required": ["mode"]
+                    },
+                    "then": {
+                        "properties": {
+                            "enabled": { "type": "boolean" }
+                        }
+                    },
+                    "else": {
+                        "properties": {
+                            "enabled": { "type": "boolean" }
+                        }
+                    },
+                    "dependentSchemas": {
+                        "mode": {
+                            "properties": {
+                                "extra": { "type": "string" }
+                            }
+                        }
+                    },
+                    "patternProperties": {
+                        "^x-": { "type": "string" }
+                    },
+                    "dependentRequired": {
+                        "mode": ["enabled"]
+                    },
+                    "unevaluatedProperties": false,
+                    "unevaluatedItems": false,
+                    "propertyNames": {
+                        "minLength": 1
+                    },
+                    "contains": {
+                        "type": "string"
+                    },
+                    "minContains": 1,
+                    "maxContains": 2,
+                    "const": "active",
+                    "x-custom": "remove-me",
+                    "items": {
+                        "not": {
+                            "type": "integer"
+                        }
+                    }
+                }
+            }
+        });
+
+        sanitize_schema_for_openai_compat(&mut schema);
+        let encoded = schema.to_string();
+
+        for keyword in [
+            "\"if\"",
+            "\"then\"",
+            "\"else\"",
+            "\"dependentSchemas\"",
+            "\"patternProperties\"",
+            "\"dependentRequired\"",
+            "\"unevaluatedProperties\"",
+            "\"unevaluatedItems\"",
+            "\"propertyNames\"",
+            "\"contains\"",
+            "\"minContains\"",
+            "\"maxContains\"",
+            "\"not\"",
+            "\"x-custom\"",
+        ] {
+            assert!(!encoded.contains(keyword), "{keyword} should be removed");
+        }
+        assert_eq!(
+            schema["properties"]["config"]["enum"],
+            serde_json::json!(["active"])
+        );
+        assert_eq!(
+            schema["properties"]["config"]["properties"]["mode"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn sanitize_schema_for_openai_compat_recurses_into_array_form_items() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tuple": {
+                    "type": "array",
+                    "items": [
+                        {
+                            "type": "string",
+                            "not": { "const": "" }
+                        },
+                        {
+                            "type": "object",
+                            "patternProperties": {
+                                "^x-": { "type": "string" }
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        sanitize_schema_for_openai_compat(&mut schema);
+
+        let Some(tuple_items) = schema["properties"]["tuple"]["items"].as_array() else {
+            panic!("tuple items should remain an array");
+        };
+        assert!(tuple_items[0].get("not").is_none());
+        assert!(tuple_items[1].get("patternProperties").is_none());
     }
 }
