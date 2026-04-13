@@ -2316,48 +2316,26 @@ function VoiceStep({ onNext, onBack }) {
 // ── Channel step ────────────────────────────────────────────
 
 function ChannelTypeSelector({ onSelect, offered }) {
-	return html`<div class="flex gap-3">
-		${
-			offered.has("telegram") &&
-			html`<button type="button" class="backend-card flex-1 items-center gap-3 py-6" onClick=${() => onSelect("telegram")}>
-			<span class="icon icon-xl icon-telegram"></span>
-			<span class="text-sm font-medium text-[var(--text-strong)]">Telegram</span>
-		</button>`
-		}
-		${
-			offered.has("whatsapp") &&
-			html`<button type="button" class="backend-card flex-1 items-center gap-3 py-6" onClick=${() => onSelect("whatsapp")}>
-			<span class="icon icon-xl icon-whatsapp"></span>
-			<span class="text-sm font-medium text-[var(--text-strong)]">WhatsApp</span>
-		</button>`
-		}
-		${
-			offered.has("msteams") &&
-			html`<button type="button" class="backend-card flex-1 items-center gap-3 py-6" onClick=${() => onSelect("msteams")}>
-			<span class="icon icon-xl icon-msteams"></span>
-			<span class="text-sm font-medium text-[var(--text-strong)]">Microsoft Teams</span>
-		</button>`
-		}
-		${
-			offered.has("discord") &&
-			html`<button type="button" class="backend-card flex-1 items-center gap-3 py-6" onClick=${() => onSelect("discord")}>
-			<span class="icon icon-xl icon-discord"></span>
-			<span class="text-sm font-medium text-[var(--text-strong)]">Discord</span>
-		</button>`
-		}
-		${
-			offered.has("matrix") &&
-			html`<button type="button" class="backend-card flex-1 items-center gap-3 py-6" onClick=${() => onSelect("matrix")}>
-			<span class="icon icon-xl icon-matrix"></span>
-			<span class="text-sm font-medium text-[var(--text-strong)]">Matrix</span>
-		</button>`
-		}
-		${
-			offered.has("nostr") &&
-			html`<button type="button" class="backend-card flex-1 items-center gap-3 py-6" onClick=${() => onSelect("nostr")}>
-			<span class="text-sm font-medium text-[var(--text-strong)]">Nostr</span>
-		</button>`
-		}
+	var channelOptions = [
+		["telegram", "icon-telegram", "Telegram"],
+		["whatsapp", "icon-whatsapp", "WhatsApp"],
+		["msteams", "icon-msteams", "Microsoft Teams"],
+		["discord", "icon-discord", "Discord"],
+		["matrix", "icon-matrix", "Matrix"],
+		["nostr", "icon-nostr", "Nostr"],
+	].filter(([type]) => offered.has(type));
+
+	return html`<div class="grid grid-cols-2 gap-3 md:grid-cols-3" data-testid="channel-type-selector">
+		${channelOptions.map(
+			([type, iconClass, label]) => html`<button
+					key=${type}
+					type="button"
+					class="backend-card w-full min-h-[120px] items-center justify-center gap-4 px-4 py-8 text-center"
+					onClick=${() => onSelect(type)}>
+					<span class=${`icon icon-xl ${iconClass}`}></span>
+					<span class="text-sm font-medium text-[var(--text-strong)]">${label}</span>
+				</button>`,
+		)}
 	</div>`;
 }
 

@@ -12,6 +12,28 @@ test.describe("Nostr channel", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("connect button renders a nostr icon mask", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await navigateAndWait(page, "/settings/channels");
+		await waitForWsConnected(page);
+
+		const addButton = page.getByRole("button", { name: "Connect Nostr", exact: true });
+		await expect(addButton).toBeVisible();
+
+		const icon = addButton.locator(".icon.icon-nostr");
+		await expect(icon).toBeVisible();
+		await expect
+			.poll(() =>
+				icon.evaluate((node) => {
+					const style = window.getComputedStyle(node);
+					return style.maskImage || style.webkitMaskImage || "";
+				}),
+			)
+			.not.toBe("none");
+
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("add modal has secret key, relays, and DM policy fields", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/settings/channels");

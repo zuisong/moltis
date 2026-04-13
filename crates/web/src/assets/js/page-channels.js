@@ -503,7 +503,7 @@ function ConnectButtons() {
 			onClick=${() => {
 				if (connected.value) showAddNostr.value = true;
 			}}>
-			Connect Nostr
+			<span class="icon icon-nostr"></span> Connect Nostr
 		</button>`
 		}
 	</div>`;
@@ -1976,7 +1976,7 @@ function EditChannelModal() {
 			updateConfig.otp_self_approval = cfg.otp_self_approval !== false;
 			updateConfig.otp_cooldown_secs = cfg.otp_cooldown_secs ?? 300;
 		}
-		if (!isWhatsApp && !isNostr) {
+		if (!(isWhatsApp || isNostr)) {
 			updateConfig.mention_mode = form.querySelector("[data-field=mentionMode]")?.value || "mention";
 		}
 		addChannelCredentials(updateConfig, form);
