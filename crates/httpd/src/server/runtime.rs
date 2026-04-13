@@ -914,7 +914,7 @@ pub(super) async fn start_ngrok_tunnel(
     webauthn_registry: Option<SharedWebAuthnRegistry>,
     ngrok_config: &moltis_config::NgrokConfig,
 ) -> anyhow::Result<NgrokActiveTunnel> {
-    use ngrok::prelude::{EndpointInfo, ForwarderBuilder};
+    use ::ngrok::prelude::{EndpointInfo, ForwarderBuilder};
 
     let internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let internal_addr = internal_listener.local_addr()?;
@@ -941,7 +941,7 @@ pub(super) async fn start_ngrok_tunnel(
         .parse()
         .map_err(|error| anyhow::anyhow!("invalid ngrok forward target: {error}"))?;
 
-    let mut session_builder = ngrok::Session::builder();
+    let mut session_builder = ::ngrok::Session::builder();
     if let Some(authtoken) = ngrok_config.authtoken.as_ref() {
         session_builder.authtoken(authtoken.expose_secret());
     } else {

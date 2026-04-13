@@ -83,10 +83,12 @@ pub use handlers::is_same_origin;
 // `runtime::{attach_ngrok_controller_owner, ngrok_loopback_has_proxy_headers}` —
 //   handlers.rs tests (ngrok-only).
 #[cfg(feature = "ngrok")]
+#[cfg(test)]
 use builder::build_gateway_base_internal;
 #[allow(unused_imports)]
 use handlers::*;
 #[cfg(feature = "ngrok")]
+#[cfg(test)]
 use runtime::{attach_ngrok_controller_owner, ngrok_loopback_has_proxy_headers};
 
 // ── Shared app state ─────────────────────────────────────────────────────────

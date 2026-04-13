@@ -14,9 +14,6 @@ use {
     moltis_sessions::session_events::SessionEventBus,
 };
 
-#[cfg(feature = "ngrok")]
-use super::ngrok::NgrokController;
-
 #[cfg(not(feature = "ngrok"))]
 use super::builder::build_gateway_base;
 #[cfg(feature = "ngrok")]
