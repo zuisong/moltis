@@ -19,6 +19,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260413.02] - 2026-04-13
+### Added
+- [voice] Add base_url config for OpenAI TTS and Whisper STT providers
+
+
+### Changed
+- [browser] Type browserless API version as enum
+- [nodes] Extract core types and constants to dedicated crate
+- [nodes] Move pure ssh and env helper functions to node-exec-types
+- [mcp] Extract config parsing functions to moltis-mcp
+- [mcp] Extract MCP-agent tool bridge to dedicated crate
+- Group lock-free broadcast state into Broadcaster struct
+- [tools] Unify cron schema field helper
+
+
+### Fixed
+- [telegram] Persist inbound documents
+- [review] Make inbound document replay robust
+- [browser] Add Browserless v2 websocket fallback support
+- [browser] Change log level from warn to debug for sandboxed browser websocket connection failures
+- Complete MCP bridge extraction and address Greptile review
+- [broadcast] Make seq private, add #[must_use] to next_seq, add tests
+- [chat] Serialize data dir override tests
+- [voice] Address PR review feedback
+- [tools] Hide wasm internals and relax cron schema
+- [tools] Simplify cron schema unions
+- [agents] Preserve legacy tool-call compatibility
+
+
+### Security
+- [nodes] Define NodeInfoProvider trait for decoupling
+
 ## [20260413.01] - 2026-04-13
 
 ## [20260412.01] - 2026-04-12
