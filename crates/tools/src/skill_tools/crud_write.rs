@@ -1,8 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 
-use super::*;
-
 #[tokio::test]
 async fn test_create_skill() {
     let tmp = tempfile::tempdir().unwrap();

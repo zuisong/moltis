@@ -18,9 +18,6 @@ use {
 
 use super::outbound_to_for_msg;
 
-#[cfg(feature = "metrics")]
-use moltis_metrics::{counter, telegram as tg_metrics};
-
 use crate::Result;
 
 pub(super) fn extract_text(msg: &Message) -> Option<String> {

@@ -2,5 +2,7 @@
 
 use super::*;
 
+#[path = "crud_write.rs"]
 mod crud_write;
+#[path = "read.rs"]
 mod read;
