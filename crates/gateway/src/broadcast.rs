@@ -48,12 +48,6 @@ impl Broadcaster {
     }
 }
 
-impl Default for Broadcaster {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ── Scope guards ─────────────────────────────────────────────────────────────
 
 /// Events that require specific scopes to receive.
