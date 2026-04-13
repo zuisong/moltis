@@ -4,7 +4,10 @@ use std::{
     sync::Mutex,
 };
 
-use tracing::{debug, info, warn};
+use {
+    serde::{Deserialize, Serialize},
+    tracing::{debug, info, warn},
+};
 
 use crate::{
     env_subst::substitute_env,
@@ -334,6 +337,11 @@ pub fn user_path() -> PathBuf {
     data_dir().join("USER.md")
 }
 
+/// Path to workspace boot context markdown.
+pub fn boot_path() -> PathBuf {
+    data_dir().join("BOOT.md")
+}
+
 /// Path to workspace tool-guidance markdown.
 pub fn tools_path() -> PathBuf {
     data_dir().join("TOOLS.md")
@@ -347,6 +355,22 @@ pub fn heartbeat_path() -> PathBuf {
 /// Path to the workspace `MEMORY.md` file.
 pub fn memory_path() -> PathBuf {
     data_dir().join("MEMORY.md")
+}
+
+/// Origin of a loaded workspace markdown file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMarkdownSource {
+    AgentWorkspace,
+    RootWorkspace,
+}
+
+/// Loaded workspace markdown content with its source path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadedWorkspaceMarkdown {
+    pub content: String,
+    pub path: PathBuf,
+    pub source: WorkspaceMarkdownSource,
 }
 
 /// Return the workspace directory for a named agent: `data_dir()/agents/<id>`.
@@ -394,6 +418,29 @@ pub fn resolve_identity() -> ResolvedIdentity {
     resolve_identity_from_config(&config)
 }
 
+/// Build a fully-resolved user profile by merging `moltis.toml` `[user]` with `USER.md`.
+pub fn resolve_user_profile() -> UserProfile {
+    let config = discover_and_load();
+    resolve_user_profile_from_config(&config)
+}
+
+/// Like [`resolve_user_profile`] but accepts a pre-loaded config.
+pub fn resolve_user_profile_from_config(config: &MoltisConfig) -> UserProfile {
+    let mut user = config.user.clone();
+    if let Some(file_user) = load_user() {
+        if file_user.name.is_some() {
+            user.name = file_user.name;
+        }
+        if file_user.timezone.is_some() {
+            user.timezone = file_user.timezone;
+        }
+        if file_user.location.is_some() {
+            user.location = file_user.location;
+        }
+    }
+    user
+}
+
 /// Like [`resolve_identity`] but accepts a pre-loaded config.
 pub fn resolve_identity_from_config(config: &MoltisConfig) -> ResolvedIdentity {
     let mut id = ResolvedIdentity::from_config(config);
@@ -413,9 +460,7 @@ pub fn resolve_identity_from_config(config: &MoltisConfig) -> ResolvedIdentity {
         }
     }
 
-    if let Some(file_user) = load_user()
-        && let Some(name) = file_user.name
-    {
+    if let Some(name) = resolve_user_profile_from_config(config).name {
         id.user_name = Some(name);
     }
 
@@ -554,6 +599,17 @@ pub fn load_agents_md_for_agent(agent_id: &str) -> Option<String> {
     load_workspace_markdown(agent_path).or_else(load_agents_md)
 }
 
+/// Load BOOT.md from the workspace root (`data_dir`) if present and non-empty.
+pub fn load_boot_md() -> Option<String> {
+    load_workspace_markdown(boot_path())
+}
+
+/// Load BOOT.md for a specific agent, falling back to the root file.
+pub fn load_boot_md_for_agent(agent_id: &str) -> Option<String> {
+    let agent_path = agent_workspace_dir(agent_id).join("BOOT.md");
+    load_workspace_markdown(agent_path).or_else(load_boot_md)
+}
+
 /// Load TOOLS.md from the workspace root (`data_dir`) if present and non-empty.
 pub fn load_tools_md() -> Option<String> {
     load_workspace_markdown(tools_path())
@@ -580,14 +636,30 @@ pub fn load_memory_md() -> Option<String> {
 /// For `"main"`, this checks `data_dir()/agents/main/MEMORY.md` first and
 /// falls back to the root `MEMORY.md`.
 pub fn load_memory_md_for_agent(agent_id: &str) -> Option<String> {
+    load_memory_md_for_agent_with_source(agent_id).map(|loaded| loaded.content)
+}
+
+/// Load MEMORY.md for a specific agent workspace and report its resolved path.
+///
+/// For `"main"`, this checks `data_dir()/agents/main/MEMORY.md` first and
+/// falls back to the root `MEMORY.md`.
+pub fn load_memory_md_for_agent_with_source(agent_id: &str) -> Option<LoadedWorkspaceMarkdown> {
     if agent_id == "main" {
         let main_path = agent_workspace_dir("main").join("MEMORY.md");
-        if let Some(memory) = load_workspace_markdown(main_path) {
+        if let Some(memory) =
+            load_workspace_markdown_with_source(main_path, WorkspaceMarkdownSource::AgentWorkspace)
+        {
             return Some(memory);
         }
-        return load_memory_md();
+        return load_workspace_markdown_with_source(
+            memory_path(),
+            WorkspaceMarkdownSource::RootWorkspace,
+        );
     }
-    load_workspace_markdown(agent_workspace_dir(agent_id).join("MEMORY.md"))
+    load_workspace_markdown_with_source(
+        agent_workspace_dir(agent_id).join("MEMORY.md"),
+        WorkspaceMarkdownSource::AgentWorkspace,
+    )
 }
 
 /// Persist SOUL.md in the workspace root (`data_dir`).
@@ -742,6 +814,25 @@ pub fn save_user(user: &UserProfile) -> crate::Result<PathBuf> {
     Ok(path)
 }
 
+/// Persist `USER.md` according to the configured write mode.
+///
+/// When writes are disabled, any existing `USER.md` file is removed and no new
+/// file is created.
+pub fn save_user_with_mode(
+    user: &UserProfile,
+    mode: crate::schema::UserProfileWriteMode,
+) -> crate::Result<Option<PathBuf>> {
+    if mode.allows_explicit_write() {
+        return save_user(user).map(Some);
+    }
+
+    let path = user_path();
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    Ok(None)
+}
+
 pub fn extract_yaml_frontmatter(content: &str) -> Option<&str> {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
@@ -868,14 +959,29 @@ fn yaml_scalar(value: &str) -> String {
     }
 }
 
-fn load_workspace_markdown(path: PathBuf) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let trimmed = strip_leading_html_comments(&content).trim();
+pub fn normalize_workspace_markdown_content(content: &str) -> Option<String> {
+    let trimmed = strip_leading_html_comments(content).trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn load_workspace_markdown(path: PathBuf) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    normalize_workspace_markdown_content(&content)
+}
+
+fn load_workspace_markdown_with_source(
+    path: PathBuf,
+    source: WorkspaceMarkdownSource,
+) -> Option<LoadedWorkspaceMarkdown> {
+    load_workspace_markdown(path.clone()).map(|content| LoadedWorkspaceMarkdown {
+        content,
+        path,
+        source,
+    })
 }
 
 fn load_identity_from_path(path: &Path) -> Option<AgentIdentity> {
@@ -1033,9 +1139,50 @@ fn merge_toml_tables(current: &mut toml_edit::Table, updated: &toml_edit::Table)
         if let Some(current_item) = current.get_mut(key) {
             merge_toml_items(current_item, updated_item);
         } else {
-            current.insert(key, updated_item.clone());
+            // Clone the item and strip `doc_position` metadata inherited from
+            // the source document.  Without this, toml_edit uses the position
+            // from the *serialized* document, causing new sub-tables to be
+            // interleaved among existing sections instead of appearing after
+            // their parent (GH-684).
+            current.insert(key, clone_item_without_positions(updated_item));
         }
     }
+}
+
+/// Deep-clone a `toml_edit::Item`, stripping `doc_position` from every table
+/// so that newly inserted entries get auto-positioned by `toml_edit` rather
+/// than inheriting stale positions from a different document.
+fn clone_item_without_positions(item: &toml_edit::Item) -> toml_edit::Item {
+    match item {
+        toml_edit::Item::Table(t) => toml_edit::Item::Table(clone_table_without_positions(t)),
+        toml_edit::Item::ArrayOfTables(arr) => {
+            let mut new_arr = toml_edit::ArrayOfTables::new();
+            for table in arr.iter() {
+                new_arr.push(clone_table_without_positions(table));
+            }
+            toml_edit::Item::ArrayOfTables(new_arr)
+        },
+        other => other.clone(),
+    }
+}
+
+/// Clone a table, recursively stripping `doc_position` so new tables get
+/// auto-positioned when inserted into a different document.
+fn clone_table_without_positions(src: &toml_edit::Table) -> toml_edit::Table {
+    let mut dst = toml_edit::Table::new();
+    // doc_position is None for manually created tables → auto-positioned
+    dst.set_implicit(src.is_implicit());
+    dst.set_dotted(src.is_dotted());
+    *dst.decor_mut() = src.decor().clone();
+    for (key, item) in src.iter() {
+        dst.insert(key, clone_item_without_positions(item));
+        // Preserve key decorations (whitespace/comments around the key)
+        if let (Some(src_key), Some(mut dst_key)) = (src.key(key), dst.key_mut(key)) {
+            *dst_key.leaf_decor_mut() = src_key.leaf_decor().clone();
+            *dst_key.dotted_decor_mut() = src_key.dotted_decor().clone();
+        }
+    }
+    dst
 }
 
 fn merge_toml_items(current: &mut toml_edit::Item, updated: &toml_edit::Item) {
@@ -1660,6 +1807,108 @@ name = "Rex"
     }
 
     #[test]
+    fn resolve_user_profile_prefers_user_md_over_config() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        let config = MoltisConfig {
+            user: UserProfile {
+                name: Some("Config User".to_string()),
+                timezone: Some(crate::schema::Timezone::from(chrono_tz::Europe::Paris)),
+                location: Some(crate::schema::GeoLocation {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    place: Some("Config Place".to_string()),
+                    updated_at: Some(100),
+                }),
+            },
+            ..Default::default()
+        };
+        save_user(&UserProfile {
+            name: Some("File User".to_string()),
+            timezone: Some(crate::schema::Timezone::from(chrono_tz::US::Eastern)),
+            location: Some(crate::schema::GeoLocation {
+                latitude: 3.0,
+                longitude: 4.0,
+                place: Some("File Place".to_string()),
+                updated_at: Some(200),
+            }),
+        })
+        .expect("save user");
+
+        let resolved = resolve_user_profile_from_config(&config);
+        assert_eq!(resolved.name.as_deref(), Some("File User"));
+        assert_eq!(
+            resolved.timezone.as_ref().map(|tz| tz.name()),
+            Some("US/Eastern")
+        );
+        let location = resolved.location.expect("resolved location");
+        assert_eq!(location.place.as_deref(), Some("File Place"));
+        assert_eq!(location.updated_at, Some(200));
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn save_user_with_mode_off_removes_existing_file() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        let user = UserProfile {
+            name: Some("Alice".to_string()),
+            ..Default::default()
+        };
+        let path = save_user(&user).expect("seed user");
+        assert!(path.exists());
+
+        let saved_path = save_user_with_mode(&user, crate::schema::UserProfileWriteMode::Off)
+            .expect("disable user profile writes");
+        assert!(saved_path.is_none());
+        assert!(!path.exists());
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_boot_md_reads_trimmed_content() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("BOOT.md"), "\n  Run startup checks.  \n").unwrap();
+        assert_eq!(load_boot_md().as_deref(), Some("Run startup checks."));
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_boot_md_for_agent_falls_back_to_root() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("BOOT.md"), "Root boot context").unwrap();
+        // No agent-specific file — should fall back to root.
+        assert_eq!(
+            load_boot_md_for_agent("test-agent").as_deref(),
+            Some("Root boot context")
+        );
+
+        // Agent-specific file overrides root.
+        let agent_dir = dir.path().join("agents").join("test-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("BOOT.md"), "Agent-specific boot").unwrap();
+        assert_eq!(
+            load_boot_md_for_agent("test-agent").as_deref(),
+            Some("Agent-specific boot")
+        );
+
+        clear_data_dir();
+    }
+
+    #[test]
     fn load_tools_md_reads_trimmed_content() {
         let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1728,6 +1977,72 @@ name = "Rex"
         set_data_dir(dir.path().to_path_buf());
 
         assert_eq!(load_memory_md(), None);
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_memory_md_for_main_prefers_agent_workspace_then_root() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("MEMORY.md"), "root memory").unwrap();
+        assert_eq!(
+            load_memory_md_for_agent("main").as_deref(),
+            Some("root memory")
+        );
+
+        let agent_dir = dir.path().join("agents").join("main");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("MEMORY.md"), "main agent memory").unwrap();
+        assert_eq!(
+            load_memory_md_for_agent("main").as_deref(),
+            Some("main agent memory")
+        );
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_memory_md_for_non_main_is_agent_scoped() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("MEMORY.md"), "root memory").unwrap();
+        assert_eq!(load_memory_md_for_agent("ops"), None);
+
+        let agent_dir = dir.path().join("agents").join("ops");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("MEMORY.md"), "ops memory").unwrap();
+        assert_eq!(
+            load_memory_md_for_agent("ops").as_deref(),
+            Some("ops memory")
+        );
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_memory_md_for_agent_reports_resolved_source_and_path() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("MEMORY.md"), "root memory").unwrap();
+        let main_root = load_memory_md_for_agent_with_source("main").unwrap();
+        assert_eq!(main_root.content, "root memory");
+        assert_eq!(main_root.path, dir.path().join("MEMORY.md"));
+        assert_eq!(main_root.source, WorkspaceMarkdownSource::RootWorkspace);
+
+        let agent_dir = dir.path().join("agents").join("ops");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("MEMORY.md"), "ops memory").unwrap();
+        let ops_memory = load_memory_md_for_agent_with_source("ops").unwrap();
+        assert_eq!(ops_memory.content, "ops memory");
+        assert_eq!(ops_memory.path, agent_dir.join("MEMORY.md"));
+        assert_eq!(ops_memory.source, WorkspaceMarkdownSource::AgentWorkspace);
 
         clear_data_dir();
     }
@@ -1970,5 +2285,142 @@ name = "Rex"
         assert_eq!(result, Some(dir.path().join("share")));
 
         clear_data_dir();
+    }
+
+    #[test]
+    fn normalize_workspace_markdown_content_strips_leading_comments_and_trims() {
+        let content = "<!-- comment -->\n\n  hello world  \n";
+        let normalized = normalize_workspace_markdown_content(content);
+        assert_eq!(normalized.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn normalize_workspace_markdown_content_returns_none_for_comment_only_content() {
+        let content = "  <!-- comment -->\n\n<!-- another -->  ";
+        let normalized = normalize_workspace_markdown_content(content);
+        assert_eq!(normalized, None);
+    }
+
+    /// GH-684: section order must be preserved after a save roundtrip.
+    #[test]
+    fn gh684_template_section_order_preserved_after_save() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("moltis.toml");
+        let template = crate::template::default_config_template(18789);
+        std::fs::write(&path, &template).expect("write template");
+
+        let template_sections: Vec<String> = template
+            .lines()
+            .filter(|l| l.starts_with('['))
+            .map(|l| l.to_string())
+            .collect();
+
+        // Load, modify, save — simulating a web UI setting change
+        let raw = std::fs::read_to_string(&path).expect("read");
+        let mut config: MoltisConfig = parse_config(&raw, &path).expect("parse");
+        config.auth.disabled = true;
+        config.server.http_request_logs = true;
+
+        save_config_to_path(&path, &config).expect("save config");
+
+        let saved = std::fs::read_to_string(&path).expect("read saved");
+        let saved_sections: Vec<String> = saved
+            .lines()
+            .filter(|l| l.starts_with('['))
+            .map(|l| l.to_string())
+            .collect();
+
+        // Every template section must still exist in the saved file
+        for ts in &template_sections {
+            assert!(
+                saved_sections.contains(ts),
+                "template section {ts} missing from saved file"
+            );
+        }
+
+        // Template sections must maintain their relative order
+        let template_positions: Vec<usize> = template_sections
+            .iter()
+            .map(|ts| {
+                saved_sections
+                    .iter()
+                    .position(|ss| ss == ts)
+                    .unwrap_or_else(|| panic!("section {ts} not found in saved"))
+            })
+            .collect();
+        for window in template_positions.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "template sections swapped: saved position {} >= {} \
+                 (sections around index {})",
+                window[0],
+                window[1],
+                window[0],
+            );
+        }
+    }
+
+    /// GH-684: new sub-tables must render after their parent, not interleaved
+    /// with unrelated sections.
+    #[test]
+    fn gh684_new_subtables_render_after_parent() {
+        let original = r#"[server]
+port = 8080
+
+[channels]
+offered = ["telegram"]
+
+[memory]
+enabled = true
+"#;
+
+        let updated = r#"[server]
+port = 8080
+
+[channels]
+offered = ["telegram"]
+
+[channels.telegram]
+token = "abc"
+
+[channels.whatsapp]
+token = "xyz"
+
+[memory]
+enabled = true
+"#;
+
+        let mut current_doc = original.parse::<toml_edit::DocumentMut>().unwrap();
+        let updated_doc = updated.parse::<toml_edit::DocumentMut>().unwrap();
+
+        merge_toml_tables(current_doc.as_table_mut(), updated_doc.as_table());
+        let result = current_doc.to_string();
+
+        let sections: Vec<&str> = result.lines().filter(|l| l.starts_with('[')).collect();
+
+        // Expected order: server, channels, channels.telegram, channels.whatsapp, memory
+        let channels_idx = sections.iter().position(|s| *s == "[channels]").unwrap();
+        let telegram_idx = sections
+            .iter()
+            .position(|s| *s == "[channels.telegram]")
+            .unwrap();
+        let whatsapp_idx = sections
+            .iter()
+            .position(|s| *s == "[channels.whatsapp]")
+            .unwrap();
+        let memory_idx = sections.iter().position(|s| *s == "[memory]").unwrap();
+
+        assert!(
+            channels_idx < telegram_idx,
+            "[channels.telegram] must come after [channels]"
+        );
+        assert!(
+            telegram_idx < whatsapp_idx,
+            "[channels.whatsapp] must come after [channels.telegram]"
+        );
+        assert!(
+            whatsapp_idx < memory_idx,
+            "[memory] must come after channel sub-tables"
+        );
     }
 }

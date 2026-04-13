@@ -18,6 +18,9 @@ use {
     moltis_tools::sandbox::SandboxRouter,
 };
 
+#[cfg(feature = "fs-tools")]
+use moltis_tools::fs::FsState;
+
 use crate::{
     agent_persona::AgentPersonaStore,
     services::{ServiceError, ServiceResult, SessionService, TtsService},
@@ -37,6 +40,27 @@ const SESSION_PREVIEW_MAX_CHARS: usize = 200;
 const UI_HISTORY_MAX_BYTES: usize = 2 * 1024 * 1024;
 const UI_HISTORY_MIN_MESSAGES: usize = 120;
 const UI_HISTORY_TRIM_STEP: usize = 50;
+
+fn resolve_hook_channel_binding(
+    session_key: &str,
+    session_entry: Option<&moltis_sessions::metadata::SessionEntry>,
+) -> Option<moltis_common::hooks::ChannelBinding> {
+    let binding = match moltis_channels::resolve_session_channel_binding(
+        session_key,
+        session_entry.and_then(|entry| entry.channel_binding.as_deref()),
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            warn!(
+                error = %error,
+                session = %session_key,
+                "failed to parse channel_binding JSON; falling back to web"
+            );
+            moltis_channels::web_session_channel_binding()
+        },
+    };
+    (!binding.is_empty()).then_some(binding)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -810,6 +834,8 @@ pub struct LiveSessionService {
     hook_registry: Option<Arc<HookRegistry>>,
     state_store: Option<Arc<SessionStateStore>>,
     browser_service: Option<Arc<dyn crate::services::BrowserService>>,
+    #[cfg(feature = "fs-tools")]
+    fs_state: Option<FsState>,
 }
 
 impl LiveSessionService {
@@ -825,6 +851,8 @@ impl LiveSessionService {
             hook_registry: None,
             state_store: None,
             browser_service: None,
+            #[cfg(feature = "fs-tools")]
+            fs_state: None,
         }
     }
 
@@ -868,6 +896,12 @@ impl LiveSessionService {
         browser: Arc<dyn crate::services::BrowserService>,
     ) -> Self {
         self.browser_service = Some(browser);
+        self
+    }
+
+    #[cfg(feature = "fs-tools")]
+    pub fn with_fs_state(mut self, fs_state: FsState) -> Self {
+        self.fs_state = Some(fs_state);
         self
     }
 
@@ -989,6 +1023,7 @@ impl SessionService for LiveSessionService {
                             target.channel_type.as_str(),
                             &target.account_id,
                             &target.chat_id,
+                            target.thread_id.as_deref(),
                         )
                         .await
                         .map(|k| k == e.key)
@@ -1086,8 +1121,10 @@ impl SessionService for LiveSessionService {
             if entry.message_count == 0
                 && let Some(ref hooks) = self.hook_registry
             {
+                let channel = resolve_hook_channel_binding(key, Some(&entry));
                 let payload = moltis_common::hooks::HookPayload::SessionStart {
                     session_key: key.to_string(),
+                    channel,
                 };
                 if let Err(e) = hooks.dispatch(&payload).await {
                     warn!(session = %key, error = %e, "SessionStart hook failed");
@@ -1135,8 +1172,10 @@ impl SessionService for LiveSessionService {
         if raw_history.is_empty()
             && let Some(ref hooks) = self.hook_registry
         {
+            let channel = resolve_hook_channel_binding(key, Some(&entry));
             let payload = moltis_common::hooks::HookPayload::SessionStart {
                 session_key: key.to_string(),
+                channel,
             };
             if let Err(e) = hooks.dispatch(&payload).await {
                 warn!(session = %key, error = %e, "SessionStart hook failed");
@@ -1181,9 +1220,6 @@ impl SessionService for LiveSessionService {
             .await
             .ok_or_else(|| format!("session '{key}' not found"))?;
         if p.label.is_some() {
-            if entry.channel_binding.is_some() {
-                return Err("cannot rename a channel-bound session".into());
-            }
             let _ = self.metadata.upsert(key, p.label).await;
         }
         if p.model.is_some() {
@@ -1621,6 +1657,14 @@ impl SessionService for LiveSessionService {
             tracing::warn!("session state cleanup for {key}: {e}");
         }
 
+        #[cfg(feature = "fs-tools")]
+        if let Some(ref fs_state) = self.fs_state {
+            let mut guard = fs_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.remove_session(key);
+        }
+
         self.metadata.remove(key).await;
 
         // Dispatch SessionEnd hook (read-only).
@@ -1890,7 +1934,36 @@ impl SessionService for LiveSessionService {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        async_trait::async_trait,
+        moltis_common::hooks::{HookAction, HookEvent, HookHandler, HookPayload},
+    };
+
+    struct RecordingHook {
+        payloads: Arc<std::sync::Mutex<Vec<HookPayload>>>,
+    }
+
+    #[async_trait]
+    impl HookHandler for RecordingHook {
+        fn name(&self) -> &str {
+            "recording-hook"
+        }
+
+        fn events(&self) -> &[HookEvent] {
+            static EVENTS: [HookEvent; 1] = [HookEvent::SessionStart];
+            &EVENTS
+        }
+
+        async fn handle(
+            &self,
+            _event: HookEvent,
+            payload: &HookPayload,
+        ) -> moltis_common::error::Result<HookAction> {
+            self.payloads.lock().unwrap().push(payload.clone());
+            Ok(HookAction::Continue)
+        }
+    }
 
     #[test]
     fn filter_ui_history_removes_empty_assistant_messages() {
@@ -2718,6 +2791,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_dispatches_session_start_with_channel_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        let key = "telegram:bot-main:-100123";
+        metadata.upsert(key, None).await.unwrap();
+        let binding_json = serde_json::to_string(&moltis_channels::ChannelReplyTarget {
+            channel_type: moltis_channels::ChannelType::Telegram,
+            account_id: "bot-main".to_string(),
+            chat_id: "-100123".to_string(),
+            message_id: Some("9".to_string()),
+            thread_id: None,
+        })
+        .unwrap();
+        metadata.set_channel_binding(key, Some(binding_json)).await;
+
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hook_registry = HookRegistry::new();
+        hook_registry.register(Arc::new(RecordingHook {
+            payloads: Arc::clone(&payloads),
+        }));
+
+        let service = LiveSessionService::new(store, metadata).with_hooks(Arc::new(hook_registry));
+        service
+            .resolve(serde_json::json!({ "key": key, "include_history": false }))
+            .await
+            .unwrap();
+
+        let payloads = payloads.lock().unwrap();
+        let payload = payloads
+            .first()
+            .unwrap_or_else(|| panic!("missing SessionStart payload"));
+        match payload {
+            HookPayload::SessionStart { channel, .. } => {
+                let channel = channel.clone().unwrap_or_else(|| panic!("missing channel"));
+                assert_eq!(channel.surface.as_deref(), Some("telegram"));
+                assert_eq!(channel.session_kind.as_deref(), Some("channel"));
+                assert_eq!(channel.channel_type.as_deref(), Some("telegram"));
+                assert_eq!(channel.account_id.as_deref(), Some("bot-main"));
+                assert_eq!(channel.chat_id.as_deref(), Some("-100123"));
+                assert_eq!(channel.chat_type.as_deref(), Some("channel_or_supergroup"));
+            },
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_dispatches_session_start_with_web_binding_for_unbound_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        metadata.upsert("main", None).await.unwrap();
+
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hook_registry = HookRegistry::new();
+        hook_registry.register(Arc::new(RecordingHook {
+            payloads: Arc::clone(&payloads),
+        }));
+
+        let service = LiveSessionService::new(store, metadata).with_hooks(Arc::new(hook_registry));
+        service
+            .resolve(serde_json::json!({ "key": "main", "include_history": false }))
+            .await
+            .unwrap();
+
+        let payloads = payloads.lock().unwrap();
+        let payload = payloads
+            .first()
+            .unwrap_or_else(|| panic!("missing SessionStart payload"));
+        match payload {
+            HookPayload::SessionStart { channel, .. } => {
+                let channel = channel.clone().unwrap_or_else(|| panic!("missing channel"));
+                assert_eq!(channel.surface.as_deref(), Some("web"));
+                assert_eq!(channel.session_kind.as_deref(), Some("web"));
+                assert!(channel.channel_type.is_none());
+                assert!(channel.account_id.is_none());
+                assert!(channel.chat_id.is_none());
+            },
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_dispatches_session_start_with_web_binding_for_invalid_channel_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        let key = "telegram:bot-main:-100123";
+        metadata.upsert(key, None).await.unwrap();
+        metadata
+            .set_channel_binding(key, Some("{not-json".to_string()))
+            .await;
+
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hook_registry = HookRegistry::new();
+        hook_registry.register(Arc::new(RecordingHook {
+            payloads: Arc::clone(&payloads),
+        }));
+
+        let service = LiveSessionService::new(store, metadata).with_hooks(Arc::new(hook_registry));
+        service
+            .resolve(serde_json::json!({ "key": key, "include_history": false }))
+            .await
+            .unwrap();
+
+        let payloads = payloads.lock().unwrap();
+        let payload = payloads
+            .first()
+            .unwrap_or_else(|| panic!("missing SessionStart payload"));
+        match payload {
+            HookPayload::SessionStart { channel, .. } => {
+                let channel = channel.clone().unwrap_or_else(|| panic!("missing channel"));
+                assert_eq!(channel.surface.as_deref(), Some("web"));
+                assert_eq!(channel.session_kind.as_deref(), Some("web"));
+                assert!(channel.channel_type.is_none());
+                assert!(channel.account_id.is_none());
+                assert!(channel.chat_id.is_none());
+            },
+            other => panic!("unexpected payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn with_browser_service_builder() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
@@ -2858,5 +3057,40 @@ mod tests {
             content.contains("cleared"),
             "notification should mention cleared"
         );
+    }
+
+    #[cfg(feature = "fs-tools")]
+    #[tokio::test]
+    async fn delete_clears_fs_state_for_session() {
+        use std::path::{Path, PathBuf};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+        metadata
+            .upsert("side", Some("Test".to_string()))
+            .await
+            .unwrap();
+
+        let fs_state = moltis_tools::fs::new_fs_state(false);
+        {
+            let mut guard = fs_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _ = guard.record_read("side", PathBuf::from("/tmp/demo.txt"), 0, 25, None);
+            assert!(guard.has_been_read("side", Path::new("/tmp/demo.txt")));
+        }
+
+        let svc = LiveSessionService::new(Arc::clone(&store), Arc::clone(&metadata))
+            .with_fs_state(Arc::clone(&fs_state));
+
+        let result = svc.delete(serde_json::json!({ "key": "side" })).await;
+        assert!(result.is_ok());
+
+        let guard = fs_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(!guard.has_been_read("side", Path::new("/tmp/demo.txt")));
     }
 }

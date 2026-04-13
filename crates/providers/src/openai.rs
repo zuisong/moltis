@@ -69,7 +69,10 @@ const DEFAULT_OPENAI_MODELS: &[ModelCatalogEntry] = &[
 pub fn default_model_catalog() -> Vec<super::DiscoveredModel> {
     DEFAULT_OPENAI_MODELS
         .iter()
-        .map(|entry| super::DiscoveredModel::new(entry.id, entry.display_name))
+        .map(|entry| {
+            super::DiscoveredModel::new(entry.id, entry.display_name)
+                .with_recommended(is_recommended_openai_model(entry.id))
+        })
         .collect()
 }
 
@@ -181,9 +184,20 @@ fn parse_model_entry(entry: &serde_json::Value) -> Option<super::DiscoveredModel
 
     let created_at = obj.get("created").and_then(serde_json::Value::as_i64);
 
+    let recommended = is_recommended_openai_model(model_id);
     Some(
         super::DiscoveredModel::new(model_id, normalize_display_name(model_id, display_name))
-            .with_created_at(created_at),
+            .with_created_at(created_at)
+            .with_recommended(recommended),
+    )
+}
+
+/// Known OpenAI flagship model IDs (latest generation, no date suffix).
+/// These are the models most users care about.
+fn is_recommended_openai_model(model_id: &str) -> bool {
+    matches!(
+        model_id,
+        "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-pro" | "o4-mini" | "o3"
     )
 }
 
@@ -337,14 +351,14 @@ fn models_endpoint(base_url: &str) -> String {
 ///
 /// The Responses API includes `output_index` on most events. Falls back to
 /// `item_index` / `index` for robustness, then to `fallback`.
-async fn fetch_models_from_api(
+pub async fn fetch_models_from_api(
     api_key: secrecy::Secret<String>,
     base_url: String,
 ) -> anyhow::Result<Vec<super::DiscoveredModel>> {
     let client = crate::shared_http_client();
     let response = client
         .get(models_endpoint(&base_url))
-        .timeout(Duration::from_secs(8))
+        .timeout(Duration::from_secs(15))
         .header(
             "Authorization",
             format!("Bearer {}", api_key.expose_secret()),
@@ -516,6 +530,181 @@ impl OpenAiProvider {
         }
     }
 
+    fn apply_probe_output_cap_chat(&self, body: &mut serde_json::Value) {
+        let raw = super::raw_model_id(&self.model).to_ascii_lowercase();
+        let capability = raw.rsplit('/').next().unwrap_or(raw.as_str());
+        let uses_max_completion_tokens = capability.starts_with("gpt-5")
+            || capability.starts_with("o1")
+            || capability.starts_with("o3")
+            || capability.starts_with("o4");
+        if uses_max_completion_tokens {
+            // GPT-5 and reasoning models need a higher minimum output cap.
+            // Values below ~10 can trigger 400 errors on some models.
+            body["max_completion_tokens"] = serde_json::json!(16);
+        } else {
+            body["max_tokens"] = serde_json::json!(1);
+        }
+    }
+
+    async fn probe_chat_completions(&self) -> anyhow::Result<()> {
+        let messages = vec![ChatMessage::user("ping")];
+        let mut openai_messages = self.serialize_messages_for_request(&messages);
+        self.apply_openrouter_cache_control(&mut openai_messages);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": openai_messages,
+        });
+        self.apply_system_prompt_rewrite(&mut body);
+        // Probes only answer "can this model respond at all?".
+        // Keep them cheap instead of mirroring full reasoning budgets.
+        self.apply_probe_output_cap_chat(&mut body);
+
+        debug!(model = %self.model, "openai probe request");
+        trace!(body = %serde_json::to_string(&body).unwrap_or_default(), "openai probe request body");
+
+        let http_resp = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let retry_after_ms = super::retry_after_ms_from_headers(http_resp.headers());
+            let body_text = http_resp.text().await.unwrap_or_default();
+            if should_warn_on_api_error(status, &body_text) {
+                warn!(
+                    status = %status,
+                    model = %self.model,
+                    provider = %self.provider_name,
+                    body = %body_text,
+                    "openai probe API error"
+                );
+            } else {
+                debug!(
+                    status = %status,
+                    model = %self.model,
+                    provider = %self.provider_name,
+                    "openai probe model unsupported for chat/completions endpoint"
+                );
+            }
+            // Ollama's OpenAI-compat layer returns 404 for models that
+            // exist but aren't wired to /v1/chat/completions.  Fall back
+            // to the native `/api/show` endpoint before giving up.
+            if status == reqwest::StatusCode::NOT_FOUND
+                && self.provider_name.eq_ignore_ascii_case("ollama")
+            {
+                return self.probe_ollama_native().await;
+            }
+
+            anyhow::bail!(
+                "{}",
+                super::with_retry_after_marker(
+                    format!("OpenAI API error HTTP {status}: {body_text}"),
+                    retry_after_ms,
+                )
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Fallback probe for Ollama: POST `/api/show` with the model name.
+    ///
+    /// This confirms the model is installed and Ollama is reachable even when
+    /// the OpenAI-compat `/v1/chat/completions` endpoint returns 404.
+    async fn probe_ollama_native(&self) -> anyhow::Result<()> {
+        let api_base = super::normalize_ollama_api_base_url(&self.base_url);
+        let url = format!("{}/api/show", api_base.trim_end_matches('/'));
+
+        debug!(model = %self.model, url = %url, "ollama native probe via /api/show");
+
+        let mut req = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "name": self.model }));
+        let key = self.api_key.expose_secret();
+        if !key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {key}"));
+        }
+        let resp = req.send().await?;
+
+        if resp.status().is_success() {
+            return Ok(());
+        }
+
+        let status = resp.status();
+        let body_text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Model '{}' not found. Make sure it is installed (ollama pull {}) \
+             and try again. (Ollama /api/show returned HTTP {}: {})",
+            self.model,
+            self.model,
+            status,
+            body_text,
+        )
+    }
+
+    async fn probe_responses(&self) -> anyhow::Result<()> {
+        let messages = vec![ChatMessage::user("ping")];
+        let (instructions, input) = split_responses_instructions_and_input(messages);
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "input": input,
+            "max_output_tokens": 1,
+        });
+
+        if let Some(instructions) = instructions {
+            body["instructions"] = serde_json::Value::String(instructions);
+        }
+
+        self.apply_reasoning_effort_responses(&mut body);
+
+        debug!(model = %self.model, "openai responses probe request");
+        trace!(body = %serde_json::to_string(&body).unwrap_or_default(), "openai responses probe request body");
+
+        let url = self.responses_sse_url();
+        let http_resp = self
+            .client
+            .post(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_key.expose_secret()),
+            )
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = http_resp.status();
+        if !status.is_success() {
+            let retry_after_ms = super::retry_after_ms_from_headers(http_resp.headers());
+            let body_text = http_resp.text().await.unwrap_or_default();
+            warn!(
+                status = %status,
+                model = %self.model,
+                provider = %self.provider_name,
+                body = %body_text,
+                "openai responses probe API error"
+            );
+            anyhow::bail!(
+                "{}",
+                super::with_retry_after_marker(
+                    format!("OpenAI API error HTTP {status}: {body_text}"),
+                    retry_after_ms,
+                )
+            );
+        }
+
+        Ok(())
+    }
+
     fn requires_reasoning_content_on_tool_messages(&self) -> bool {
         self.provider_name.eq_ignore_ascii_case("moonshot")
             || self.base_url.contains("moonshot.ai")
@@ -523,35 +712,87 @@ impl OpenAiProvider {
             || self.model.starts_with("kimi-")
     }
 
-    fn requires_top_level_system_prompt(&self) -> bool {
-        false
+    /// Some providers (e.g. MiniMax) reject `role: "system"` in the messages
+    /// array. System content must be extracted and prepended to the first user
+    /// message instead (MiniMax silently ignores a top-level `"system"` field).
+    fn rejects_system_role(&self) -> bool {
+        self.model.starts_with("MiniMax-")
+            || self.provider_name.eq_ignore_ascii_case("minimax")
+            || self.base_url.to_ascii_lowercase().contains("minimax")
     }
 
-    fn prepare_request_messages(
-        &self,
-        messages: Vec<serde_json::Value>,
-    ) -> (Vec<serde_json::Value>, Option<String>) {
-        if !self.requires_top_level_system_prompt() {
-            return (messages, None);
+    /// For providers that reject `role: "system"` in the messages array,
+    /// extract all system messages from `body["messages"]`, join their
+    /// content, and prepend it to the first user message.
+    ///
+    /// MiniMax's `/v1/chat/completions` endpoint returns error 2013 for
+    /// `role: "system"` entries and silently ignores a top-level `"system"`
+    /// field. The only reliable way to deliver the system prompt is to
+    /// inline it into the first user message.
+    ///
+    /// Must be called on the request body **after** it is fully assembled.
+    fn apply_system_prompt_rewrite(&self, body: &mut serde_json::Value) {
+        if !self.rejects_system_role() {
+            return;
         }
-
+        let Some(messages) = body
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
         let mut system_parts = Vec::new();
-        let mut out = Vec::with_capacity(messages.len());
-
-        for message in messages {
-            if message.get("role").and_then(serde_json::Value::as_str) == Some("system") {
-                if let Some(content) = message.get("content").and_then(serde_json::Value::as_str)
+        messages.retain(|msg| {
+            if msg.get("role").and_then(serde_json::Value::as_str) == Some("system") {
+                if let Some(content) = msg.get("content").and_then(serde_json::Value::as_str)
                     && !content.is_empty()
                 {
                     system_parts.push(content.to_string());
+                } else if msg.get("content").is_some() {
+                    warn!("MiniMax system message has non-string content; it will be dropped");
                 }
-                continue;
+                return false;
             }
-            out.push(message);
+            true
+        });
+        if system_parts.is_empty() {
+            return;
         }
+        let system_text = system_parts.join("\n\n");
 
-        let system_prompt = (!system_parts.is_empty()).then(|| system_parts.join("\n\n"));
-        (out, system_prompt)
+        // Find the first user message and prepend system content to it.
+        let system_block =
+            format!("[System Instructions]\n{system_text}\n[End System Instructions]\n\n");
+        if let Some(first_user) = messages
+            .iter_mut()
+            .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        {
+            match first_user.get("content").cloned() {
+                Some(serde_json::Value::String(s)) => {
+                    first_user["content"] = serde_json::Value::String(format!("{system_block}{s}"));
+                },
+                Some(serde_json::Value::Array(mut arr)) => {
+                    // Multimodal content (text + images): prepend as a text block.
+                    arr.insert(
+                        0,
+                        serde_json::json!({ "type": "text", "text": system_block }),
+                    );
+                    first_user["content"] = serde_json::Value::Array(arr);
+                },
+                _ => {
+                    first_user["content"] = serde_json::Value::String(system_block);
+                },
+            }
+        } else {
+            // No user message yet (e.g. probe); insert a synthetic user message.
+            messages.insert(
+                0,
+                serde_json::json!({
+                    "role": "user",
+                    "content": format!("[System Instructions]\n{system_text}\n[End System Instructions]")
+                }),
+            );
+        }
     }
 
     fn serialize_messages_for_request(&self, messages: &[ChatMessage]) -> Vec<serde_json::Value> {
@@ -888,8 +1129,7 @@ impl OpenAiProvider {
         tools: Vec<serde_json::Value>,
     ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
         Box::pin(async_stream::stream! {
-            let serialized_messages = self.serialize_messages_for_request(&messages);
-            let (mut openai_messages, system_prompt) = self.prepare_request_messages(serialized_messages);
+            let mut openai_messages = self.serialize_messages_for_request(&messages);
             self.apply_openrouter_cache_control(&mut openai_messages);
             let mut body = serde_json::json!({
                 "model": self.model,
@@ -897,10 +1137,7 @@ impl OpenAiProvider {
                 "stream": true,
                 "stream_options": { "include_usage": true },
             });
-
-            if let Some(system_prompt) = system_prompt {
-                body["system"] = serde_json::Value::String(system_prompt);
-            }
+            self.apply_system_prompt_rewrite(&mut body);
 
             if !tools.is_empty() {
                 body["tools"] = serde_json::Value::Array(to_openai_tools(&tools));
@@ -1124,6 +1361,8 @@ impl OpenAiProvider {
 
             let mut input_tokens: u32 = 0;
             let mut output_tokens: u32 = 0;
+            let mut cache_read_tokens: u32 = 0;
+            let mut cache_write_tokens: u32 = 0;
             let mut current_tool_index: usize = 0;
             let mut tool_calls: HashMap<usize, (String, String)> = HashMap::new();
             let mut completed_tool_calls: HashSet<usize> = HashSet::new();
@@ -1193,6 +1432,8 @@ impl OpenAiProvider {
                             let parsed = parse_openai_compat_usage(usage);
                             input_tokens = parsed.input_tokens;
                             output_tokens = parsed.output_tokens;
+                            cache_read_tokens = parsed.cache_read_tokens;
+                            cache_write_tokens = parsed.cache_write_tokens;
                         }
                         let mut pending: Vec<usize> = tool_calls.keys().copied().collect();
                         pending.sort_unstable();
@@ -1238,7 +1479,8 @@ impl OpenAiProvider {
             yield StreamEvent::Done(Usage {
                 input_tokens,
                 output_tokens,
-                ..Default::default()
+                cache_read_tokens,
+                cache_write_tokens,
             });
         })
     }
@@ -1307,6 +1549,8 @@ impl OpenAiProvider {
         let mut fn_call_args: Vec<String> = Vec::new();
         let mut input_tokens: u32 = 0;
         let mut output_tokens: u32 = 0;
+        let mut cache_read_tokens: u32 = 0;
+        let cache_write_tokens: u32 = 0;
 
         let full_body = http_resp.text().await.unwrap_or_default();
         for line in full_body.lines() {
@@ -1354,6 +1598,11 @@ impl OpenAiProvider {
                             u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                         output_tokens =
                             u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                        cache_read_tokens = u
+                            .get("input_tokens_details")
+                            .and_then(|d| d.get("cached_tokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
                     }
                 },
                 "error" | "response.failed" => {
@@ -1398,7 +1647,8 @@ impl OpenAiProvider {
             usage: Usage {
                 input_tokens,
                 output_tokens,
-                ..Default::default()
+                cache_read_tokens,
+                cache_write_tokens,
             },
         })
     }
@@ -1515,18 +1765,13 @@ impl LlmProvider for OpenAiProvider {
             return self.complete_responses(messages, tools).await;
         }
 
-        let serialized_messages = self.serialize_messages_for_request(messages);
-        let (mut openai_messages, system_prompt) =
-            self.prepare_request_messages(serialized_messages);
+        let mut openai_messages = self.serialize_messages_for_request(messages);
         self.apply_openrouter_cache_control(&mut openai_messages);
         let mut body = serde_json::json!({
             "model": self.model,
             "messages": openai_messages,
         });
-
-        if let Some(system_prompt) = system_prompt {
-            body["system"] = serde_json::Value::String(system_prompt);
-        }
+        self.apply_system_prompt_rewrite(&mut body);
 
         if !tools.is_empty() {
             body["tools"] = serde_json::Value::Array(to_openai_tools(tools));
@@ -1616,6 +1861,13 @@ impl LlmProvider for OpenAiProvider {
         self.stream_with_tools(messages, vec![])
     }
 
+    async fn probe(&self) -> anyhow::Result<()> {
+        match self.wire_api {
+            WireApi::Responses => self.probe_responses().await,
+            WireApi::ChatCompletions => self.probe_chat_completions().await,
+        }
+    }
+
     #[allow(clippy::collapsible_if)]
     fn stream_with_tools(
         &self,
@@ -1703,6 +1955,43 @@ mod tests {
         (format!("http://{addr}"), captured)
     }
 
+    /// Start a mock JSON server at `/chat/completions` that captures the
+    /// request body and returns the given JSON payload.
+    async fn start_completion_mock(
+        json_payload: String,
+    ) -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
+        let captured: Arc<Mutex<Vec<CapturedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |req: Request| {
+                let cap = captured_clone.clone();
+                let payload = json_payload.clone();
+                async move {
+                    let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                        .await
+                        .unwrap_or_default();
+                    let body: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
+                    cap.lock().unwrap().push(CapturedRequest { body });
+
+                    axum::response::Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(payload))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}"), captured)
+    }
+
     fn test_provider(base_url: &str) -> OpenAiProvider {
         OpenAiProvider::new(
             Secret::new("test-key".to_string()),
@@ -1766,7 +2055,7 @@ mod tests {
     }
 
     #[test]
-    fn minimax_serialization_keeps_system_messages_in_history() {
+    fn minimax_body_prepends_system_content_to_first_user_message() {
         let provider = OpenAiProvider::new_with_name(
             Secret::new("test-key".to_string()),
             "MiniMax-M2.1".to_string(),
@@ -1778,12 +2067,102 @@ mod tests {
             ChatMessage::user("hi"),
             ChatMessage::system("sys b"),
         ]);
-        let (history, system_prompt) = provider.prepare_request_messages(serialized);
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0]["role"], "system");
-        assert_eq!(history[1]["role"], "user");
-        assert_eq!(history[2]["role"], "system");
-        assert!(system_prompt.is_none());
+        let mut body = serde_json::json!({ "model": "MiniMax-M2.1", "messages": serialized });
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "system messages should be removed");
+        assert_eq!(messages[0]["role"], "user");
+        let content = messages[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("sys a") && content.contains("sys b"),
+            "both system parts should be in user message: {content}"
+        );
+        assert!(content.contains("hi"), "original user content preserved");
+        // No top-level system field (MiniMax ignores it)
+        assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn minimax_body_without_user_message_creates_synthetic_user_message() {
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.1".to_string(),
+            "https://api.minimax.io/v1".to_string(),
+            "minimax".to_string(),
+        );
+        let serialized =
+            provider.serialize_messages_for_request(&[ChatMessage::system("be helpful")]);
+        let mut body = serde_json::json!({ "model": "MiniMax-M2.1", "messages": serialized });
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("be helpful")
+        );
+    }
+
+    #[test]
+    fn minimax_body_preserves_multimodal_user_content() {
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.1".to_string(),
+            "https://api.minimax.io/v1".to_string(),
+            "minimax".to_string(),
+        );
+        // Simulate a multimodal user message (text + image) serialized as an array
+        let mut body = serde_json::json!({
+            "model": "MiniMax-M2.1",
+            "messages": [
+                { "role": "system", "content": "be helpful" },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "describe this" },
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+                    ]
+                }
+            ]
+        });
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "system message removed");
+        assert_eq!(messages[0]["role"], "user");
+
+        // Content should be an array with system block prepended
+        let content = messages[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3, "system text + original text + image");
+        assert_eq!(content[0]["type"], "text");
+        assert!(content[0]["text"].as_str().unwrap().contains("be helpful"));
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "describe this");
+        assert_eq!(content[2]["type"], "image_url");
+    }
+
+    #[test]
+    fn non_minimax_body_keeps_system_messages_in_array() {
+        let provider = OpenAiProvider::new(
+            Secret::new("test-key".to_string()),
+            "gpt-4o".to_string(),
+            "https://api.openai.com/v1".to_string(),
+        );
+        let serialized = provider.serialize_messages_for_request(&[
+            ChatMessage::system("sys a"),
+            ChatMessage::user("hi"),
+        ]);
+        let mut body = serde_json::json!({ "model": "gpt-4o", "messages": serialized });
+        provider.apply_system_prompt_rewrite(&mut body);
+
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert!(body.get("system").is_none());
     }
 
     #[test]
@@ -1881,7 +2260,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn minimax_stream_request_keeps_system_message_in_messages_array() {
+    async fn minimax_stream_prepends_system_to_first_user_message() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
                    data: [DONE]\n\n";
         let (base_url, captured) = start_sse_mock(sse.to_string()).await;
@@ -1902,15 +2281,145 @@ mod tests {
         let reqs = captured.lock().unwrap();
         assert_eq!(reqs.len(), 1);
         let body = reqs[0].body.as_ref().expect("request should have a body");
+        // No top-level system field (MiniMax ignores it)
         assert!(body.get("system").is_none());
 
         let history = body["messages"]
             .as_array()
             .expect("messages should be an array");
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0]["role"], "system");
-        assert_eq!(history[0]["content"], "stay deterministic");
-        assert_eq!(history[1]["role"], "user");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["role"], "user");
+        let content = history[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("stay deterministic"),
+            "system text in user msg"
+        );
+        assert!(content.contains("ping"), "original user text preserved");
+    }
+
+    #[tokio::test]
+    async fn minimax_complete_prepends_system_to_user_message_regression_578() {
+        let payload = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "content": "hi"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 12,
+                "completion_tokens": 1
+            }
+        });
+        let (base_url, captured) = start_completion_mock(payload.to_string()).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.7".to_string(),
+            base_url,
+            "minimax".to_string(),
+        );
+
+        let response = provider
+            .complete(
+                &[
+                    ChatMessage::system("you are a helpful assistant"),
+                    ChatMessage::user("hello"),
+                    ChatMessage::system("extra context"),
+                ],
+                &[],
+            )
+            .await
+            .expect("request should succeed");
+        assert_eq!(response.text.as_deref(), Some("hi"));
+
+        let reqs = captured.lock().unwrap();
+        let body = reqs[0].body.as_ref().expect("request should have a body");
+        // No top-level system field
+        assert!(body.get("system").is_none());
+
+        let history = body["messages"]
+            .as_array()
+            .expect("messages should be an array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["role"], "user");
+        let content = history[0]["content"].as_str().unwrap();
+        assert!(content.contains("you are a helpful assistant"));
+        assert!(content.contains("extra context"));
+        assert!(content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn minimax_stream_multiple_system_messages_prepended_regression_578() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n\
+                   data: [DONE]\n\n";
+        let (base_url, captured) = start_sse_mock(sse.to_string()).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.7".to_string(),
+            base_url,
+            "minimax".to_string(),
+        );
+
+        let messages = vec![
+            ChatMessage::system("you are a helpful assistant"),
+            ChatMessage::user("hello"),
+            ChatMessage::system("extra context"),
+        ];
+
+        let mut stream = provider.stream_with_tools(messages, vec![]);
+        while stream.next().await.is_some() {}
+
+        let reqs = captured.lock().unwrap();
+        let body = reqs[0].body.as_ref().expect("request should have a body");
+        // No top-level system field
+        assert!(body.get("system").is_none());
+
+        let history = body["messages"]
+            .as_array()
+            .expect("messages should be an array");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["role"], "user");
+        let content = history[0]["content"].as_str().unwrap();
+        assert!(content.contains("you are a helpful assistant"));
+        assert!(content.contains("extra context"));
+        assert!(content.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn probe_chat_request_caps_minimax_output_to_one_token() {
+        let (base_url, captured) = start_sse_mock("{}".to_string()).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("test-key".to_string()),
+            "MiniMax-M2.7".to_string(),
+            base_url,
+            "minimax".to_string(),
+        );
+
+        provider.probe().await.expect("probe should succeed");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = reqs[0].body.as_ref().expect("request should have a body");
+        assert_eq!(body["max_tokens"], 1);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("system").is_none());
+    }
+
+    #[tokio::test]
+    async fn probe_chat_request_uses_max_completion_tokens_for_gpt5() {
+        let (base_url, captured) = start_sse_mock("{}".to_string()).await;
+        let provider = OpenAiProvider::new(
+            Secret::new("test-key".to_string()),
+            "gpt-5.2".to_string(),
+            base_url,
+        );
+
+        provider.probe().await.expect("probe should succeed");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = reqs[0].body.as_ref().expect("request should have a body");
+        assert_eq!(body["max_completion_tokens"], 16);
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[tokio::test]
@@ -1941,6 +2450,205 @@ mod tests {
         let usage = last_done.expect("stream should emit Done");
         assert_eq!(usage.input_tokens, 5040);
         assert_eq!(usage.output_tokens, 61);
+    }
+
+    #[tokio::test]
+    async fn lmstudio_reasoning_content_stream_emits_reasoning_and_visible_deltas() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Thinking\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" process\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Rome\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, _) = start_sse_mock(sse.to_string()).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("lmstudio".to_string()),
+            "qwen3.5-27b".to_string(),
+            base_url,
+            "lmstudio".to_string(),
+        );
+
+        crate::contract::stream_surfaces_reasoning_separately(&provider)
+            .await
+            .expect("LM Studio reasoning stream should satisfy provider contract");
+
+        let mut stream = provider.stream(vec![ChatMessage::user("What is the capital of Italy?")]);
+        let mut reasoning_deltas = Vec::new();
+        let mut visible_deltas = Vec::new();
+        let mut final_usage: Option<Usage> = None;
+
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::ReasoningDelta(delta) => reasoning_deltas.push(delta),
+                StreamEvent::Delta(delta) => visible_deltas.push(delta),
+                StreamEvent::Done(usage) => final_usage = Some(usage),
+                _ => {},
+            }
+        }
+
+        assert_eq!(reasoning_deltas, vec!["Thinking", " process"]);
+        assert_eq!(visible_deltas, vec!["Rome"]);
+        let usage = final_usage.expect("stream should emit Done");
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 3);
+    }
+
+    /// Regression test for <https://github.com/moltis-org/moltis/issues/597>.
+    ///
+    /// Simulates a realistic LM Studio SSE stream with:
+    /// - An initial role-only chunk (no reasoning/content)
+    /// - Multiple `reasoning_content` chunks (long thinking phase)
+    /// - Transition to `content` chunks (visible answer)
+    /// - Full LM Studio metadata fields (`id`, `object`, `model`, `created`)
+    /// - Final usage + `[DONE]` frame
+    ///
+    /// Verifies that all `ReasoningDelta` events are emitted before any `Delta`
+    /// events, that the accumulated text matches, and that usage propagates.
+    #[tokio::test]
+    async fn lmstudio_realistic_reasoning_stream_with_metadata() {
+        // Realistic LM Studio SSE format: initial role-only chunk, then
+        // reasoning_content chunks, then content chunks, then usage + DONE.
+        let sse = concat!(
+            // Initial chunk: role assignment, no content or reasoning.
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
+            // Reasoning phase: multiple reasoning_content chunks.
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"The user\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" is asking\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" about the\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\" capital of Italy.\"},\"finish_reason\":null}]}\n\n",
+            // Content phase: visible answer.
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Рим\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" (Rome)\"},\"finish_reason\":null}]}\n\n",
+            // Finish + usage.
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion.chunk\",\"created\":1712600000,\"model\":\"qwen3.5-27b\",\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":18}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, _) = start_sse_mock(sse.to_string()).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("lmstudio".to_string()),
+            "qwen3.5-27b".to_string(),
+            base_url,
+            "lmstudio".to_string(),
+        );
+
+        // Call stream_with_tools directly (with empty tools) to exercise the
+        // same SSE path the agent loop uses, while verifying realistic LM Studio
+        // metadata fields don't disrupt reasoning_content extraction.
+        let mut stream =
+            provider.stream_with_tools(vec![ChatMessage::user("Какая столица Италии?")], vec![]);
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        assert!(
+            !events.iter().any(|e| matches!(e, StreamEvent::Error(_))),
+            "stream must not emit Error events for valid LM Studio SSE"
+        );
+
+        // Collect reasoning and visible deltas.
+        let reasoning: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ReasoningDelta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let visible: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Delta(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        // All reasoning chunks must be present.
+        assert_eq!(reasoning, vec![
+            "The user",
+            " is asking",
+            " about the",
+            " capital of Italy."
+        ]);
+        // All visible content chunks must be present.
+        assert_eq!(visible, vec!["Рим", " (Rome)"]);
+
+        // Reasoning must arrive before visible text.
+        let first_reasoning = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::ReasoningDelta(_)))
+            .expect("stream should include ReasoningDelta");
+        let first_visible = events
+            .iter()
+            .position(|e| matches!(e, StreamEvent::Delta(_)))
+            .expect("stream should include Delta");
+        assert!(
+            first_reasoning < first_visible,
+            "reasoning events must arrive before visible deltas"
+        );
+
+        // Done event with usage.
+        let done = events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done(u) => Some(u),
+                _ => None,
+            })
+            .expect("stream must emit Done");
+        assert_eq!(done.input_tokens, 42);
+        assert_eq!(done.output_tokens, 18);
+    }
+
+    #[tokio::test]
+    async fn lmstudio_reasoning_field_alias_stream_emits_reasoning_before_answer() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\"Plan:\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning\":\" compare capitals\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Rome\"},\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, _) = start_sse_mock(sse.to_string()).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("lmstudio".to_string()),
+            "gemma-4".to_string(),
+            base_url,
+            "lmstudio".to_string(),
+        );
+
+        let mut stream = provider.stream(vec![ChatMessage::user("Answer briefly")]);
+        let mut events = Vec::new();
+
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+
+        let reasoning: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ReasoningDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        let visible: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Delta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(reasoning, vec!["Plan:", " compare capitals"]);
+        assert_eq!(visible, vec!["Rome"]);
+
+        let first_reasoning = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ReasoningDelta(_)))
+            .expect("stream should include reasoning");
+        let first_visible = events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::Delta(_)))
+            .expect("stream should include visible text");
+        assert!(first_reasoning < first_visible);
     }
 
     // ── Regression: stream_with_tools must send tools in the API body ────
@@ -2597,6 +3305,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_sse_stream_propagates_cached_tokens() {
+        // Responses API nests cached_tokens under input_tokens_details.
+        let sse = "\
+            data: {\"type\":\"response.output_text.delta\",\"delta\":\"cached\"}\n\n\
+            data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":80}}}}\n\n";
+        let (base_url, _) = start_responses_mock(sse.to_string()).await;
+        let provider = OpenAiProvider::new(
+            Secret::new("test-key".to_string()),
+            "test-model".to_string(),
+            base_url,
+        )
+        .with_wire_api(WireApi::Responses);
+
+        let mut stream = provider.stream_with_tools(vec![ChatMessage::user("hi")], vec![]);
+        let mut done_usage = None;
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Done(u) = event {
+                done_usage = Some(u);
+            }
+        }
+        let usage = done_usage.expect("should have received Done event");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.cache_read_tokens, 80);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn responses_sse_stream_cached_tokens_default_to_zero() {
+        // Provider omits cached_tokens — should default to zero, not panic.
+        let sse = "\
+            data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+            data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n";
+        let (base_url, _) = start_responses_mock(sse.to_string()).await;
+        let provider = OpenAiProvider::new(
+            Secret::new("test-key".to_string()),
+            "test-model".to_string(),
+            base_url,
+        )
+        .with_wire_api(WireApi::Responses);
+
+        let mut stream = provider.stream_with_tools(vec![ChatMessage::user("hi")], vec![]);
+        let mut done_usage = None;
+        while let Some(event) = stream.next().await {
+            if let StreamEvent::Done(u) = event {
+                done_usage = Some(u);
+            }
+        }
+        let usage = done_usage.expect("should have received Done event");
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
+    }
+
+    #[tokio::test]
+    async fn probe_responses_request_caps_output_tokens() {
+        let (base_url, captured) = start_responses_mock("{}".to_string()).await;
+        let provider = OpenAiProvider::new(
+            Secret::new("test-key".to_string()),
+            "gpt-5.2".to_string(),
+            base_url,
+        )
+        .with_wire_api(WireApi::Responses);
+
+        provider.probe().await.expect("probe should succeed");
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        let body = reqs[0].body.as_ref().expect("request should have a body");
+        assert_eq!(body["max_output_tokens"], 1);
+        assert!(body.get("stream").is_none());
+    }
+
+    #[tokio::test]
     async fn responses_sse_stream_with_tool_calls() {
         let sse = "\
             data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_abc\",\"name\":\"exec\"}}\n\n\
@@ -2794,5 +3575,107 @@ mod tests {
 
         provider.apply_openrouter_cache_control(&mut messages);
         assert_eq!(messages[0]["content"], "hello");
+    }
+
+    // ---- Ollama native probe fallback tests ----
+
+    /// Start a mock server for Ollama probe fallback tests.
+    ///
+    /// `/v1/chat/completions` returns `chat_status`.
+    /// `/api/show` returns `show_status` with `show_body`.
+    async fn start_ollama_probe_mock(
+        chat_status: u16,
+        show_status: u16,
+        show_body: &str,
+    ) -> String {
+        use axum::routing::{any, post};
+
+        let show_body = show_body.to_string();
+
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    axum::response::Response::builder()
+                        .status(chat_status)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"error":"not found"}"#))
+                        .unwrap()
+                }),
+            )
+            .route(
+                "/api/show",
+                any(move || {
+                    let body = show_body.clone();
+                    async move {
+                        axum::response::Response::builder()
+                            .status(show_status)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn ollama_probe_falls_back_to_native_api_show_on_404() {
+        let base = start_ollama_probe_mock(404, 200, r#"{"name":"gemma4:e2b"}"#).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new(String::new()),
+            "gemma4:e2b".into(),
+            format!("{base}/v1"),
+            "ollama".into(),
+        );
+
+        provider
+            .probe()
+            .await
+            .expect("probe should succeed via /api/show fallback");
+    }
+
+    #[tokio::test]
+    async fn ollama_probe_native_fallback_also_fails() {
+        let base = start_ollama_probe_mock(404, 404, r#"{"error":"model not found"}"#).await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new(String::new()),
+            "no-such-model".into(),
+            format!("{base}/v1"),
+            "ollama".into(),
+        );
+
+        let err = provider.probe().await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ollama pull"),
+            "error should suggest 'ollama pull', got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_ollama_provider_does_not_fallback_on_404() {
+        let base = start_ollama_probe_mock(404, 200, "{}").await;
+        let provider = OpenAiProvider::new_with_name(
+            Secret::new("key".into()),
+            "some-model".into(),
+            format!("{base}/v1"),
+            "openai".into(),
+        );
+
+        let err = provider.probe().await.unwrap_err();
+        let msg = err.to_string();
+        // Should NOT attempt fallback — should get the standard OpenAI error.
+        assert!(
+            msg.contains("HTTP 404"),
+            "non-ollama provider should get standard 404 error, got: {msg}"
+        );
     }
 }

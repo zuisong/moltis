@@ -22,7 +22,7 @@ use {
     moltis_config::schema::ProvidersConfig,
     moltis_oauth::{
         CallbackServer, OAuthFlow, TokenStore, callback_port, device_flow, load_oauth_config,
-        parse_callback_input,
+        normalize_loopback_redirect, parse_callback_input,
     },
     moltis_providers::{ProviderRegistry, raw_model_id},
 };
@@ -79,6 +79,30 @@ where
     };
 
     Ok(normalize_model_list(normalized))
+}
+
+/// Normalize the `redirect_uri` on a provider `OAuthConfig` loaded via
+/// `load_oauth_config` so that loopback values always use the `http`
+/// scheme, per RFC 8252 §7.3/§8.3.
+///
+/// Built-in defaults (e.g. `openai-codex`) already use
+/// `http://localhost:1455/auth/callback`, but `load_oauth_config` also
+/// reads from `~/.config/moltis/oauth_providers.json` and
+/// `MOLTIS_OAUTH_{PROVIDER}_REDIRECT_URI`, either of which could
+/// accidentally specify `https://localhost`. Without normalization:
+///
+/// * `callback_port` would parse the port from the HTTPS form and the
+///   spawned `CallbackServer` would try to bind on Moltis's main TLS
+///   port, which is already in use by the gateway.
+/// * Strict authorization servers would reject the authorization
+///   request with `invalid_redirect_uri`.
+///
+/// No-op for empty or non-loopback URIs.
+fn normalize_loaded_redirect_uri(config: &mut moltis_oauth::OAuthConfig) {
+    if config.redirect_uri.is_empty() {
+        return;
+    }
+    config.redirect_uri = normalize_loopback_redirect(&config.redirect_uri);
 }
 
 fn normalize_model_list(models: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -729,8 +753,24 @@ pub struct KnownProvider {
     pub default_base_url: Option<&'static str>,
     /// Whether this provider requires a model to be specified.
     pub requires_model: bool,
-    /// Whether the API key is optional (e.g. Ollama runs locally without auth).
+    /// Whether the API key is optional (e.g. Ollama and LM Studio run locally
+    /// without auth).
     pub key_optional: bool,
+    /// Whether this provider only runs locally (binds to localhost) and should
+    /// be hidden from cloud deployments. Separate from `key_optional` because a
+    /// remote provider could legitimately support unauthenticated access without
+    /// binding to localhost.
+    pub local_only: bool,
+}
+
+impl KnownProvider {
+    /// Returns true if this provider is local-only — runs on the user's
+    /// machine and isn't reachable from cloud deployments. Used by cloud-mode
+    /// filters to hide providers that bind to localhost.
+    #[must_use]
+    pub fn is_local_only(&self) -> bool {
+        self.auth_type == AuthType::Local || self.local_only
+    }
 }
 
 /// Build the known providers list at runtime, including local-llm if enabled.
@@ -744,6 +784,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.anthropic.com"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "openai",
@@ -753,6 +794,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.openai.com/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "gemini",
@@ -762,6 +804,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://generativelanguage.googleapis.com/v1beta/openai"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "groq",
@@ -771,6 +814,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.groq.com/openai/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "xai",
@@ -780,6 +824,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.x.ai/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "deepseek",
@@ -789,6 +834,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.deepseek.com"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "fireworks",
@@ -798,6 +844,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.fireworks.ai/inference/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "mistral",
@@ -807,6 +854,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.mistral.ai/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "openrouter",
@@ -816,6 +864,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://openrouter.ai/api/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "cerebras",
@@ -825,6 +874,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.cerebras.ai/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "minimax",
@@ -834,6 +884,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.minimax.io/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "moonshot",
@@ -843,6 +894,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.moonshot.cn/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "zai",
@@ -852,6 +904,17 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.z.ai/api/paas/v4"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
+        },
+        KnownProvider {
+            name: "zai-code",
+            display_name: "Z.AI (Coding Plan)",
+            auth_type: AuthType::ApiKey,
+            env_key: Some("Z_CODE_API_KEY"),
+            default_base_url: Some("https://api.z.ai/api/coding/paas/v4"),
+            requires_model: false,
+            key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "venice",
@@ -861,6 +924,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.venice.ai/api/v1"),
             requires_model: true,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "ollama",
@@ -870,6 +934,17 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("http://localhost:11434"),
             requires_model: false,
             key_optional: true,
+            local_only: true,
+        },
+        KnownProvider {
+            name: "lmstudio",
+            display_name: "LM Studio",
+            auth_type: AuthType::ApiKey,
+            env_key: Some("LMSTUDIO_API_KEY"),
+            default_base_url: Some("http://127.0.0.1:1234/v1"),
+            requires_model: false,
+            key_optional: true,
+            local_only: true,
         },
         KnownProvider {
             name: "openai-codex",
@@ -879,6 +954,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: None,
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "github-copilot",
@@ -888,6 +964,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: None,
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
         KnownProvider {
             name: "kimi-code",
@@ -897,6 +974,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: Some("https://api.kimi.com/coding/v1"),
             requires_model: false,
             key_optional: false,
+            local_only: false,
         },
     ];
 
@@ -912,6 +990,7 @@ pub fn known_providers() -> Vec<KnownProvider> {
             default_base_url: None,
             requires_model: true,
             key_optional: false,
+            local_only: true,
         });
         p
     };
@@ -1106,7 +1185,7 @@ pub fn detect_auto_provider_sources_with_overrides(
 
     for provider in known_providers().into_iter().filter(|p| {
         if is_cloud {
-            return p.auth_type != AuthType::Local && p.name != "ollama";
+            return !p.is_local_only();
         }
         true
     }) {
@@ -1672,8 +1751,7 @@ impl ProviderSetupService for LiveProviderSetupService {
             .enumerate()
             .filter_map(|(known_idx, provider)| {
                 // Hide local-only providers on cloud deployments.
-                if is_cloud && (provider.auth_type == AuthType::Local || provider.name == "ollama")
-                {
+                if is_cloud && provider.is_local_only() {
                     return None;
                 }
 
@@ -1817,10 +1895,9 @@ impl ProviderSetupService for LiveProviderSetupService {
                 })
                 .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
 
-            // API key is required for api-key providers (except Ollama which is optional)
-            if provider.auth_type == AuthType::ApiKey
-                && provider_name != "ollama"
-                && api_key.is_none()
+            // API key is required for api-key providers unless the provider
+            // marks the key as optional (Ollama, LM Studio).
+            if provider.auth_type == AuthType::ApiKey && !provider.key_optional && api_key.is_none()
             {
                 return Err("missing 'apiKey' parameter".into());
             }
@@ -1889,15 +1966,27 @@ impl ProviderSetupService for LiveProviderSetupService {
             .ok_or_else(|| "missing 'provider' parameter".to_string())?
             .to_string();
 
+        // RFC 8252 §7.3/§8.3: loopback redirect URIs must use `http`.
+        // The UI sends `${window.location.origin}/auth/callback`, which is
+        // `https://localhost:<port>/auth/callback` on TLS-enabled
+        // deployments. Rewrite loopback origins to `http` so strict
+        // authorization servers accept them; the TLS listener's HTTP peek
+        // redirect bounces the callback back onto the HTTPS handler.
         let redirect_uri = params
             .get("redirectUri")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|v| !v.is_empty())
-            .map(ToOwned::to_owned);
+            .map(normalize_loopback_redirect);
 
         let mut oauth_config = load_oauth_config(&provider_name)
             .ok_or_else(|| format!("no OAuth config for provider: {provider_name}"))?;
+
+        // Normalize any loopback `redirect_uri` loaded from the user
+        // config file (`~/.config/moltis/oauth_providers.json`) or
+        // `MOLTIS_OAUTH_{PROVIDER}_REDIRECT_URI`. See
+        // `normalize_loaded_redirect_uri` for the full rationale.
+        normalize_loaded_redirect_uri(&mut oauth_config);
 
         // User explicitly initiated OAuth for this provider; ensure it is enabled.
         set_provider_enabled_in_config(&provider_name, true)?;
@@ -1935,6 +2024,10 @@ impl ProviderSetupService for LiveProviderSetupService {
         // Overriding it with the gateway URL causes OAuth providers to
         // reject the request with "unknown_error".
         // For these providers we always use the local callback server.
+        //
+        // The pre-registered URI has already been loopback-normalized
+        // above, so strict authorization servers accept it even if the
+        // user's custom config file used the `https://` form.
         let has_registered_redirect = !oauth_config.redirect_uri.is_empty();
         let use_server_callback = redirect_uri.is_some() && !has_registered_redirect;
         if !has_registered_redirect && let Some(uri) = redirect_uri {
@@ -2215,8 +2308,6 @@ impl ProviderSetupService for LiveProviderSetupService {
     }
 
     async fn validate_key(&self, params: Value) -> ServiceResult {
-        use moltis_agents::model::ChatMessage;
-
         let provider_name = params
             .get("provider")
             .and_then(|v| v.as_str())
@@ -2231,6 +2322,14 @@ impl ProviderSetupService for LiveProviderSetupService {
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(ToString::to_string);
+        let saved_config = self.key_store.load_config(provider_name);
+        let saved_base_url = saved_config
+            .as_ref()
+            .and_then(|config| config.base_url.as_deref())
+            .filter(|url| !url.trim().is_empty());
+        let effective_base_url = base_url
+            .filter(|url| !url.trim().is_empty())
+            .or(saved_base_url);
 
         // Custom providers bypass known_providers() validation.
         let is_custom = is_custom_provider(provider_name);
@@ -2242,9 +2341,9 @@ impl ProviderSetupService for LiveProviderSetupService {
                 .iter()
                 .find(|p| p.name == provider_name)
                 .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
-            // API key is required for api-key providers (except Ollama).
-            if info.auth_type == AuthType::ApiKey && provider_name != "ollama" && api_key.is_none()
-            {
+            // API key is required for api-key providers unless the provider
+            // marks the key as optional (Ollama, LM Studio).
+            if info.auth_type == AuthType::ApiKey && !info.key_optional && api_key.is_none() {
                 return Err("missing 'apiKey' parameter".into());
             }
             Some(KnownProvider {
@@ -2255,22 +2354,22 @@ impl ProviderSetupService for LiveProviderSetupService {
                 default_base_url: info.default_base_url,
                 requires_model: info.requires_model,
                 key_optional: info.key_optional,
+                local_only: info.local_only,
             })
         };
 
         if is_custom && api_key.is_none() {
             return Err("missing 'apiKey' parameter".into());
         }
-        if is_custom && base_url.filter(|s| !s.trim().is_empty()).is_none() {
+        if is_custom && effective_base_url.is_none() {
             return Err("missing 'baseUrl' parameter".into());
         }
 
         let selected_model = preferred_models.first().map(String::as_str);
-        let base_url_value = base_url.filter(|s| !s.trim().is_empty());
         let validation_provider_name = validation_provider_name_for_endpoint(
             provider_name,
             provider_info.as_ref().and_then(|p| p.default_base_url),
-            base_url_value,
+            effective_base_url,
         );
         let _timing =
             ProviderSetupTiming::start("providers.validate_key", Some(&validation_provider_name));
@@ -2288,7 +2387,7 @@ impl ProviderSetupService for LiveProviderSetupService {
         // If no model is supplied, return discovered models for UI selection.
         if provider_name == "ollama" {
             let ollama_api_base = normalize_ollama_api_base_url(
-                base_url_value.or(provider_info.as_ref().and_then(|p| p.default_base_url)),
+                effective_base_url.or(provider_info.as_ref().and_then(|p| p.default_base_url)),
             );
             let discovered_models = match discover_ollama_models(&ollama_api_base).await {
                 Ok(models) => models,
@@ -2368,10 +2467,66 @@ impl ProviderSetupService for LiveProviderSetupService {
             }
         }
 
+        // Custom OpenAI-compatible providers: discover models via /v1/models
+        // when no model is specified, instead of probing (which can timeout).
+        if is_custom && selected_model.is_none() {
+            let api_key_str = api_key.unwrap_or_default();
+            let base = effective_base_url.unwrap_or_default();
+            match moltis_providers::openai::fetch_models_from_api(
+                Secret::new(api_key_str.to_string()),
+                base.to_string(),
+            )
+            .await
+            {
+                Ok(discovered) => {
+                    let model_list: Vec<Value> = discovered
+                        .iter()
+                        .map(|m| {
+                            serde_json::json!({
+                                "id": format!("{provider_name}::{}", m.id),
+                                "displayName": &m.display_name,
+                                "provider": provider_name,
+                            })
+                        })
+                        .collect();
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "complete",
+                        progress_payload(serde_json::json!({
+                            "message": "Discovered models from endpoint.",
+                            "modelCount": model_list.len(),
+                        })),
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "valid": true,
+                        "models": model_list,
+                    }));
+                },
+                Err(err) => {
+                    let error = format!("Failed to discover models from endpoint: {err}");
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "error",
+                        progress_payload(serde_json::json!({
+                            "message": error.clone(),
+                        })),
+                    )
+                    .await;
+                    return Ok(serde_json::json!({
+                        "valid": false,
+                        "error": error,
+                    }));
+                },
+            }
+        }
+
         let normalized_base_url = if provider_name == "ollama" {
-            base_url_value.map(|url| normalize_ollama_openai_base_url(Some(url)))
+            effective_base_url.map(|url| normalize_ollama_openai_base_url(Some(url)))
         } else {
-            base_url_value.map(String::from)
+            effective_base_url.map(String::from)
         };
 
         // Build a temporary ProvidersConfig with just this provider.
@@ -2391,7 +2546,7 @@ impl ProviderSetupService for LiveProviderSetupService {
         let temp_registry = self.build_registry(&temp_config);
 
         // Filter models for this provider.
-        let mut models: Vec<_> = temp_registry
+        let models: Vec<_> = temp_registry
             .list_models()
             .iter()
             .filter(|m| {
@@ -2422,257 +2577,42 @@ impl ProviderSetupService for LiveProviderSetupService {
         info!(
             provider = %validation_provider_name,
             model_count = models.len(),
-            "provider validation discovered candidate models for probing"
+            "provider validation discovered candidate models"
         );
-        self.emit_validation_progress(
-            &validation_provider_name,
-            request_id.as_deref(),
-            "candidates_discovered",
-            progress_payload(serde_json::json!({
-                "modelCount": models.len(),
-                "message": format!("Discovered {} candidate models.", models.len()),
-            })),
-        )
-        .await;
 
-        const VALIDATION_MAX_MODEL_PROBES: usize = 8;
-        const VALIDATION_MAX_TIMEOUTS: usize = 3;
-        const VALIDATION_PROBE_TIMEOUT_SECS: u64 = 10;
-
-        reorder_models_for_validation(&mut models);
-
-        let total_probe_attempts = models.len().min(VALIDATION_MAX_MODEL_PROBES);
-
-        let probe = [ChatMessage::user("ping")];
-        let mut probe_attempted = false;
-        let mut unsupported_errors = Vec::new();
-        let mut last_error: Option<String> = None;
-        let mut probe_succeeded = false;
-        let mut timeout_count = 0usize;
-
-        // Try multiple models because provider catalogs can include endpoint-
-        // incompatible IDs. We only need one successful probe to validate creds.
-        for (attempt, probe_model) in models.iter().take(VALIDATION_MAX_MODEL_PROBES).enumerate() {
-            let Some(llm_provider) = temp_registry.get(&probe_model.id) else {
-                continue;
-            };
-
-            probe_attempted = true;
-            let probe_started = std::time::Instant::now();
-            info!(
-                provider = %validation_provider_name,
-                model = %probe_model.id,
-                attempt = attempt + 1,
-                total_models = models.len(),
-                "provider validation model probe started"
-            );
-            self.emit_validation_progress(
-                &validation_provider_name,
-                request_id.as_deref(),
-                "probe_started",
-                progress_payload(serde_json::json!({
-                    "modelId": probe_model.id,
-                    "attempt": attempt + 1,
-                    "totalAttempts": total_probe_attempts,
-                    "message": format!(
-                        "Probing model {} of {}.",
-                        attempt + 1,
-                        total_probe_attempts
-                    ),
-                })),
-            )
-            .await;
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(VALIDATION_PROBE_TIMEOUT_SECS),
-                llm_provider.complete(&probe, &[]),
-            )
-            .await;
-
-            match result {
-                Ok(Ok(_)) => {
-                    let elapsed_ms = probe_started.elapsed().as_millis();
-                    info!(
-                        provider = %validation_provider_name,
-                        model = %probe_model.id,
-                        elapsed_ms,
-                        "provider validation model probe succeeded"
-                    );
-                    self.emit_validation_progress(
-                        &validation_provider_name,
-                        request_id.as_deref(),
-                        "probe_succeeded",
-                        progress_payload(serde_json::json!({
-                            "modelId": probe_model.id,
-                            "elapsedMs": elapsed_ms,
-                            "attempt": attempt + 1,
-                            "totalAttempts": total_probe_attempts,
-                            "message": "Model probe succeeded.",
-                        })),
-                    )
-                    .await;
-                    probe_succeeded = true;
-                    break;
-                },
-                Ok(Err(err)) => {
-                    let error_text = err.to_string();
-                    let error_obj =
-                        (self.error_parser)(&error_text, Some(&validation_provider_name));
-                    let detail = error_obj
-                        .get("detail")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&error_text)
-                        .to_string();
-                    let is_unsupported =
-                        error_obj.get("type").and_then(|v| v.as_str()) == Some("unsupported_model");
-                    let elapsed_ms = probe_started.elapsed().as_millis();
-                    info!(
-                        provider = %validation_provider_name,
-                        model = %probe_model.id,
-                        elapsed_ms,
-                        unsupported = is_unsupported,
-                        "provider validation model probe failed"
-                    );
-                    self.emit_validation_progress(
-                        &validation_provider_name,
-                        request_id.as_deref(),
-                        "probe_failed",
-                        progress_payload(serde_json::json!({
-                            "modelId": probe_model.id,
-                            "elapsedMs": elapsed_ms,
-                            "attempt": attempt + 1,
-                            "totalAttempts": total_probe_attempts,
-                            "unsupported": is_unsupported,
-                            "message": detail.clone(),
-                        })),
-                    )
-                    .await;
-                    if is_unsupported {
-                        unsupported_errors.push(detail);
-                        continue;
-                    }
-                    last_error = Some(detail);
-                    break;
-                },
-                Err(_) => {
-                    timeout_count += 1;
-                    let elapsed_ms = probe_started.elapsed().as_millis();
-                    warn!(
-                        provider = %validation_provider_name,
-                        model = %probe_model.id,
-                        timeout_count,
-                        max_timeouts = VALIDATION_MAX_TIMEOUTS,
-                        elapsed_ms,
-                        "provider validation model probe timed out"
-                    );
-                    self.emit_validation_progress(
-                        &validation_provider_name,
-                        request_id.as_deref(),
-                        "probe_timeout",
-                        progress_payload(serde_json::json!({
-                            "modelId": probe_model.id,
-                            "elapsedMs": elapsed_ms,
-                            "attempt": attempt + 1,
-                            "totalAttempts": total_probe_attempts,
-                            "timeoutCount": timeout_count,
-                            "maxTimeouts": VALIDATION_MAX_TIMEOUTS,
-                            "message": format!(
-                                "Timed out probing model after {VALIDATION_PROBE_TIMEOUT_SECS} seconds."
-                            ),
-                        })),
-                    )
-                    .await;
-                    if timeout_count >= VALIDATION_MAX_TIMEOUTS {
-                        last_error = Some(format!(
-                            "Connection timed out after {VALIDATION_PROBE_TIMEOUT_SECS} seconds while validating models. Check your endpoint URL and try again."
-                        ));
-                        break;
-                    }
-                    continue;
-                },
-            }
-        }
-
-        if probe_succeeded {
-            // Build model list for the frontend, excluding non-chat models.
-            let model_list: Vec<Value> = models
-                .iter()
-                .filter(|m| moltis_providers::is_chat_capable_model(&m.id))
-                .map(|m| {
-                    let supports_tools =
-                        temp_registry.get(&m.id).is_some_and(|p| p.supports_tools());
-                    serde_json::json!({
-                        "id": m.id,
-                        "displayName": m.display_name,
-                        "provider": m.provider,
-                        "supportsTools": supports_tools,
-                    })
+        // Skip probing — the model list endpoint already proves the endpoint
+        // is reachable and any API key is valid.  Probing each model via a
+        // chat completion forces local LLM servers (Ollama, LemonadeSDK, …)
+        // to load/unload every model, causing enormous I/O for large model
+        // sets.  Errors will surface at chat time with actionable messages.
+        // Users can manually test individual models from the Providers page.
+        let model_list: Vec<Value> = models
+            .iter()
+            .filter(|m| moltis_providers::is_chat_capable_model(&m.id))
+            .map(|m| {
+                let supports_tools = temp_registry.get(&m.id).is_some_and(|p| p.supports_tools());
+                serde_json::json!({
+                    "id": m.id,
+                    "displayName": m.display_name,
+                    "provider": m.provider,
+                    "supportsTools": supports_tools,
                 })
-                .collect();
+            })
+            .collect();
 
-            self.emit_validation_progress(
-                &validation_provider_name,
-                request_id.as_deref(),
-                "complete",
-                progress_payload(serde_json::json!({
-                    "message": "Validation complete.",
-                    "modelCount": model_list.len(),
-                })),
-            )
-            .await;
-            return Ok(serde_json::json!({
-                "valid": true,
-                "models": model_list,
-            }));
-        }
-
-        if !probe_attempted {
-            let error = "Could not instantiate provider for probing.";
-            self.emit_validation_progress(
-                &validation_provider_name,
-                request_id.as_deref(),
-                "error",
-                progress_payload(serde_json::json!({
-                    "message": error,
-                })),
-            )
-            .await;
-            return Ok(serde_json::json!({
-                "valid": false,
-                "error": error,
-            }));
-        }
-
-        if let Some(error) = last_error {
-            self.emit_validation_progress(
-                &validation_provider_name,
-                request_id.as_deref(),
-                "error",
-                progress_payload(serde_json::json!({
-                    "message": error,
-                })),
-            )
-            .await;
-            return Ok(serde_json::json!({
-                "valid": false,
-                "error": error,
-            }));
-        }
-
-        let unsupported_error = unsupported_errors.into_iter().next().unwrap_or_else(|| {
-            "No supported chat models were found for this provider.".to_string()
-        });
         self.emit_validation_progress(
             &validation_provider_name,
             request_id.as_deref(),
-            "error",
+            "complete",
             progress_payload(serde_json::json!({
-                "message": unsupported_error.clone(),
+                "message": "Validation complete.",
+                "modelCount": model_list.len(),
             })),
         )
         .await;
         Ok(serde_json::json!({
-            "valid": false,
-            "error": unsupported_error,
+            "valid": true,
+            "models": model_list,
         }))
     }
 
@@ -2845,58 +2785,82 @@ impl ProviderSetupService for LiveProviderSetupService {
     }
 }
 
-// ── Validation probe ordering ────────────────────────────────────────────────
-
-/// Reorder models so that known-fast, reliable models appear first for
-/// validation probing.  We only need *one* successful response to prove the
-/// API key works, so prefer the cheapest/fastest endpoints.
-fn reorder_models_for_validation(models: &mut [moltis_providers::ModelInfo]) {
-    /// Known-fast model substrings, ordered by preference.
-    /// These are small/cheap models that respond quickly on every major provider.
-    const FAST_PATTERNS: &[&str] = &[
-        "gpt-4o-mini",
-        "gpt-4.1-mini",
-        "gpt-4.1-nano",
-        "claude-3-haiku",
-        "claude-3.5-haiku",
-        "gemini-2.0-flash",
-        "gemini-flash",
-        "llama-3",
-        "mistral-small",
-        "deepseek-chat",
-    ];
-
-    /// Known-slow or experimental model substrings to deprioritize.
-    const SLOW_PATTERNS: &[&str] = &["search-preview", "seed-", "preview", "experimental"];
-
-    models.sort_by(|a, b| {
-        let a_rank = probe_priority_rank(&a.id, FAST_PATTERNS, SLOW_PATTERNS);
-        let b_rank = probe_priority_rank(&b.id, FAST_PATTERNS, SLOW_PATTERNS);
-        a_rank.cmp(&b_rank)
-    });
-}
-
-fn probe_priority_rank(model_id: &str, fast: &[&str], slow: &[&str]) -> u8 {
-    let raw = raw_model_id(model_id);
-    for pattern in fast {
-        if raw.contains(pattern) {
-            return 0; // probe first
-        }
-    }
-    for pattern in slow {
-        if raw.contains(pattern) {
-            return 2; // probe last
-        }
-    }
-    1 // default: middle tier
-}
-
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
     use {
         super::*, moltis_config::schema::ProviderEntry, moltis_oauth::OAuthTokens, secrecy::Secret,
     };
+
+    fn make_oauth_config(redirect_uri: &str) -> moltis_oauth::OAuthConfig {
+        moltis_oauth::OAuthConfig {
+            client_id: "client".into(),
+            auth_url: "https://example.com/authorize".into(),
+            token_url: "https://example.com/token".into(),
+            redirect_uri: redirect_uri.into(),
+            resource: None,
+            scopes: Vec::new(),
+            extra_auth_params: Vec::new(),
+            device_flow: false,
+        }
+    }
+
+    #[test]
+    fn normalize_loaded_redirect_uri_rewrites_https_localhost() {
+        let mut config = make_oauth_config("https://localhost:1455/auth/callback");
+        normalize_loaded_redirect_uri(&mut config);
+        assert_eq!(config.redirect_uri, "http://localhost:1455/auth/callback");
+    }
+
+    #[test]
+    fn normalize_loaded_redirect_uri_rewrites_https_ipv4_loopback() {
+        let mut config = make_oauth_config("https://127.0.0.1:1455/auth/callback");
+        normalize_loaded_redirect_uri(&mut config);
+        assert_eq!(config.redirect_uri, "http://127.0.0.1:1455/auth/callback");
+    }
+
+    #[test]
+    fn normalize_loaded_redirect_uri_rewrites_https_ipv6_loopback() {
+        let mut config = make_oauth_config("https://[::1]:1455/auth/callback");
+        normalize_loaded_redirect_uri(&mut config);
+        assert_eq!(config.redirect_uri, "http://[::1]:1455/auth/callback");
+    }
+
+    #[test]
+    fn normalize_loaded_redirect_uri_preserves_http_scheme() {
+        let mut config = make_oauth_config("http://localhost:1455/auth/callback");
+        normalize_loaded_redirect_uri(&mut config);
+        assert_eq!(config.redirect_uri, "http://localhost:1455/auth/callback");
+    }
+
+    #[test]
+    fn normalize_loaded_redirect_uri_preserves_real_hostname() {
+        let mut config = make_oauth_config("https://moltis.lan/auth/callback");
+        normalize_loaded_redirect_uri(&mut config);
+        assert_eq!(config.redirect_uri, "https://moltis.lan/auth/callback");
+    }
+
+    #[test]
+    fn normalize_loaded_redirect_uri_no_op_on_empty_string() {
+        let mut config = make_oauth_config("");
+        normalize_loaded_redirect_uri(&mut config);
+        assert_eq!(config.redirect_uri, "");
+    }
+
+    /// Regression guard for the full integration path: load `openai-codex`
+    /// through `load_oauth_config` and confirm that, after passing the
+    /// result through `normalize_loaded_redirect_uri`, `callback_port`
+    /// parses a non-conflicting value. This is the safety net that would
+    /// have caught the original bug report if the built-in default had
+    /// been wrong.
+    #[test]
+    fn loaded_openai_codex_redirect_parses_to_http_loopback() {
+        let mut config = load_oauth_config("openai-codex").expect("openai-codex should exist");
+        normalize_loaded_redirect_uri(&mut config);
+        let parsed = url::Url::parse(&config.redirect_uri).expect("parsable URL");
+        assert_eq!(parsed.scheme(), "http");
+        assert_eq!(parsed.host_str(), Some("localhost"));
+    }
 
     #[test]
     fn known_providers_have_valid_auth_types() {
@@ -3972,11 +3936,56 @@ mod tests {
         assert!(names.contains(&"minimax"), "missing minimax");
         assert!(names.contains(&"moonshot"), "missing moonshot");
         assert!(names.contains(&"zai"), "missing zai");
+        assert!(names.contains(&"zai-code"), "missing zai-code");
         assert!(names.contains(&"kimi-code"), "missing kimi-code");
         assert!(names.contains(&"venice"), "missing venice");
         assert!(names.contains(&"ollama"), "missing ollama");
+        assert!(names.contains(&"lmstudio"), "missing lmstudio");
         // OAuth providers
         assert!(names.contains(&"github-copilot"), "missing github-copilot");
+    }
+
+    #[test]
+    fn lmstudio_is_local_only_with_optional_key() {
+        let providers = known_providers();
+        let lmstudio = providers
+            .iter()
+            .find(|p| p.name == "lmstudio")
+            .expect("lmstudio not in known_providers");
+        assert_eq!(lmstudio.auth_type, AuthType::ApiKey);
+        assert!(
+            lmstudio.key_optional,
+            "lmstudio runs locally and must not require an API key"
+        );
+        assert!(
+            lmstudio.is_local_only(),
+            "lmstudio must be filtered out of cloud deployments"
+        );
+        assert_eq!(lmstudio.env_key, Some("LMSTUDIO_API_KEY"));
+        assert_eq!(
+            lmstudio.default_base_url,
+            Some("http://127.0.0.1:1234/v1"),
+            "lmstudio default base URL must match LM Studio's default server port"
+        );
+    }
+
+    #[test]
+    fn is_local_only_is_superset_of_legacy_check() {
+        // Regression: before the typed `is_local_only()` helper, cloud-mode
+        // filters used `auth_type == Local || name == "ollama"`. Confirm the
+        // typed method is a superset of that legacy set — every provider the
+        // old check flagged must still be flagged. The new method intentionally
+        // also catches providers like `lmstudio` that the old string check
+        // missed, so `typed == true && legacy == false` is expected.
+        for p in known_providers() {
+            let legacy = p.auth_type == AuthType::Local || p.name == "ollama";
+            let typed = p.is_local_only();
+            assert!(
+                typed || !legacy,
+                "{}: legacy says local but typed disagrees",
+                p.name
+            );
+        }
     }
 
     #[test]
@@ -3999,9 +4008,11 @@ mod tests {
             ("minimax", "MINIMAX_API_KEY"),
             ("moonshot", "MOONSHOT_API_KEY"),
             ("zai", "Z_API_KEY"),
+            ("zai-code", "Z_CODE_API_KEY"),
             ("kimi-code", "KIMI_API_KEY"),
             ("venice", "VENICE_API_KEY"),
             ("ollama", "OLLAMA_API_KEY"),
+            ("lmstudio", "LMSTUDIO_API_KEY"),
         ];
         let providers = known_providers();
         for (name, env_key) in expected {
@@ -4030,9 +4041,11 @@ mod tests {
             "minimax",
             "moonshot",
             "zai",
+            "zai-code",
             "kimi-code",
             "venice",
             "ollama",
+            "lmstudio",
         ] {
             // We can't actually persist in tests (would write to real disk),
             // but we can verify the provider name is recognized.
@@ -4067,9 +4080,11 @@ mod tests {
             "minimax",
             "moonshot",
             "zai",
+            "zai-code",
             "kimi-code",
             "venice",
             "ollama",
+            "lmstudio",
             "github-copilot",
         ] {
             assert!(
@@ -4097,7 +4112,7 @@ mod tests {
             .filter_map(|v| v.get("name").and_then(|n| n.as_str()))
             .collect();
 
-        // local-llm and ollama should be hidden on cloud deployments
+        // local-only providers should be hidden on cloud deployments
         assert!(
             !names.contains(&"local-llm"),
             "local-llm should be hidden on cloud: {names:?}"
@@ -4105,6 +4120,10 @@ mod tests {
         assert!(
             !names.contains(&"ollama"),
             "ollama should be hidden on cloud: {names:?}"
+        );
+        assert!(
+            !names.contains(&"lmstudio"),
+            "lmstudio should be hidden on cloud: {names:?}"
         );
 
         // Cloud-compatible providers should still be present
@@ -4136,6 +4155,10 @@ mod tests {
         assert!(
             names.contains(&"ollama"),
             "ollama should be present locally: {names:?}"
+        );
+        assert!(
+            names.contains(&"lmstudio"),
+            "lmstudio should be present locally: {names:?}"
         );
         assert!(
             names.contains(&"openai"),
@@ -4335,7 +4358,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn validate_key_ollama_model_probe_uses_v1_endpoint() {
+    async fn validate_key_ollama_with_model_returns_model_list() {
         use axum::{
             Json, Router,
             routing::{get, post},
@@ -4593,113 +4616,272 @@ mod tests {
         assert_eq!(models, vec!["gpt-5.2", "anthropic/claude-sonnet-4-5"]);
     }
 
-    fn make_model(id: &str) -> moltis_providers::ModelInfo {
-        moltis_providers::ModelInfo {
-            id: id.to_string(),
-            provider: "test".to_string(),
-            display_name: id.to_string(),
-            created_at: None,
-        }
-    }
+    #[tokio::test]
+    async fn validate_key_custom_provider_without_model_returns_discovered_models() {
+        use axum::{Json, Router, routing::get};
 
-    #[test]
-    fn reorder_models_for_validation_fast_first_slow_last() {
-        let mut models = vec![
-            make_model("bytedance-seed/seed-2.0-mini"),
-            make_model("some-regular-model"),
-            make_model("gpt-4o-mini"),
-            make_model("gpt-4o-search-preview"),
-            make_model("claude-3.5-haiku-20241022"),
-            make_model("experimental-model-v1"),
-            make_model("deepseek-chat"),
-        ];
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "data": [
+                        {"id": "gpt-4o", "object": "model", "created": 1700000000},
+                        {"id": "gpt-4o-mini", "object": "model", "created": 1700000001},
+                        {"id": "dall-e-3", "object": "model", "created": 1700000002}
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-        reorder_models_for_validation(&mut models);
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None);
+        let result = svc
+            .validate_key(serde_json::json!({
+                "provider": "custom-test-server",
+                "apiKey": "sk-test",
+                "baseUrl": format!("http://{addr}")
+            }))
+            .await
+            .expect("validate_key should return payload");
+        server.abort();
 
-        // Fast models should be at the front
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(true));
+        let models = result
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array should be present");
+        // Chat-capable models should be included (namespaced with provider).
         assert!(
-            ids.iter().position(|id| *id == "gpt-4o-mini").unwrap()
-                < ids
-                    .iter()
-                    .position(|id| *id == "some-regular-model")
-                    .unwrap(),
-            "fast model gpt-4o-mini should come before regular model, got: {ids:?}"
+            models.iter().any(|m| m.get("id").and_then(|v| v.as_str())
+                == Some("custom-test-server::gpt-4o"))
         );
+        assert!(models.iter().any(
+            |m| m.get("id").and_then(|v| v.as_str()) == Some("custom-test-server::gpt-4o-mini")
+        ));
+        // Non-chat models (dall-e-3) are filtered by fetch_models_from_api.
         assert!(
-            ids.iter()
-                .position(|id| *id == "claude-3.5-haiku-20241022")
-                .unwrap()
-                < ids
-                    .iter()
-                    .position(|id| *id == "some-regular-model")
-                    .unwrap(),
-            "fast model claude-3.5-haiku should come before regular model, got: {ids:?}"
-        );
-        assert!(
-            ids.iter().position(|id| *id == "deepseek-chat").unwrap()
-                < ids
-                    .iter()
-                    .position(|id| *id == "some-regular-model")
-                    .unwrap(),
-            "fast model deepseek-chat should come before regular model, got: {ids:?}"
-        );
-
-        // Slow models should be at the end
-        assert!(
-            ids.iter()
-                .position(|id| *id == "some-regular-model")
-                .unwrap()
-                < ids
-                    .iter()
-                    .position(|id| *id == "gpt-4o-search-preview")
-                    .unwrap(),
-            "regular model should come before slow model search-preview, got: {ids:?}"
-        );
-        assert!(
-            ids.iter()
-                .position(|id| *id == "some-regular-model")
-                .unwrap()
-                < ids
-                    .iter()
-                    .position(|id| *id == "bytedance-seed/seed-2.0-mini")
-                    .unwrap(),
-            "regular model should come before slow model seed-, got: {ids:?}"
-        );
-        assert!(
-            ids.iter()
-                .position(|id| *id == "some-regular-model")
-                .unwrap()
-                < ids
-                    .iter()
-                    .position(|id| *id == "experimental-model-v1")
-                    .unwrap(),
-            "regular model should come before slow model experimental, got: {ids:?}"
+            !models
+                .iter()
+                .any(|m| m.get("id").and_then(|v| v.as_str())
+                    == Some("custom-test-server::dall-e-3"))
         );
     }
 
-    #[test]
-    fn reorder_models_for_validation_with_namespaced_ids() {
-        let mut models = vec![
-            make_model("openrouter::gpt-4o-search-preview"),
-            make_model("openrouter::gpt-4o-mini"),
-            make_model("openrouter::some-model"),
-        ];
+    #[tokio::test]
+    async fn validate_key_custom_provider_uses_saved_base_url_when_request_omits_it() {
+        use axum::{Json, Router, routing::get};
 
-        reorder_models_for_validation(&mut models);
-        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        let app = Router::new().route(
+            "/models",
+            get(|| async {
+                Json(serde_json::json!({
+                    "data": [
+                        {"id": "gpt-4o-mini", "object": "model", "created": 1700000001}
+                    ]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
 
-        assert_eq!(
-            ids[0], "openrouter::gpt-4o-mini",
-            "fast namespaced model should be first, got: {ids:?}"
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None);
+        svc.key_store
+            .save_config(
+                "custom-test-server",
+                Some("sk-saved".into()),
+                Some(format!("http://{addr}")),
+                None,
+            )
+            .expect("save custom provider config");
+
+        let result = svc
+            .validate_key(serde_json::json!({
+                "provider": "custom-test-server",
+                "apiKey": "sk-test"
+            }))
+            .await
+            .expect("validate_key should return payload");
+        server.abort();
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(true));
+        let models = result
+            .get("models")
+            .and_then(|v| v.as_array())
+            .expect("models array should be present");
+        assert!(
+            models
+                .iter()
+                .any(|m| m.get("id").and_then(|v| v.as_str())
+                    == Some("custom-test-server::gpt-4o-mini")),
+            "expected discovered model via saved base_url, got: {models:?}"
         );
-        assert_eq!(
-            ids[1], "openrouter::some-model",
-            "regular model should be middle, got: {ids:?}"
+    }
+
+    #[tokio::test]
+    async fn validate_key_custom_provider_discovery_error_returns_invalid() {
+        use axum::{Router, http::StatusCode, routing::get};
+
+        let app = Router::new().route(
+            "/models",
+            get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
         );
-        assert_eq!(
-            ids[2], "openrouter::gpt-4o-search-preview",
-            "slow namespaced model should be last, got: {ids:?}"
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None);
+        let result = svc
+            .validate_key(serde_json::json!({
+                "provider": "custom-test-server",
+                "apiKey": "sk-test",
+                "baseUrl": format!("http://{addr}")
+            }))
+            .await
+            .expect("validate_key should return payload");
+        server.abort();
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(false));
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            error.contains("Failed to discover models"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// Regression test for <https://github.com/moltis-org/moltis/issues/502>.
+    ///
+    /// Before the fix, custom providers without a model fell through to the
+    /// model-probing loop, which sent chat completions to every discovered
+    /// model and timed out. The discovery path must return the model list
+    /// directly without ever hitting the chat completions endpoint.
+    #[tokio::test]
+    async fn validate_key_custom_provider_returns_discovered_models_without_probing() {
+        use {
+            axum::{
+                Json, Router,
+                http::StatusCode,
+                routing::{get, post},
+            },
+            std::sync::atomic::{AtomicBool, Ordering},
+        };
+
+        let completions_called = Arc::new(AtomicBool::new(false));
+        let cc1 = completions_called.clone();
+        let cc2 = completions_called.clone();
+
+        let app = Router::new()
+            .route(
+                "/models",
+                get(|| async {
+                    Json(serde_json::json!({
+                        "data": [
+                            {"id": "llama-3.1-70b", "object": "model", "created": 1700000000},
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/chat/completions",
+                post(move || async move {
+                    cc1.store(true, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    cc2.store(true, Ordering::SeqCst);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None);
+        let result = svc
+            .validate_key(serde_json::json!({
+                "provider": "custom-test-server",
+                "apiKey": "sk-test",
+                "baseUrl": format!("http://{addr}")
+            }))
+            .await
+            .expect("validate_key should return payload");
+        server.abort();
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            result.get("models").and_then(|v| v.as_array()).is_some(),
+            "should return discovered models"
+        );
+        assert!(
+            !completions_called.load(Ordering::SeqCst),
+            "chat completions endpoint must NOT be called when model is unset — \
+             the discovery path should return models directly (issue #502)"
+        );
+    }
+
+    /// When a custom provider's `/models` endpoint is unreachable, validation
+    /// should return an error promptly rather than falling through to probing.
+    #[tokio::test]
+    async fn validate_key_custom_provider_connection_refused_returns_error() {
+        // Bind a port and immediately drop the listener so connections are refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService::new(registry, ProvidersConfig::default(), None);
+        let result = svc
+            .validate_key(serde_json::json!({
+                "provider": "custom-test-server",
+                "apiKey": "sk-test",
+                "baseUrl": format!("http://{addr}")
+            }))
+            .await
+            .expect("validate_key should return payload");
+
+        assert_eq!(result.get("valid").and_then(|v| v.as_bool()), Some(false));
+        let error = result.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            error.contains("Failed to discover models"),
+            "should report discovery failure, got: {error}"
         );
     }
 }

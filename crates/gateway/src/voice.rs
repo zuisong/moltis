@@ -3,12 +3,10 @@
 //! This module provides concrete implementations of the `TtsService` and
 //! `SttService` traits using the moltis-voice crate's providers.
 
-use {
-    async_trait::async_trait,
-    serde_json::{Value, json},
-};
-
-use crate::services::{ServiceError, ServiceResult};
+#[cfg(feature = "voice")]
+use async_trait::async_trait;
+#[cfg(feature = "voice")]
+use serde_json::{Value, json};
 
 #[cfg(feature = "voice")]
 use {
@@ -27,6 +25,8 @@ use moltis_voice::{
 
 #[cfg(feature = "voice")]
 use crate::services::TtsService;
+#[cfg(feature = "voice")]
+use crate::services::{ServiceError, ServiceResult};
 
 #[cfg(feature = "voice")]
 trait IntoVoiceSttProvider {
@@ -532,6 +532,7 @@ impl LiveSttService {
                     key,
                     cfg.voice.stt.whisper.base_url.clone(),
                     cfg.voice.stt.whisper.model.clone(),
+                    cfg.voice.stt.whisper.language.clone(),
                 );
                 if provider.is_configured() {
                     Some(Box::new(provider) as Box<dyn SttProvider + Send + Sync>)
@@ -731,6 +732,7 @@ impl SttService for LiveSttService {
         prompt: Option<&str>,
     ) -> ServiceResult {
         let cfg = moltis_config::discover_and_load();
+        let audio_len = audio.len();
 
         let provider_id = match provider {
             Some(s) => {
@@ -751,10 +753,25 @@ impl SttService for LiveSttService {
             prompt: prompt.map(String::from),
         };
 
-        let transcript = stt_provider
-            .transcribe(request)
-            .await
-            .map_err(|e| format!("transcription failed: {}", e))?;
+        debug!(
+            provider = %provider_id,
+            format,
+            audio_bytes = audio_len,
+            language = language.unwrap_or("auto"),
+            has_prompt = prompt.is_some(),
+            "STT transcription request"
+        );
+
+        let transcript = stt_provider.transcribe(request).await.map_err(|e| {
+            warn!(
+                provider = %provider_id,
+                format,
+                audio_bytes = audio_len,
+                error = %e,
+                "STT transcription failed"
+            );
+            format!("transcription failed: {}", e)
+        })?;
 
         Ok(json!({
             "text": transcript.text,

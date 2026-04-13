@@ -17,10 +17,14 @@ use {
         task::AbortHandle,
     },
     tokio_stream::StreamExt,
+    tokio_util::sync::CancellationToken,
     tracing::{debug, info, warn},
 };
 
-use moltis_config::{MessageQueueMode, ToolMode};
+use moltis_config::{
+    AgentMemoryWriteMode, LoadedWorkspaceMarkdown, MemoryStyle, MessageQueueMode, PromptMemoryMode,
+    ToolMode,
+};
 
 use {
     moltis_agents::{
@@ -28,23 +32,28 @@ use {
         model::{StreamEvent, values_to_chat_messages},
         multimodal::parse_data_uri,
         prompt::{
-            PromptHostRuntimeContext, PromptNodeInfo, PromptNodesRuntimeContext,
+            PromptBuildLimits, PromptHostRuntimeContext, PromptNodeInfo, PromptNodesRuntimeContext,
             PromptRuntimeContext, PromptSandboxRuntimeContext, VOICE_REPLY_SUFFIX,
-            build_system_prompt_minimal_runtime, build_system_prompt_with_session_runtime,
+            build_system_prompt_minimal_runtime_details,
+            build_system_prompt_with_session_runtime_details,
         },
         runner::{RunnerEvent, run_agent_loop_streaming},
         tool_registry::{AgentTool, ToolRegistry},
     },
     moltis_providers::{ProviderRegistry, raw_model_id},
     moltis_sessions::{
-        ContentBlock, MessageContent, PersistedMessage,
+        ContentBlock, MessageContent, PersistedMessage, UserDocument,
         message::{PersistedFunction, PersistedToolCall},
         metadata::{SessionEntry, SqliteSessionMetadata},
+        state_store::SessionStateStore,
         store::SessionStore,
     },
     moltis_skills::discover::SkillDiscoverer,
-    moltis_tools::policy::{ToolPolicy, profile_tools},
+    moltis_tools::policy::{PolicyContext, ToolPolicy, resolve_effective_policy},
 };
+
+mod compaction;
+mod compaction_run;
 
 pub mod chat_error;
 pub mod error;
@@ -122,11 +131,48 @@ use moltis_metrics::{counter, histogram, labels, llm as llm_metrics};
 /// The two types have different image representations:
 /// - `ContentBlock::ImageUrl` stores a data URI string
 /// - `ContentPart::Image` stores separated `media_type` + `data` fields
-fn to_user_content(mc: &MessageContent) -> UserContent {
+fn format_user_documents_context(documents: &[UserDocument]) -> Option<String> {
+    if documents.is_empty() {
+        return None;
+    }
+
+    let mut sections = Vec::with_capacity(documents.len() + 1);
+    sections.push("[Inbound documents available]".to_string());
+    for document in documents {
+        sections.push(format!(
+            "filename: {}\nmime_type: {}\nlocal_path: {}\nmedia_ref: {}",
+            document.display_name,
+            document.mime_type,
+            document
+                .absolute_path
+                .as_deref()
+                .unwrap_or(&document.media_ref),
+            document.media_ref
+        ));
+    }
+
+    Some(sections.join("\n\n"))
+}
+
+fn append_user_documents_to_text(text: &str, documents: &[UserDocument]) -> String {
+    if let Some(context) = format_user_documents_context(documents) {
+        if text.trim().is_empty() {
+            context
+        } else {
+            format!("{text}\n\n{context}")
+        }
+    } else {
+        text.to_string()
+    }
+}
+
+fn to_user_content(mc: &MessageContent, documents: &[UserDocument]) -> UserContent {
     match mc {
-        MessageContent::Text(text) => UserContent::Text(text.clone()),
+        MessageContent::Text(text) => {
+            UserContent::Text(append_user_documents_to_text(text, documents))
+        },
         MessageContent::Multimodal(blocks) => {
-            let parts: Vec<ContentPart> = blocks
+            let mut parts: Vec<ContentPart> = blocks
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text { text } => Some(ContentPart::Text(text.clone())),
@@ -152,6 +198,19 @@ fn to_user_content(mc: &MessageContent) -> UserContent {
                     },
                 })
                 .collect();
+            if let Some(context) = format_user_documents_context(documents) {
+                if let Some(ContentPart::Text(text)) = parts
+                    .iter_mut()
+                    .find(|part| matches!(part, ContentPart::Text(_)))
+                {
+                    if !text.trim().is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&context);
+                } else {
+                    parts.insert(0, ContentPart::Text(context));
+                }
+            }
             let text_count = parts
                 .iter()
                 .filter(|p| matches!(p, ContentPart::Text(_)))
@@ -167,6 +226,64 @@ fn to_user_content(mc: &MessageContent) -> UserContent {
                 "to_user_content: converted multimodal content"
             );
             UserContent::Multimodal(parts)
+        },
+    }
+}
+
+fn rewrite_multimodal_text_blocks(blocks: &[ContentBlock], new_text: &str) -> Vec<ContentBlock> {
+    let mut rewritten = Vec::with_capacity(blocks.len().max(1));
+    let mut inserted_text = false;
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text { .. } if !inserted_text => {
+                rewritten.push(ContentBlock::Text {
+                    text: new_text.to_string(),
+                });
+                inserted_text = true;
+            },
+            ContentBlock::Text { .. } => {},
+            _ => rewritten.push(block.clone()),
+        }
+    }
+
+    if !inserted_text {
+        rewritten.insert(0, ContentBlock::Text {
+            text: new_text.to_string(),
+        });
+    }
+
+    rewritten
+}
+
+fn apply_message_received_rewrite(
+    message_content: &mut MessageContent,
+    params: &mut Value,
+    new_text: &str,
+) {
+    match message_content {
+        MessageContent::Text(text) => {
+            *text = new_text.to_string();
+            if let Some(params_obj) = params.as_object_mut() {
+                params_obj.insert("text".to_string(), serde_json::json!(new_text));
+                params_obj.remove("content");
+            }
+        },
+        MessageContent::Multimodal(blocks) => {
+            let rewritten_blocks = rewrite_multimodal_text_blocks(blocks, new_text);
+            match serde_json::to_value(&rewritten_blocks) {
+                Ok(content_value) => {
+                    *blocks = rewritten_blocks;
+                    if let Some(params_obj) = params.as_object_mut() {
+                        params_obj.insert("content".to_string(), content_value);
+                        params_obj.remove("text");
+                        params_obj.remove("message");
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize rewritten multimodal content");
+                },
+            }
         },
     }
 }
@@ -187,6 +304,13 @@ fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
 struct InputChannelMeta {
     #[serde(default)]
     message_kind: Option<InputMessageKind>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputChannelDocumentFile {
+    display_name: String,
+    stored_filename: String,
+    mime_type: String,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -332,6 +456,20 @@ fn estimate_text_tokens(text: &str) -> u64 {
     }
     let bytes = trimmed.len() as u64;
     bytes.div_ceil(4).max(1)
+}
+
+/// Compute the auto-compact trigger threshold for a given context window
+/// and user-configured `chat.compaction.threshold_percent`.
+///
+/// The returned value is the number of estimated next-request input
+/// tokens at or above which `send()` fires a pre-emptive compaction.
+/// The fraction is clamped to `[0.1, 0.95]` so a typo'd config can't
+/// disable auto-compact or spam it on every message, and the result is
+/// floored at `1` so zero-context windows still get a non-zero check.
+#[must_use]
+fn compute_auto_compact_threshold(context_window_tokens: u64, threshold_percent: f32) -> u64 {
+    let fraction = f64::from(threshold_percent.clamp(0.1, 0.95));
+    ((context_window_tokens as f64) * fraction).round().max(1.0) as u64
 }
 
 fn now_ms() -> u64 {
@@ -642,9 +780,7 @@ async fn run_single_probe(
         };
     }
 
-    let probe = [ChatMessage::user("ping")];
-    let completion =
-        tokio::time::timeout(Duration::from_secs(20), provider.complete(&probe, &[])).await;
+    let completion = tokio::time::timeout(Duration::from_secs(20), provider.probe()).await;
 
     match completion {
         Ok(Ok(_)) => {
@@ -831,6 +967,212 @@ fn capped_tool_result_payload(result: &Value, max_len: usize) -> Value {
     capped
 }
 
+/// Maximum total characters for a compaction summary.
+const SUMMARY_MAX_CHARS: usize = 1_200;
+/// Maximum number of lines in a compaction summary (excluding omission notice).
+const SUMMARY_MAX_LINES: usize = 24;
+/// Maximum characters per line in a compaction summary.
+const SUMMARY_MAX_LINE_CHARS: usize = 160;
+
+/// Compress a compaction summary to fit within budget constraints.
+///
+/// Enforces: max 1,200 chars total, max 24 lines, max 160 chars per line.
+/// Deduplicates lines (case-insensitive), preserves headers and bullets,
+/// and appends an omission notice when lines are dropped.
+#[must_use]
+fn compress_summary(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Step 1: deduplicate lines (case-insensitive, keep first occurrence)
+    // and strip blank lines so they don't consume the 24-line budget.
+    let mut seen = HashSet::new();
+    let mut deduped: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let key = line.trim().to_ascii_lowercase();
+        // Drop blank lines — they waste budget without adding content.
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key) {
+            deduped.push(if line.len() <= SUMMARY_MAX_LINE_CHARS {
+                line.to_string()
+            } else {
+                // Step 2: truncate individual lines exceeding 160 chars.
+                line[..line.floor_char_boundary(SUMMARY_MAX_LINE_CHARS)].to_string()
+            });
+        }
+    }
+    drop(seen);
+
+    // Step 3: check if already within budget.
+    let joined = deduped.join("\n");
+    if deduped.len() <= SUMMARY_MAX_LINES && joined.len() <= SUMMARY_MAX_CHARS {
+        return joined;
+    }
+
+    // Step 4: priority-based line dropping.
+    // Headers (starting with #) get highest priority, then bullets (- * •), then rest.
+    fn is_header(line: &str) -> bool {
+        line.trim_start().starts_with('#')
+    }
+    fn is_bullet(line: &str) -> bool {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ")
+    }
+
+    let mut headers: Vec<String> = Vec::new();
+    let mut bullet_lines: Vec<String> = Vec::new();
+    let mut other_lines: Vec<String> = Vec::new();
+
+    for line in deduped {
+        if is_header(&line) {
+            headers.push(line);
+        } else if is_bullet(&line) {
+            bullet_lines.push(line);
+        } else {
+            other_lines.push(line);
+        }
+    }
+
+    // Build ordered candidate list: bullets first, then others.
+    // Headers are always kept.
+    let mut candidates: Vec<String> = Vec::new();
+    candidates.extend(bullet_lines);
+    candidates.extend(other_lines);
+
+    let header_count = headers.len();
+
+    // Check if keeping all candidates fits.
+    if header_count + candidates.len() <= SUMMARY_MAX_LINES {
+        let total_len = headers.iter().chain(candidates.iter()).fold(0, |acc, l| {
+            acc + l.len() + 1 // +1 for newline
+        })
+        // fold overcounts by 1 (N newlines vs N-1 for join); subtract to correct.
+        .saturating_sub(1);
+        if total_len <= SUMMARY_MAX_CHARS {
+            let mut result = headers;
+            result.extend(candidates);
+            return result.join("\n");
+        }
+    }
+
+    // Need to drop lines from the end of candidates.
+    // Account for omission notice in budget.
+    fn make_notice(n: usize) -> String {
+        format!("[... {n} lines omitted for brevity]")
+    }
+
+    for drop_count in 1..=candidates.len() {
+        let keep_count = candidates.len() - drop_count;
+        let line_count = header_count + keep_count + 1; // +1 for omission notice
+        if line_count > SUMMARY_MAX_LINES {
+            continue;
+        }
+
+        let notice = make_notice(drop_count);
+        let kept_candidates = &candidates[..keep_count];
+        let total_len = headers
+            .iter()
+            .chain(kept_candidates.iter())
+            .fold(0, |acc, l| acc + l.len() + 1)
+            // fold overcounts by 1 (N newlines vs N-1 for join); subtract to correct.
+            .saturating_sub(1)
+            + notice.len()
+            + 1; // +1 for newline before notice
+
+        if total_len <= SUMMARY_MAX_CHARS {
+            let mut result = headers;
+            result.extend(kept_candidates.iter().cloned());
+            result.push(notice);
+            return result.join("\n");
+        }
+    }
+
+    // Edge case: even dropping all candidates, headers alone are too long.
+    // Force-truncate headers from the end.  Run two passes so the notice
+    // length is exact: first pass counts dropped headers, second pass
+    // builds the result with the correct budget.
+    let base_dropped = candidates.len();
+    let mut header_drop_count = 0usize;
+    {
+        // First pass: determine how many headers must be dropped.
+        let mut budget = SUMMARY_MAX_CHARS.saturating_sub(make_notice(base_dropped).len() + 1);
+        let mut kept = 0usize;
+        for line in &headers {
+            let needed = line.len()
+                + if kept == 0 {
+                    0
+                } else {
+                    1
+                };
+            if needed > budget || kept + 1 >= SUMMARY_MAX_LINES {
+                header_drop_count += 1;
+            } else {
+                budget -= needed;
+                kept += 1;
+            }
+        }
+    }
+
+    let notice = make_notice(base_dropped + header_drop_count);
+    // Second pass: rebuild with exact budget including final notice length.
+    let mut char_budget = SUMMARY_MAX_CHARS.saturating_sub(notice.len() + 1);
+    let mut result: Vec<String> = Vec::new();
+    for line in &headers {
+        let needed = line.len()
+            + if result.is_empty() {
+                0
+            } else {
+                1
+            };
+        if needed > char_budget || result.len() + 1 >= SUMMARY_MAX_LINES {
+            continue;
+        }
+        char_budget -= needed;
+        result.push(line.clone());
+    }
+    result.push(notice);
+    result.join("\n")
+}
+
+/// Apply [`compress_summary`] to any `[Conversation Summary]` or
+/// `[Conversation Compacted]` message in a compacted history.
+///
+/// Walks each message, detects the summary prefix, compresses the body, and
+/// replaces the content in place. Non-summary messages are passed through
+/// unchanged, preserving the head/tail structure of modes like
+/// `recency_preserving`.
+fn compress_summary_in_history(mut history: Vec<Value>) -> Vec<Value> {
+    for msg in &mut history {
+        let Some(content) = msg.get("content").and_then(Value::as_str).map(String::from) else {
+            continue;
+        };
+        for prefix in ["[Conversation Summary]\n\n", "[Conversation Compacted]\n\n"] {
+            if let Some(body) = content.strip_prefix(prefix) {
+                let compressed = compress_summary(body);
+                if compressed.len() < body.len()
+                    && let Some(obj) = msg.as_object_mut()
+                {
+                    obj.insert(
+                        "content".into(),
+                        Value::String(format!("{prefix}{compressed}")),
+                    );
+                }
+                break;
+            }
+        }
+    }
+    history
+}
+
 fn shell_reply_text_from_exec_result(result: &Value) -> String {
     let stdout = result
         .get("stdout")
@@ -870,6 +1212,15 @@ fn is_safe_user_audio_filename(filename: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
 }
 
+fn sanitize_user_document_display_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.len() > 255 || trimmed.chars().any(char::is_control) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn user_audio_path_from_params(params: &Value, session_key: &str) -> Option<String> {
     let filename = params
         .get("_audio_filename")
@@ -888,6 +1239,66 @@ fn user_audio_path_from_params(params: &Value, session_key: &str) -> Option<Stri
 
     let key = SessionStore::key_to_filename(session_key);
     Some(format!("media/{key}/{filename}"))
+}
+
+fn user_documents_from_params(
+    params: &Value,
+    session_key: &str,
+    session_store: &SessionStore,
+) -> Option<Vec<UserDocument>> {
+    let documents = params.get("_document_files")?.as_array()?;
+    let media_dir_key = SessionStore::key_to_filename(session_key);
+    let mut parsed = Vec::new();
+
+    for document in documents {
+        let Ok(document) = serde_json::from_value::<InputChannelDocumentFile>(document.clone())
+        else {
+            continue;
+        };
+        let stored_filename = document.stored_filename.trim();
+        let mime_type = document.mime_type.trim();
+        if !is_safe_user_audio_filename(stored_filename) || mime_type.is_empty() {
+            continue;
+        }
+
+        let display_name = sanitize_user_document_display_name(&document.display_name)
+            .unwrap_or_else(|| stored_filename.to_string());
+        parsed.push(UserDocument {
+            display_name,
+            stored_filename: stored_filename.to_string(),
+            mime_type: mime_type.to_string(),
+            media_ref: format!("media/{media_dir_key}/{stored_filename}"),
+            absolute_path: Some(
+                session_store
+                    .media_path_for(session_key, stored_filename)
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        });
+    }
+
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn user_documents_for_persistence(documents: &[UserDocument]) -> Option<Vec<UserDocument>> {
+    if documents.is_empty() {
+        return None;
+    }
+
+    Some(
+        documents
+            .iter()
+            .cloned()
+            .map(|mut document| {
+                document.absolute_path = None;
+                document
+            })
+            .collect(),
+    )
 }
 
 fn detect_runtime_shell() -> Option<String> {
@@ -994,9 +1405,131 @@ struct PromptPersona {
     identity: moltis_config::AgentIdentity,
     user: moltis_config::UserProfile,
     soul_text: Option<String>,
+    boot_text: Option<String>,
     agents_text: Option<String>,
     tools_text: Option<String>,
     memory_text: Option<String>,
+    memory_status: PromptMemoryStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptMemoryStatus {
+    style: MemoryStyle,
+    mode: PromptMemoryMode,
+    write_mode: AgentMemoryWriteMode,
+    snapshot_active: bool,
+    present: bool,
+    chars: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_source: Option<moltis_config::WorkspaceMarkdownSource>,
+}
+
+const PROMPT_MEMORY_NAMESPACE: &str = "__prompt_memory";
+
+fn prompt_memory_snapshot_key(agent_id: &str) -> String {
+    format!("snapshot:{agent_id}")
+}
+
+async fn clear_prompt_memory_snapshot(
+    session_key: &str,
+    agent_id: &str,
+    state_store: Option<&SessionStateStore>,
+) -> bool {
+    let Some(store) = state_store else {
+        return false;
+    };
+    let key = prompt_memory_snapshot_key(agent_id);
+    match store
+        .delete(session_key, PROMPT_MEMORY_NAMESPACE, &key)
+        .await
+    {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                agent_id,
+                error = %error,
+                "failed to clear prompt memory snapshot"
+            );
+            false
+        },
+    }
+}
+
+fn prompt_memory_status(
+    style: MemoryStyle,
+    mode: PromptMemoryMode,
+    write_mode: AgentMemoryWriteMode,
+    snapshot_active: bool,
+    memory: Option<&LoadedWorkspaceMarkdown>,
+) -> PromptMemoryStatus {
+    PromptMemoryStatus {
+        style,
+        mode,
+        write_mode,
+        snapshot_active,
+        present: memory.is_some(),
+        chars: memory.map_or(0, |entry| entry.content.chars().count()),
+        path: memory.map(|entry| entry.path.to_string_lossy().into_owned()),
+        file_source: memory.map(|entry| entry.source),
+    }
+}
+
+fn memory_write_mode_allows_save(mode: AgentMemoryWriteMode) -> bool {
+    !matches!(mode, AgentMemoryWriteMode::Off)
+}
+
+fn default_agent_memory_file_for_mode(mode: AgentMemoryWriteMode) -> &'static str {
+    match mode {
+        AgentMemoryWriteMode::SearchOnly => "memory/notes.md",
+        AgentMemoryWriteMode::Hybrid
+        | AgentMemoryWriteMode::PromptOnly
+        | AgentMemoryWriteMode::Off => "MEMORY.md",
+    }
+}
+
+fn is_prompt_memory_file(file: &str) -> bool {
+    matches!(file.trim(), "MEMORY.md" | "memory.md")
+}
+
+fn validate_agent_memory_target_for_mode(
+    mode: AgentMemoryWriteMode,
+    file: &str,
+) -> anyhow::Result<()> {
+    match mode {
+        AgentMemoryWriteMode::Hybrid => Ok(()),
+        AgentMemoryWriteMode::PromptOnly => {
+            if is_prompt_memory_file(file) {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "memory.agent_write_mode = \"prompt-only\" only allows MEMORY.md writes"
+                );
+            }
+        },
+        AgentMemoryWriteMode::SearchOnly => {
+            if is_prompt_memory_file(file) {
+                anyhow::bail!(
+                    "memory.agent_write_mode = \"search-only\" only allows memory/<name>.md writes"
+                );
+            }
+            Ok(())
+        },
+        AgentMemoryWriteMode::Off => {
+            anyhow::bail!("agent-authored memory writes are disabled by memory.agent_write_mode");
+        },
+    }
+}
+
+fn memory_style_allows_prompt(style: MemoryStyle) -> bool {
+    matches!(style, MemoryStyle::Hybrid | MemoryStyle::PromptOnly)
+}
+
+fn memory_style_allows_tools(style: MemoryStyle) -> bool {
+    matches!(style, MemoryStyle::Hybrid | MemoryStyle::SearchOnly)
 }
 
 fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> String {
@@ -1026,11 +1559,11 @@ fn resolve_prompt_agent_id(session_entry: Option<&SessionEntry>) -> String {
 }
 
 /// Load identity, user profile, soul, and workspace text for one agent.
-///
-/// Both `run_with_tools` and `run_streaming` need the same persona data;
-/// this function avoids duplicating the merge logic.
-fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
+fn load_prompt_persona_base_for_agent(agent_id: &str) -> PromptPersona {
     let config = moltis_config::discover_and_load();
+    let prompt_memory_mode = config.chat.prompt_memory_mode;
+    let agent_write_mode = config.memory.agent_write_mode;
+    let memory_style = config.memory.style;
     let mut identity = config.identity.clone();
     if let Some(file_identity) = moltis_config::load_identity_for_agent(agent_id) {
         if file_identity.name.is_some() {
@@ -1043,95 +1576,212 @@ fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
             identity.theme = file_identity.theme;
         }
     }
-    let mut user = config.user.clone();
-    if let Some(file_user) = moltis_config::load_user() {
-        if file_user.name.is_some() {
-            user.name = file_user.name;
-        }
-        if file_user.timezone.is_some() {
-            user.timezone = file_user.timezone;
-        }
-    }
+    let user = moltis_config::resolve_user_profile_from_config(&config);
     PromptPersona {
         config,
         identity,
         user,
         soul_text: moltis_config::load_soul_for_agent(agent_id),
+        boot_text: moltis_config::load_boot_md_for_agent(agent_id),
         agents_text: moltis_config::load_agents_md_for_agent(agent_id),
         tools_text: moltis_config::load_tools_md_for_agent(agent_id),
-        memory_text: moltis_config::load_memory_md_for_agent(agent_id),
+        memory_text: None,
+        memory_status: prompt_memory_status(
+            memory_style,
+            prompt_memory_mode,
+            agent_write_mode,
+            false,
+            None,
+        ),
     }
 }
 
-fn load_prompt_persona_for_session(session_entry: Option<&SessionEntry>) -> PromptPersona {
+fn load_prompt_persona_for_agent(agent_id: &str) -> PromptPersona {
+    let mut persona = load_prompt_persona_base_for_agent(agent_id);
+    let style = persona.config.memory.style;
+    let mode = persona.config.chat.prompt_memory_mode;
+    let write_mode = persona.config.memory.agent_write_mode;
+    let memory = if memory_style_allows_prompt(style) {
+        moltis_config::load_memory_md_for_agent_with_source(agent_id)
+    } else {
+        None
+    };
+    persona.memory_text = memory.as_ref().map(|entry| entry.content.clone());
+    persona.memory_status = prompt_memory_status(style, mode, write_mode, false, memory.as_ref());
+    persona
+}
+
+async fn load_prompt_memory_for_session(
+    session_key: &str,
+    agent_id: &str,
+    mode: PromptMemoryMode,
+    state_store: Option<&SessionStateStore>,
+) -> (Option<LoadedWorkspaceMarkdown>, bool) {
+    let live_memory = || moltis_config::load_memory_md_for_agent_with_source(agent_id);
+
+    if !matches!(mode, PromptMemoryMode::FrozenAtSessionStart) {
+        return (live_memory(), false);
+    }
+
+    let Some(store) = state_store else {
+        return (live_memory(), false);
+    };
+
+    let key = prompt_memory_snapshot_key(agent_id);
+    match store.get(session_key, PROMPT_MEMORY_NAMESPACE, &key).await {
+        Ok(Some(raw)) => match serde_json::from_str::<Option<LoadedWorkspaceMarkdown>>(&raw) {
+            Ok(snapshot) => return (snapshot, true),
+            Err(error) => warn!(
+                session = %session_key,
+                agent_id,
+                error = %error,
+                "failed to deserialize prompt memory snapshot, rebuilding"
+            ),
+        },
+        Ok(None) => {},
+        Err(error) => warn!(
+            session = %session_key,
+            agent_id,
+            error = %error,
+            "failed to read prompt memory snapshot, falling back to live memory"
+        ),
+    }
+
+    let memory = live_memory();
+    match serde_json::to_string(&memory) {
+        Ok(serialized) => {
+            if let Err(error) = store
+                .set(session_key, PROMPT_MEMORY_NAMESPACE, &key, &serialized)
+                .await
+            {
+                warn!(
+                    session = %session_key,
+                    agent_id,
+                    error = %error,
+                    "failed to persist prompt memory snapshot"
+                );
+                return (memory, false);
+            }
+            (memory, true)
+        },
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                agent_id,
+                error = %error,
+                "failed to serialize prompt memory snapshot"
+            );
+            (memory, false)
+        },
+    }
+}
+
+async fn load_prompt_persona_for_session(
+    session_key: &str,
+    session_entry: Option<&SessionEntry>,
+    state_store: Option<&SessionStateStore>,
+) -> PromptPersona {
     let agent_id = resolve_prompt_agent_id(session_entry);
-    load_prompt_persona_for_agent(&agent_id)
+    let mut persona = load_prompt_persona_base_for_agent(&agent_id);
+    let style = persona.config.memory.style;
+    let mode = persona.config.chat.prompt_memory_mode;
+    let write_mode = persona.config.memory.agent_write_mode;
+    let (memory, snapshot_active) = if memory_style_allows_prompt(style) {
+        load_prompt_memory_for_session(session_key, &agent_id, mode, state_store).await
+    } else {
+        (None, false)
+    };
+    persona.memory_text = memory.as_ref().map(|entry| entry.content.clone());
+    persona.memory_status =
+        prompt_memory_status(style, mode, write_mode, snapshot_active, memory.as_ref());
+    persona
 }
 
-#[derive(Default)]
-struct ChannelRuntimeContext {
-    surface: Option<String>,
-    session_kind: Option<String>,
-    channel_type: Option<String>,
-    channel_account_id: Option<String>,
-    channel_chat_id: Option<String>,
-    channel_chat_type: Option<String>,
-}
-
-fn infer_channel_chat_type(channel_type: &str, chat_id: &str) -> Option<String> {
-    if channel_type.eq_ignore_ascii_case("telegram") {
-        if chat_id.starts_with("-100") {
-            return Some("channel_or_supergroup".to_string());
-        }
-        if chat_id.starts_with('-') {
-            return Some("group".to_string());
-        }
-        return Some("private".to_string());
+fn prompt_build_limits_from_config(config: &moltis_config::MoltisConfig) -> PromptBuildLimits {
+    PromptBuildLimits {
+        workspace_file_max_chars: config.chat.workspace_file_max_chars,
     }
-    None
+}
+
+/// Discover skills from the default filesystem paths, honoring `[skills] enabled`.
+///
+/// Returns an empty list when `config.skills.enabled` is `false`, so callers can
+/// unconditionally feed the result into prompt building / tool filtering without
+/// injecting skills into the LLM context when the operator has disabled them.
+async fn discover_skills_if_enabled(
+    config: &moltis_config::MoltisConfig,
+) -> Vec<moltis_skills::types::SkillMetadata> {
+    if !config.skills.enabled {
+        return Vec::new();
+    }
+    let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
+    let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
+    match discoverer.discover().await {
+        Ok(skills) => skills,
+        Err(e) => {
+            warn!("failed to discover skills: {e}");
+            Vec::new()
+        },
+    }
 }
 
 fn resolve_channel_runtime_context(
     session_key: &str,
     session_entry: Option<&SessionEntry>,
-) -> ChannelRuntimeContext {
-    if session_key == "cron:heartbeat" {
-        return ChannelRuntimeContext {
-            surface: Some("heartbeat".to_string()),
-            session_kind: Some("cron".to_string()),
-            ..Default::default()
-        };
+) -> moltis_common::hooks::ChannelBinding {
+    match moltis_channels::resolve_session_channel_binding(
+        session_key,
+        session_entry.and_then(|entry| entry.channel_binding.as_deref()),
+    ) {
+        Ok(binding) => binding,
+        Err(error) => {
+            warn!(
+                error = %error,
+                session = %session_key,
+                "failed to parse channel_binding JSON; falling back to web"
+            );
+            moltis_channels::web_session_channel_binding()
+        },
     }
+}
 
-    if session_key.starts_with("cron:") {
-        return ChannelRuntimeContext {
-            surface: Some("cron".to_string()),
-            session_kind: Some("cron".to_string()),
-            ..Default::default()
-        };
-    }
+fn channel_binding_from_runtime_context(
+    runtime_context: Option<&PromptRuntimeContext>,
+) -> Option<moltis_common::hooks::ChannelBinding> {
+    let host = &runtime_context?.host;
+    let binding = moltis_common::hooks::ChannelBinding {
+        surface: host.surface.clone(),
+        session_kind: host.session_kind.clone(),
+        channel_type: host.channel_type.clone(),
+        account_id: host.channel_account_id.clone(),
+        chat_id: host.channel_chat_id.clone(),
+        chat_type: host.channel_chat_type.clone(),
+        sender_id: host.channel_sender_id.clone(),
+    };
+    (!binding.is_empty()).then_some(binding)
+}
 
-    if let Some(binding_json) = session_entry.and_then(|entry| entry.channel_binding.as_deref())
-        && let Ok(binding) =
-            serde_json::from_str::<moltis_channels::ChannelReplyTarget>(binding_json)
+fn build_tool_context(
+    session_key: &str,
+    accept_language: Option<&str>,
+    conn_id: Option<&str>,
+    runtime_context: Option<&PromptRuntimeContext>,
+) -> Value {
+    let mut tool_context = serde_json::json!({
+        "_session_key": session_key,
+    });
+    if let Some(channel_binding) = channel_binding_from_runtime_context(runtime_context)
+        && let Ok(channel_value) = serde_json::to_value(channel_binding)
     {
-        let channel_type = binding.channel_type.as_str().to_string();
-        let chat_id = binding.chat_id;
-        return ChannelRuntimeContext {
-            surface: Some(channel_type.clone()),
-            session_kind: Some("channel".to_string()),
-            channel_chat_type: infer_channel_chat_type(&channel_type, &chat_id),
-            channel_type: Some(channel_type),
-            channel_account_id: Some(binding.account_id),
-            channel_chat_id: Some(chat_id),
-        };
+        tool_context["_channel"] = channel_value;
     }
-
-    ChannelRuntimeContext {
-        surface: Some("web".to_string()),
-        session_kind: Some("web".to_string()),
-        ..Default::default()
+    if let Some(lang) = accept_language {
+        tool_context["_accept_language"] = serde_json::json!(lang);
     }
+    if let Some(cid) = conn_id {
+        tool_context["_conn_id"] = serde_json::json!(cid);
+    }
+    tool_context
 }
 
 async fn build_prompt_runtime_context(
@@ -1203,9 +1853,9 @@ async fn build_prompt_runtime_context(
         surface: channel_context.surface,
         session_kind: channel_context.session_kind,
         channel_type: channel_context.channel_type,
-        channel_account_id: channel_context.channel_account_id,
-        channel_chat_id: channel_context.channel_chat_id,
-        channel_chat_type: channel_context.channel_chat_type,
+        channel_account_id: channel_context.account_id,
+        channel_chat_id: channel_context.chat_id,
+        channel_chat_type: channel_context.chat_type,
         data_dir: Some(data_dir_display),
         sudo_non_interactive,
         sudo_status,
@@ -1325,8 +1975,8 @@ fn normalized_iana_timezone(timezone: Option<&str>) -> Option<String> {
 }
 
 fn default_user_prompt_timezone() -> Option<String> {
-    let user = moltis_config::load_user()?;
-    user.timezone
+    moltis_config::resolve_user_profile()
+        .timezone
         .as_ref()
         .map(|timezone| timezone.name().to_string())
         .and_then(|timezone| normalized_iana_timezone(Some(&timezone)))
@@ -1341,6 +1991,15 @@ fn apply_request_runtime_context(host: &mut PromptHostRuntimeContext, params: &V
         .get("_remote_ip")
         .and_then(|v| v.as_str())
         .map(String::from);
+
+    // Extract sender_id from channel metadata (set by channel handlers).
+    if host.channel_sender_id.is_none() {
+        host.channel_sender_id = params
+            .get("channel")
+            .and_then(|ch| ch.get("sender_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
 
     if let Some(timezone) =
         normalized_iana_timezone(params.get("_timezone").and_then(|v| v.as_str()))
@@ -1362,25 +2021,12 @@ fn prompt_sandbox_no_network_state(backend: &str, configured_no_network: bool) -
     }
 }
 
-fn effective_tool_policy(config: &moltis_config::MoltisConfig) -> ToolPolicy {
-    let mut effective = ToolPolicy::default();
-    if let Some(profile) = config.tools.policy.profile.as_deref()
-        && !profile.is_empty()
-    {
-        effective = effective.merge_with(&profile_tools(profile));
-    }
-    let configured = ToolPolicy {
-        allow: config.tools.policy.allow.clone(),
-        deny: config.tools.policy.deny.clone(),
-    };
-    effective.merge_with(&configured)
-}
-
 fn apply_runtime_tool_filters(
     base: &ToolRegistry,
     config: &moltis_config::MoltisConfig,
     _skills: &[moltis_skills::types::SkillMetadata],
     mcp_disabled: bool,
+    policy_context: &PolicyContext,
 ) -> ToolRegistry {
     let base_registry = if mcp_disabled {
         base.clone_without_mcp()
@@ -1388,13 +2034,42 @@ fn apply_runtime_tool_filters(
         base.clone_without(&[])
     };
 
-    let policy = effective_tool_policy(config);
+    let policy = resolve_effective_policy(config, policy_context);
     // NOTE: Do not globally restrict tools by discovered skill `allowed_tools`.
     // Skills are always discovered for prompt injection; applying those lists at
     // runtime can unintentionally remove unrelated tools (for example, leaving
     // only `web_fetch` and preventing `create_skill` from being called).
     // Tool availability here is controlled by configured runtime policy.
     base_registry.clone_allowed_by(|name| policy.is_allowed(name))
+}
+
+/// Build a `PolicyContext` from runtime context and request parameters.
+fn build_policy_context(
+    agent_id: &str,
+    runtime_context: Option<&PromptRuntimeContext>,
+    params: Option<&Value>,
+) -> PolicyContext {
+    let host = runtime_context.map(|rc| &rc.host);
+    // sender_id: prefer params["channel"]["sender_id"] (fresh from channel
+    // dispatch), fall back to host.channel_sender_id (set by
+    // apply_request_runtime_context earlier in the call chain).
+    let sender_id = params
+        .and_then(|p| p.get("channel"))
+        .and_then(|ch| ch.get("sender_id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| host.and_then(|h| h.channel_sender_id.clone()));
+    PolicyContext {
+        agent_id: agent_id.to_string(),
+        provider: host.and_then(|h| h.provider.clone()),
+        channel: host.and_then(|h| h.channel_type.clone()),
+        channel_account_id: host.and_then(|h| h.channel_account_id.clone()),
+        group_id: host.and_then(|h| h.channel_chat_type.clone()),
+        sender_id,
+        sandboxed: runtime_context
+            .and_then(|rc| rc.sandbox.as_ref())
+            .is_some_and(|s| s.exec_sandboxed),
+    }
 }
 
 // ── Disabled Models Store ────────────────────────────────────────────────────
@@ -1496,7 +2171,15 @@ pub struct LiveModelService {
     disabled: Arc<RwLock<DisabledModelsStore>>,
     state: Arc<OnceCell<Arc<dyn ChatRuntime>>>,
     detect_gate: Arc<Semaphore>,
+    /// Token used to cancel an in-flight `detect_supported` run.
+    detect_cancel: Arc<RwLock<Option<CancellationToken>>>,
     priority_models: Arc<RwLock<Vec<String>>>,
+    show_legacy_models: bool,
+    /// Provider config for runtime model rediscovery.
+    providers_config: moltis_config::schema::ProvidersConfig,
+    /// Environment variable overrides for runtime model rediscovery.
+    /// Shared so the gateway can update it after loading UI-stored keys.
+    env_overrides: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl LiveModelService {
@@ -1510,8 +2193,36 @@ impl LiveModelService {
             disabled,
             state: Arc::new(OnceCell::new()),
             detect_gate: Arc::new(Semaphore::new(1)),
+            detect_cancel: Arc::new(RwLock::new(None)),
             priority_models: Arc::new(RwLock::new(priority_models)),
+            show_legacy_models: false,
+            providers_config: moltis_config::schema::ProvidersConfig::default(),
+            env_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub fn with_show_legacy_models(mut self, show: bool) -> Self {
+        self.show_legacy_models = show;
+        self
+    }
+
+    /// Set the provider config and initial env overrides used for runtime
+    /// model rediscovery when "Detect All Models" is triggered.
+    pub fn with_discovery_config(
+        mut self,
+        providers_config: moltis_config::schema::ProvidersConfig,
+        env_overrides: HashMap<String, String>,
+    ) -> Self {
+        self.providers_config = providers_config;
+        self.env_overrides = Arc::new(RwLock::new(env_overrides));
+        self
+    }
+
+    /// Shared handle to the env overrides. Pass this to code that needs to
+    /// update the overrides after construction (e.g. when runtime UI-stored
+    /// API keys are loaded from the credential store).
+    pub fn env_overrides_handle(&self) -> Arc<RwLock<HashMap<String, String>>> {
+        Arc::clone(&self.env_overrides)
     }
 
     /// Shared handle to the priority models list. Pass this to services
@@ -1732,6 +2443,21 @@ impl ModelService for LiveModelService {
         let disabled = self.disabled.read().await;
         let order = self.priority_order().await;
         let all_models = reg.list_models_with_reasoning_variants();
+
+        // Hide models older than 1 year from the chat selector unless the
+        // user opted in via `providers.show_legacy_models`.  Preferred models
+        // and models without a timestamp are never hidden.
+        let legacy_cutoff: Option<i64> = if self.show_legacy_models {
+            None
+        } else {
+            let one_year_ago = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+                - 365 * 24 * 60 * 60;
+            Some(one_year_ago)
+        };
+
         let prioritized = Self::prioritize_models(
             &order,
             all_models
@@ -1740,19 +2466,31 @@ impl ModelService for LiveModelService {
                 .filter(|m| !disabled.is_disabled(&m.id))
                 .filter(|m| disabled.unsupported_info(&m.id).is_none()),
         );
-        info!(model_count = prioritized.len(), "models.list response");
+        debug!(model_count = prioritized.len(), "models.list response");
         let models: Vec<_> = prioritized
             .iter()
             .copied()
+            .filter(|m| {
+                let preferred = Self::priority_rank(&order, m) != usize::MAX;
+                if preferred {
+                    return true;
+                }
+                match (legacy_cutoff, m.created_at) {
+                    (Some(cutoff), Some(ts)) => ts >= cutoff,
+                    _ => true, // no cutoff or no timestamp → keep
+                }
+            })
             .map(|m| {
-                let supports_tools = reg.get(&m.id).is_some_and(|p| p.supports_tools());
                 let preferred = Self::priority_rank(&order, m) != usize::MAX;
                 serde_json::json!({
                     "id": m.id,
                     "provider": m.provider,
                     "displayName": m.display_name,
-                    "supportsTools": supports_tools,
+                    "supportsTools": m.capabilities.tools,
+                    "supportsVision": m.capabilities.vision,
+                    "supportsReasoning": m.capabilities.reasoning,
                     "preferred": preferred,
+                    "recommended": m.recommended,
                     "createdAt": m.created_at,
                     "unsupported": false,
                     "unsupportedReason": Value::Null,
@@ -1780,13 +2518,17 @@ impl ModelService for LiveModelService {
             .iter()
             .copied()
             .map(|m| {
-                let supports_tools = reg.get(&m.id).is_some_and(|p| p.supports_tools());
+                let preferred = Self::priority_rank(&order, m) != usize::MAX;
                 let unsupported = disabled.unsupported_info(&m.id);
                 serde_json::json!({
                     "id": m.id,
                     "provider": m.provider,
                     "displayName": m.display_name,
-                    "supportsTools": supports_tools,
+                    "supportsTools": m.capabilities.tools,
+                    "supportsVision": m.capabilities.vision,
+                    "supportsReasoning": m.capabilities.reasoning,
+                    "preferred": preferred,
+                    "recommended": m.recommended,
                     "createdAt": m.created_at,
                     "disabled": disabled.is_disabled(&m.id),
                     "unsupported": unsupported.is_some(),
@@ -1884,7 +2626,44 @@ impl ModelService for LiveModelService {
                 .map_err(|_| ServiceError::message("model probe gate closed"))?
         };
 
+        // Install a cancellation token for this run so cancel_detect() can stop it.
+        let cancel_token = CancellationToken::new();
+        {
+            let mut guard = self.detect_cancel.write().await;
+            *guard = Some(cancel_token.clone());
+        }
+
         let state = self.state.get().cloned();
+
+        // Phase 0: re-discover models from provider APIs so that newly
+        // added models (e.g. a model loaded into llama.cpp after startup)
+        // are found before probing.
+        //
+        // HTTP fetches and Ollama `/api/show` probes run outside the
+        // registry lock; only the fast in-memory registration takes it.
+        {
+            let env_snapshot = self.env_overrides.read().await.clone();
+            let result = moltis_providers::fetch_discoverable_models(
+                &self.providers_config,
+                &env_snapshot,
+                provider_filter.as_deref(),
+            )
+            .await;
+            if !result.is_empty() {
+                let mut reg = self.providers.write().await;
+                let new_count = reg.register_rediscovered_models(
+                    &self.providers_config,
+                    &env_snapshot,
+                    &result,
+                );
+                if new_count > 0 {
+                    tracing::info!(
+                        new_models = new_count,
+                        "rediscovery registered new models before probe"
+                    );
+                }
+            }
+        }
 
         // Phase 1: notify clients to refresh and show the full current model list first.
         if let Some(state) = state.as_ref() {
@@ -1947,12 +2726,12 @@ impl ModelService for LiveModelService {
         let limiter = Arc::new(Semaphore::new(max_parallel));
         let provider_limiter = Arc::new(ProbeProviderLimiter::new(max_parallel_per_provider));
         let rate_limiter = Arc::new(ProbeRateLimiter::default());
-        let mut tasks = futures::stream::FuturesUnordered::new();
+        let mut tasks = tokio::task::JoinSet::new();
         for (model_id, display_name, provider_name, provider) in checks {
             let limiter = Arc::clone(&limiter);
             let provider_limiter = Arc::clone(&provider_limiter);
             let rate_limiter = Arc::clone(&rate_limiter);
-            tasks.push(tokio::spawn(run_single_probe(
+            tasks.spawn(run_single_probe(
                 model_id,
                 display_name,
                 provider_name,
@@ -1960,7 +2739,7 @@ impl ModelService for LiveModelService {
                 limiter,
                 provider_limiter,
                 rate_limiter,
-            )));
+            ));
         }
 
         let mut results = Vec::with_capacity(total);
@@ -1974,7 +2753,20 @@ impl ModelService for LiveModelService {
         let mut unsupported_by_provider: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         let mut errors_by_provider: BTreeMap<String, Vec<Value>> = BTreeMap::new();
 
-        while let Some(joined) = tasks.next().await {
+        let mut cancelled = false;
+        loop {
+            let joined = tokio::select! {
+                biased;
+                () = cancel_token.cancelled() => {
+                    tasks.abort_all();
+                    cancelled = true;
+                    break;
+                }
+                next = tasks.join_next() => match next {
+                    Some(joined) => joined,
+                    None => break,
+                },
+            };
             checked += 1;
             let outcome = match joined {
                 Ok(outcome) => outcome,
@@ -2149,8 +2941,20 @@ impl ModelService for LiveModelService {
             }
         }
 
+        // Clear the cancellation token now that the loop has exited.
+        {
+            let mut guard = self.detect_cancel.write().await;
+            *guard = None;
+        }
+
+        let phase = if cancelled {
+            "cancelled"
+        } else {
+            "complete"
+        };
         let summary = serde_json::json!({
             "ok": true,
+            "cancelled": cancelled,
             "probeWord": "ping",
             "background": background,
             "reason": reason,
@@ -2176,7 +2980,7 @@ impl ModelService for LiveModelService {
                 state,
                 "models.updated",
                 serde_json::json!({
-                    "phase": "complete",
+                    "phase": phase,
                     "background": background,
                     "reason": reason,
                     "provider": provider_filter.as_deref(),
@@ -2188,6 +2992,17 @@ impl ModelService for LiveModelService {
         }
 
         Ok(summary)
+    }
+
+    async fn cancel_detect(&self) -> ServiceResult {
+        let token = self.detect_cancel.read().await.clone();
+        let cancelled = if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        };
+        Ok(serde_json::json!({ "ok": true, "cancelled": cancelled }))
     }
 
     async fn test(&self, params: Value) -> ServiceResult {
@@ -2222,30 +3037,8 @@ impl ModelService for LiveModelService {
         let started = Instant::now();
         info!(model_id, provider = provider.name(), "model probe started");
 
-        // Use streaming and return as soon as the first token arrives.
-        // Dropping the stream closes the HTTP connection, which tells the
-        // provider to stop generating — effectively max_tokens: 1.
-        let probe = vec![ChatMessage::user("ping")];
-        let mut stream = provider.stream(probe);
-
-        let result = tokio::time::timeout(Duration::from_secs(10), async {
-            while let Some(event) = stream.next().await {
-                match event {
-                    StreamEvent::Delta(_) | StreamEvent::Done(_) => return Ok(()),
-                    StreamEvent::Error(err) => return Err(err),
-                    // Skip other events (tool calls, etc.) and keep waiting.
-                    _ => continue,
-                }
-            }
-            Err("stream ended without producing any output".to_string())
-        })
-        .await;
-
-        // Drop the stream early to cancel the request on the provider side.
-        drop(stream);
-
-        match result {
-            Ok(Ok(())) => {
+        match provider.probe().await {
+            Ok(()) => {
                 info!(
                     model_id,
                     provider = provider.name(),
@@ -2257,12 +3050,13 @@ impl ModelService for LiveModelService {
                     "modelId": model_id,
                 }))
             },
-            Ok(Err(err)) => {
-                let error_obj = parse_chat_error(&err, Some(provider.name()));
+            Err(err) => {
+                let error_text = err.to_string();
+                let error_obj = parse_chat_error(&error_text, Some(provider.name()));
                 let detail = error_obj
                     .get("detail")
                     .and_then(|v| v.as_str())
-                    .unwrap_or(&err)
+                    .unwrap_or(&error_text)
                     .to_string();
 
                 warn!(
@@ -2273,15 +3067,6 @@ impl ModelService for LiveModelService {
                     "model probe failed"
                 );
                 Err(detail.into())
-            },
-            Err(_) => {
-                warn!(
-                    model_id,
-                    provider = provider.name(),
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "model probe timed out after 10s"
-                );
-                Err("Connection timed out after 10 seconds".into())
             },
         }
     }
@@ -2450,6 +3235,7 @@ pub struct LiveChatService {
     tool_registry: Arc<RwLock<ToolRegistry>>,
     session_store: Arc<SessionStore>,
     session_metadata: Arc<SqliteSessionMetadata>,
+    session_state_store: Option<Arc<SessionStateStore>>,
     hook_registry: Option<Arc<moltis_common::hooks::HookRegistry>>,
     /// Per-session semaphore ensuring only one agent run executes per session at a time.
     session_locks: Arc<RwLock<HashMap<String, Arc<Semaphore>>>>,
@@ -2491,6 +3277,7 @@ impl LiveChatService {
             tool_registry: Arc::new(RwLock::new(ToolRegistry::new())),
             session_store,
             session_metadata,
+            session_state_store: None,
             hook_registry: None,
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             message_queue: Arc::new(RwLock::new(HashMap::new())),
@@ -2510,6 +3297,11 @@ impl LiveChatService {
 
     pub fn with_tools(mut self, registry: Arc<RwLock<ToolRegistry>>) -> Self {
         self.tool_registry = registry;
+        self
+    }
+
+    pub fn with_session_state_store(mut self, store: Arc<SessionStateStore>) -> Self {
+        self.session_state_store = Some(store);
         self
     }
 
@@ -2707,6 +3499,33 @@ impl LiveChatService {
         "main".to_string()
     }
 
+    /// Resolve the effective session key for chat operations.
+    ///
+    /// Precedence is:
+    /// 1. Internal `_session_key` overrides used by runtime-owned callers.
+    /// 2. Public `sessionKey` / `session_key` request parameters.
+    /// 3. Connection-scoped active session derived from `_conn_id`.
+    /// 4. The default `"main"` session.
+    async fn resolve_session_key_from_params(&self, params: &Value) -> String {
+        if let Some(session_key) = params
+            .get("_session_key")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            return session_key.to_string();
+        }
+        if let Some(session_key) = params
+            .get("sessionKey")
+            .or_else(|| params.get("session_key"))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+        {
+            return session_key.to_string();
+        }
+        let conn_id = params.get("_conn_id").and_then(|v| v.as_str());
+        self.session_key_for(conn_id).await
+    }
+
     /// Resolve the project context prompt section for a session.
     async fn resolve_project_context(
         &self,
@@ -2773,7 +3592,11 @@ impl ChatService for LiveChatService {
         // Support both text-only and multimodal content.
         // - "text": string → plain text message
         // - "content": array → multimodal content (text + images)
-        let (text, message_content) = if let Some(content) = params.get("content") {
+        //
+        // Note: `text` and `message_content` are `mut` because a
+        // `MessageReceived` hook may return `ModifyPayload` to rewrite the
+        // inbound message before the turn begins (see GH #639).
+        let (mut text, mut message_content) = if let Some(content) = params.get("content") {
             // Multimodal content - extract text for logging/hooks, parse into typed blocks
             let text_part = content
                 .as_array()
@@ -2842,11 +3665,8 @@ impl ChatService for LiveChatService {
             "send() mode decision"
         );
 
-        // Resolve session key: explicit override (used by cron callbacks) or connection-scoped lookup.
-        let session_key = match params.get("_session_key").and_then(|v| v.as_str()) {
-            Some(sk) => sk.to_string(),
-            None => self.session_key_for(conn_id.as_deref()).await,
-        };
+        // Resolve session key from explicit overrides, public request params, or connection context.
+        let session_key = self.resolve_session_key_from_params(&params).await;
         let queued_replay = params
             .get("_queued_replay")
             .and_then(|v| v.as_bool())
@@ -2910,10 +3730,15 @@ impl ChatService for LiveChatService {
             let run_id_clone = run_id.clone();
             let channel_meta = params.get("channel").cloned();
             let user_audio = user_audio_path_from_params(&params, &session_key);
+            let user_documents =
+                user_documents_from_params(&params, &session_key, self.session_store.as_ref());
             let user_msg = PersistedMessage::User {
                 content: message_content,
                 created_at: Some(now_ms()),
                 audio: user_audio,
+                documents: user_documents
+                    .as_deref()
+                    .and_then(user_documents_for_persistence),
                 channel: channel_meta,
                 seq: client_seq,
                 run_id: Some(run_id.clone()),
@@ -2950,6 +3775,7 @@ impl ChatService for LiveChatService {
                         target.channel_type.as_str(),
                         &target.account_id,
                         &target.chat_id,
+                        target.thread_id.as_deref(),
                     )
                     .await
                     .map(|k| k == session_key)
@@ -3292,42 +4118,8 @@ impl ChatService for LiveChatService {
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
 
-        // Dispatch MessageReceived hook (read-only).
-        if let Some(ref hooks) = self.hook_registry {
-            let channel = params
-                .get("channel")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let payload = moltis_common::hooks::HookPayload::MessageReceived {
-                session_key: session_key.clone(),
-                content: text.clone(),
-                channel,
-            };
-            if let Err(e) = hooks.dispatch(&payload).await {
-                warn!(session = %session_key, error = %e, "MessageReceived hook failed");
-            }
-        }
-
         // Generate run_id early so we can link the user message to its agent run.
         let run_id = uuid::Uuid::new_v4().to_string();
-
-        // Convert session-crate content to agents-crate content for the LLM.
-        // Must happen before `message_content` is moved into `user_msg`.
-        let user_content = to_user_content(&message_content);
-
-        // Build the user message for later persistence (deferred until we
-        // know the message won't be queued — avoids double-persist when a
-        // queued message is replayed via send()).
-        let channel_meta = params.get("channel").cloned();
-        let user_audio = user_audio_path_from_params(&params, &session_key);
-        let user_msg = PersistedMessage::User {
-            content: message_content,
-            created_at: Some(now_ms()),
-            audio: user_audio,
-            channel: channel_meta,
-            seq: client_seq,
-            run_id: Some(run_id.clone()),
-        };
 
         // Load conversation history (the current user message is NOT yet
         // persisted — run_streaming / run_agent_loop add it themselves).
@@ -3363,6 +4155,7 @@ impl ChatService for LiveChatService {
                     target.channel_type.as_str(),
                     &target.account_id,
                     &target.chat_id,
+                    target.thread_id.as_deref(),
                 )
                 .await
                 .map(|k| k == session_key)
@@ -3402,21 +4195,148 @@ impl ChatService for LiveChatService {
                     }
                 });
 
-        // Discover enabled skills/plugins for prompt injection.
-        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
-        let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
-        let discovered_skills = match discoverer.discover().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("failed to discover skills: {e}");
-                Vec::new()
-            },
+        // Dispatch the `MessageReceived` hook before the turn starts. The
+        // hook can:
+        //   - return `Continue` → proceed normally;
+        //   - return `ModifyPayload({"content": "..."})` → rewrite the
+        //     inbound text before it is persisted or sent to the model;
+        //   - return `Block(reason)` → abort this turn entirely. The user
+        //     message is NOT persisted, no run is started, and the reason
+        //     is surfaced to the channel/web sender.
+        //
+        // Hook errors are treated as fail-open: a broken hook must not be
+        // able to wedge every inbound message. See GH #639.
+        if let Some(ref hooks) = self.hook_registry {
+            let session_entry = self.session_metadata.get(&session_key).await;
+            let channel = params
+                .get("channel")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let channel_binding = Some(resolve_channel_runtime_context(
+                &session_key,
+                session_entry.as_ref(),
+            ))
+            .filter(|binding| !binding.is_empty());
+            let payload = moltis_common::hooks::HookPayload::MessageReceived {
+                session_key: session_key.clone(),
+                content: text.clone(),
+                channel,
+                channel_binding,
+            };
+            match hooks.dispatch(&payload).await {
+                Ok(moltis_common::hooks::HookAction::Continue) => {},
+                Ok(moltis_common::hooks::HookAction::ModifyPayload(new_payload)) => {
+                    match new_payload.get("content").and_then(|v| v.as_str()) {
+                        Some(new_text) => {
+                            info!(
+                                session = %session_key,
+                                "MessageReceived hook rewrote inbound content"
+                            );
+                            text = new_text.to_string();
+                            apply_message_received_rewrite(
+                                &mut message_content,
+                                &mut params,
+                                new_text,
+                            );
+                        },
+                        None => {
+                            warn!(
+                                session = %session_key,
+                                "MessageReceived hook ModifyPayload ignored: expected object with `content` string"
+                            );
+                        },
+                    }
+                },
+                Ok(moltis_common::hooks::HookAction::Block(reason)) => {
+                    info!(
+                        session = %session_key,
+                        reason = %reason,
+                        "MessageReceived hook blocked inbound message"
+                    );
+
+                    // Surface the rejection to channel senders via the
+                    // existing channel-error delivery path. If the caller
+                    // attached a reply target (web-UI-on-bound-session or an
+                    // inbound channel message), re-register it so
+                    // `deliver_channel_error` has a destination to drain.
+                    if let Some(target) = deferred_channel_target.clone() {
+                        self.state.push_channel_reply(&session_key, target).await;
+                        let error_obj = serde_json::json!({
+                            "type": "message_rejected",
+                            "message": reason,
+                        });
+                        deliver_channel_error(&self.state, &session_key, &error_obj).await;
+                    }
+
+                    // Broadcast a rejection event so web UI clients see it.
+                    broadcast(
+                        &self.state,
+                        "chat",
+                        serde_json::json!({
+                            "state": "rejected",
+                            "sessionKey": session_key,
+                            "reason": reason,
+                        }),
+                        BroadcastOpts::default(),
+                    )
+                    .await;
+
+                    return Ok(serde_json::json!({
+                        "ok": false,
+                        "rejected": true,
+                        "reason": reason,
+                    }));
+                },
+                Err(e) => {
+                    warn!(
+                        session = %session_key,
+                        error = %e,
+                        "MessageReceived hook failed; proceeding fail-open"
+                    );
+                },
+            }
+        }
+
+        // Convert session-crate content to agents-crate content for the LLM.
+        // Must happen before `message_content` is moved into `user_msg`, and
+        // must happen AFTER the MessageReceived hook dispatch so a
+        // `ModifyPayload` rewrite is reflected in both `user_content` (what
+        // the LLM sees) and `user_msg` (what gets persisted).
+        let user_documents =
+            user_documents_from_params(&params, &session_key, self.session_store.as_ref())
+                .unwrap_or_default();
+        let user_content = to_user_content(&message_content, &user_documents);
+
+        // Build the user message for later persistence (deferred until we
+        // know the message won't be queued — avoids double-persist when a
+        // queued message is replayed via send()).
+        let channel_meta = params.get("channel").cloned();
+        let user_audio = user_audio_path_from_params(&params, &session_key);
+        let user_msg = PersistedMessage::User {
+            content: message_content,
+            created_at: Some(now_ms()),
+            audio: user_audio,
+            documents: user_documents_for_persistence(&user_documents),
+            channel: channel_meta,
+            seq: client_seq,
+            run_id: Some(run_id.clone()),
         };
+
+        // Discover enabled skills/plugins for prompt injection (gated on
+        // `[skills] enabled` — see #655).
+        let discovered_skills =
+            discover_skills_if_enabled(&moltis_config::discover_and_load()).await;
 
         // Check if MCP tools are disabled for this session and capture
         // per-session sandbox override details for prompt runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
         let session_agent_id = resolve_prompt_agent_id(session_entry.as_ref());
+        let persona = load_prompt_persona_for_session(
+            &session_key,
+            session_entry.as_ref(),
+            self.session_state_store.as_deref(),
+        )
+        .await;
         let mcp_disabled = session_entry
             .as_ref()
             .and_then(|entry| entry.mcp_disabled)
@@ -3478,14 +4398,23 @@ impl ChatService for LiveChatService {
             .get("_accept_language")
             .and_then(|v| v.as_str())
             .map(String::from);
-        // Auto-compact when the next request is likely to exceed 95% of the
-        // model context window.
+        // Auto-compact when the next request is likely to exceed
+        // `chat.compaction.threshold_percent` of the model context window.
+        // The value is clamped to the 0.1–0.95 range in case config
+        // validation missed a typo; the default (0.95) is loaded via
+        // load_prompt_persona_for_agent for the session's agent and
+        // matches the pre-PR-#653 hardcoded trigger.
+        let compaction_cfg = &load_prompt_persona_for_agent(&session_agent_id)
+            .config
+            .chat
+            .compaction;
         let context_window = provider.context_window() as u64;
         let token_usage = session_token_usage_from_messages(&history);
         let estimated_next_input = token_usage
             .current_request_input_tokens
             .saturating_add(estimate_text_tokens(&text));
-        let compact_threshold = (context_window * 95) / 100;
+        let compact_threshold =
+            compute_auto_compact_threshold(context_window, compaction_cfg.threshold_percent);
 
         if estimated_next_input >= compact_threshold {
             let pre_compact_msg_count = history.len();
@@ -3497,7 +4426,9 @@ impl ChatService for LiveChatService {
                 session = %session_key,
                 estimated_next_input,
                 context_window,
-                "auto-compact triggered (estimated next request over 95% threshold)"
+                threshold_percent = compaction_cfg.threshold_percent,
+                compact_threshold,
+                "auto-compact triggered (estimated next request over chat.compaction.threshold_percent)"
             );
             broadcast(
                 &self.state,
@@ -3528,6 +4459,18 @@ impl ChatService for LiveChatService {
                         .read(&session_key)
                         .await
                         .unwrap_or_default();
+                    // This `auto_compact done` event is a lifecycle
+                    // signal for subscribers that pre-emptive
+                    // auto-compact finished. The mode/token metadata
+                    // lives on the `chat.compact done` event that
+                    // `self.compact()` broadcasts from the inside —
+                    // the `compactBroadcastPath: "inner"` marker below
+                    // lets hook / webhook consumers detect that and
+                    // subscribe to that event instead. The parallel
+                    // `run_with_tools` context-overflow path emits a
+                    // self-contained `auto_compact done` (with
+                    // `compactBroadcastPath: "wrapper"`) that carries
+                    // the metadata directly.
                     broadcast(
                         &self.state,
                         "chat",
@@ -3538,6 +4481,7 @@ impl ChatService for LiveChatService {
                             "messageCount": pre_compact_msg_count,
                             "totalTokens": pre_compact_total,
                             "contextWindow": context_window,
+                            "compactBroadcastPath": "inner",
                         }),
                         BroadcastOpts::default(),
                     )
@@ -3666,6 +4610,7 @@ impl ChatService for LiveChatService {
             let agent_fut = async {
                 if stream_only {
                     run_streaming(
+                        persona,
                         &state,
                         &model_store,
                         &run_id_clone,
@@ -3689,6 +4634,7 @@ impl ChatService for LiveChatService {
                     .await
                 } else {
                     run_with_tools(
+                        persona,
                         &state,
                         &model_store,
                         &run_id_clone,
@@ -3899,6 +4845,18 @@ impl ChatService for LiveChatService {
             .ok_or_else(|| "missing 'text' parameter".to_string())?
             .to_string();
         let desired_reply_medium = infer_reply_medium(&params, &text);
+        let requested_agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let request_tool_policy = params
+            .get("_tool_policy")
+            .cloned()
+            .map(serde_json::from_value::<ToolPolicy>)
+            .transpose()
+            .map_err(|e| format!("invalid '_tool_policy' parameter: {e}"))?;
 
         let explicit_model = params.get("model").and_then(|v| v.as_str());
         let stream_only = !self.has_tools_sync();
@@ -3925,11 +4883,16 @@ impl ChatService for LiveChatService {
         };
 
         let user_audio = user_audio_path_from_params(&params, &session_key);
+        let user_documents =
+            user_documents_from_params(&params, &session_key, self.session_store.as_ref());
         // Persist the user message.
         let user_msg = PersistedMessage::User {
             content: MessageContent::Text(text.clone()),
             created_at: Some(now_ms()),
             audio: user_audio,
+            documents: user_documents
+                .as_deref()
+                .and_then(user_documents_for_persistence),
             channel: None,
             seq: None,
             run_id: None,
@@ -3944,10 +4907,29 @@ impl ChatService for LiveChatService {
 
         // Ensure this session appears in the sessions list.
         let _ = self.session_metadata.upsert(&session_key, None).await;
+        if let Some(agent_id) = requested_agent_id.as_deref()
+            && let Err(error) = self
+                .session_metadata
+                .set_agent_id(&session_key, Some(agent_id))
+                .await
+        {
+            warn!(
+                session = %session_key,
+                agent_id,
+                error = %error,
+                "send_sync: failed to assign requested agent to session"
+            );
+        }
         self.session_metadata.touch(&session_key, 1).await;
 
         let session_entry = self.session_metadata.get(&session_key).await;
         let session_agent_id = resolve_prompt_agent_id(session_entry.as_ref());
+        let persona = load_prompt_persona_for_session(
+            &session_key,
+            session_entry.as_ref(),
+            self.session_state_store.as_deref(),
+        )
+        .await;
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -3969,7 +4951,14 @@ impl ChatService for LiveChatService {
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let state = Arc::clone(&self.state);
-        let tool_registry = Arc::clone(&self.tool_registry);
+        let tool_registry = if let Some(policy) = request_tool_policy.as_ref() {
+            let registry_guard = self.tool_registry.read().await;
+            Arc::new(RwLock::new(
+                registry_guard.clone_allowed_by(|name| policy.is_allowed(name)),
+            ))
+        } else {
+            Arc::clone(&self.tool_registry)
+        };
         let hook_registry = self.hook_registry.clone();
         let provider_name = provider.name().to_string();
         let model_id = provider.id().to_string();
@@ -4006,6 +4995,7 @@ impl ChatService for LiveChatService {
         let terminal_runs = Arc::new(RwLock::new(HashSet::new()));
         let result = if stream_only {
             run_streaming(
+                persona,
                 &state,
                 &model_store,
                 &run_id,
@@ -4029,6 +5019,7 @@ impl ChatService for LiveChatService {
             .await
         } else {
             run_with_tools(
+                persona,
                 &state,
                 &model_store,
                 &run_id,
@@ -4209,11 +5200,7 @@ impl ChatService for LiveChatService {
     }
 
     async fn history(&self, params: Value) -> ServiceResult {
-        let conn_id = params
-            .get("_conn_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let session_key = self.session_key_for(conn_id.as_deref()).await;
+        let session_key = self.resolve_session_key_from_params(&params).await;
         let messages = self
             .session_store
             .read(&session_key)
@@ -4233,15 +5220,7 @@ impl ChatService for LiveChatService {
     }
 
     async fn clear(&self, params: Value) -> ServiceResult {
-        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
-            sk.to_string()
-        } else {
-            let conn_id = params
-                .get("_conn_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            self.session_key_for(conn_id.as_deref()).await
-        };
+        let session_key = self.resolve_session_key_from_params(&params).await;
 
         self.session_store
             .clear(&session_key)
@@ -4277,15 +5256,7 @@ impl ChatService for LiveChatService {
     }
 
     async fn compact(&self, params: Value) -> ServiceResult {
-        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
-            sk.to_string()
-        } else {
-            let conn_id = params
-                .get("_conn_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            self.session_key_for(conn_id.as_deref()).await
-        };
+        let session_key = self.resolve_session_key_from_params(&params).await;
         let session_entry = self.session_metadata.get(&session_key).await;
         let session_agent_id = resolve_prompt_agent_id(session_entry.as_ref());
 
@@ -4316,101 +5287,144 @@ impl ChatService for LiveChatService {
         if let Some(mm) = self.state.memory_manager()
             && let Ok(provider) = self.resolve_provider(&session_key, &history).await
         {
-            let chat_history_for_memory = values_to_chat_messages(&history);
-            let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::new(
-                AgentScopedMemoryWriter::new(Arc::clone(mm), session_agent_id.clone()),
-            );
-            match moltis_agents::silent_turn::run_silent_memory_turn(
-                provider,
-                &chat_history_for_memory,
-                writer,
-            )
-            .await
-            {
-                Ok(paths) => {
-                    if !paths.is_empty() {
-                        info!(
-                            files = paths.len(),
-                            "compact: silent memory turn wrote files"
-                        );
-                    }
-                },
-                Err(e) => warn!(error = %e, "compact: silent memory turn failed"),
+            let write_mode = moltis_config::discover_and_load().memory.agent_write_mode;
+            if !memory_write_mode_allows_save(write_mode) {
+                debug!(
+                    "compact: agent-authored memory writes disabled, skipping silent memory turn"
+                );
+            } else {
+                let chat_history_for_memory = values_to_chat_messages(&history);
+                let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> =
+                    Arc::new(AgentScopedMemoryWriter::new(
+                        Arc::clone(mm),
+                        session_agent_id.clone(),
+                        write_mode,
+                    ));
+                match moltis_agents::silent_turn::run_silent_memory_turn(
+                    provider,
+                    &chat_history_for_memory,
+                    writer,
+                )
+                .await
+                {
+                    Ok(paths) => {
+                        if !paths.is_empty() {
+                            info!(
+                                files = paths.len(),
+                                "compact: silent memory turn wrote files"
+                            );
+                        }
+                    },
+                    Err(e) => warn!(error = %e, "compact: silent memory turn failed"),
+                }
             }
         }
 
-        // Build a summary prompt from the conversation using structured messages.
-        // We pass the typed ChatMessage objects directly so role boundaries are
-        // maintained via the API's message structure, preventing prompt injection
-        // where user content could mimic role prefixes in concatenated text.
-        let mut summary_messages = vec![ChatMessage::system(
-            "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
-        )];
-        summary_messages.extend(values_to_chat_messages(&history));
-        summary_messages.push(ChatMessage::user(
-            "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-        ));
+        // Resolve the session persona so we can pick up the compaction config
+        // and provide a provider to LLM-backed compaction modes. Agent-scoped
+        // config falls back through `load_prompt_persona_for_agent`'s default
+        // path, so this is safe even when the session has no custom preset.
+        let persona = load_prompt_persona_for_agent(&session_agent_id);
+        let compaction_config = &persona.config.chat.compaction;
 
-        // Use the session's model if available, otherwise fall back to the model
-        // from the last assistant message, then to the first registered provider.
-        let provider = self
-            .resolve_provider(&session_key, &history)
-            .await
-            .map_err(ServiceError::message)?;
+        // LLM-backed modes need a resolved provider. Deterministic mode
+        // ignores it, so resolution failures are only fatal for the other
+        // modes — and `run_compaction` returns a clear ProviderRequired
+        // error in that case.
+        let provider_arc = self.resolve_provider(&session_key, &history).await.ok();
 
-        info!(session = %session_key, messages = history.len(), "chat.compact: summarizing");
+        let outcome =
+            compaction_run::run_compaction(&history, compaction_config, provider_arc.as_deref())
+                .await
+                .map_err(|e| ServiceError::message(e.to_string()))?;
 
-        let mut stream = provider.stream(summary_messages);
-        let mut summary = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                StreamEvent::Delta(delta) => summary.push_str(&delta),
-                StreamEvent::Done(_) => break,
-                StreamEvent::Error(e) => {
-                    return Err(format!("compact summarization failed: {e}").into());
-                },
-                // Tool events not expected in summarization stream.
-                StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. }
-                // Provider raw payloads are debug metadata, not summary text.
-                | StreamEvent::ProviderRaw(_)
-                // Ignore provider reasoning blocks; summary body should only
-                // include final answer text.
-                | StreamEvent::ReasoningDelta(_) => {},
-            }
-        }
+        let compacted = outcome.history.clone();
 
-        if summary.is_empty() {
-            return Err("compact produced empty summary".into());
-        }
+        // Keep a plain-text copy of the summary so the memory-file snapshot
+        // below can still record what we compacted to. The helper walks the
+        // compacted history because recency_preserving / structured modes
+        // splice head and tail messages around the summary — it isn't
+        // necessarily compacted[0].
+        let summary_for_memory = compaction_run::extract_summary_body(&compacted);
 
-        // Replace history with a single assistant message containing the summary.
-        let compacted_msg = PersistedMessage::Assistant {
-            content: format!("[Conversation Summary]\n\n{summary}"),
-            created_at: Some(now_ms()),
-            model: None,
-            provider: None,
-            input_tokens: None,
-            output_tokens: None,
-            duration_ms: None,
-            request_input_tokens: None,
-            request_output_tokens: None,
-            tool_calls: None,
-            reasoning: None,
-            llm_api_response: None,
-            audio: None,
-            seq: None,
-            run_id: None,
-        };
-        let compacted = vec![compacted_msg.to_value()];
+        info!(
+            session = %session_key,
+            requested_mode = ?compaction_config.mode,
+            effective_mode = ?outcome.effective_mode,
+            input_tokens = outcome.input_tokens,
+            output_tokens = outcome.output_tokens,
+            messages = history.len(),
+            "chat.compact: strategy dispatched"
+        );
 
+        // Enforce summary budget discipline: max 1,200 chars, 24 lines,
+        // 160 chars/line.  Mutate the compacted history in place so the
+        // compressed text is what gets persisted and broadcast.
+        let compacted = compress_summary_in_history(compacted);
+
+        // Replace the session history BEFORE broadcasting or notifying
+        // channels. If we did it the other way around, a concurrent
+        // `send()` RPC that landed between the broadcast and the store
+        // update would see the stale history and the client UI would
+        // already believe compaction had finished — a narrow but real
+        // race window flagged by Greptile on commit 0714de07.
         self.session_store
             .replace_history(&session_key, compacted.clone())
             .await
             .map_err(ServiceError::message)?;
 
         self.session_metadata.touch(&session_key, 1).await;
+
+        // Broadcast a chat.compact-scoped "done" event so UI consumers see
+        // the effective mode and token usage even when compaction is
+        // triggered manually via the RPC (the auto-compact path broadcasts
+        // separately around `send()`). The settings hint is included only
+        // when the user hasn't opted out via chat.compaction.show_settings_hint.
+        //
+        // Include `totalTokens` / `contextWindow` on this payload so the
+        // web UI's compact card can render a full "Before compact"
+        // section even when this event fires first in `send()`'s
+        // pre-emptive auto-compact path. Without these fields the card
+        // was rendering without the "Total tokens" and "Context usage"
+        // rows on that path.
+        let show_hint = compaction_config.show_settings_hint;
+        let pre_compact_total_tokens: u32 = history
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .map(|text| u32::try_from(estimate_text_tokens(text)).unwrap_or(u32::MAX))
+            .sum();
+        let context_window = provider_arc.as_deref().map(|p| p.context_window());
+        let mut compact_payload = serde_json::json!({
+            "sessionKey": session_key,
+            "state": "compact",
+            "phase": "done",
+            "messageCount": history.len(),
+            "totalTokens": pre_compact_total_tokens,
+        });
+        if let Some(window) = context_window
+            && let Some(obj) = compact_payload.as_object_mut()
+        {
+            obj.insert("contextWindow".to_string(), serde_json::json!(window));
+        }
+        if let (Some(obj), Some(meta)) = (
+            compact_payload.as_object_mut(),
+            outcome.broadcast_metadata(show_hint).as_object().cloned(),
+        ) {
+            obj.extend(meta);
+        }
+        broadcast(
+            &self.state,
+            "chat",
+            compact_payload,
+            BroadcastOpts::default(),
+        )
+        .await;
+
+        // Notify any channel (Telegram, Discord, Matrix, WhatsApp, etc.)
+        // that has pending reply targets on this session, so channel
+        // users see "Conversation compacted (mode, tokens, hint)"
+        // alongside the web UI's compact card.
+        notify_channels_of_compaction(&self.state, &session_key, &outcome, show_hint).await;
 
         // Save compaction summary to memory file and trigger sync.
         if let Some(mm) = self.state.memory_manager() {
@@ -4425,7 +5439,7 @@ impl ChatService for LiveChatService {
                 let filename = format!("compaction-{}-{ts}.md", session_key);
                 let path = memory_dir.join(&filename);
                 let content = format!(
-                    "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{summary}"
+                    "# Compaction Summary\n\n- **Session**: {session_key}\n- **Timestamp**: {ts}\n\n{summary_for_memory}"
                 );
                 if let Err(e) = tokio::fs::write(&path, &content).await {
                     warn!(error = %e, "compact: failed to write memory file");
@@ -4444,7 +5458,7 @@ impl ChatService for LiveChatService {
         if let Some(ref hooks) = self.hook_registry {
             let payload = moltis_common::hooks::HookPayload::AfterCompaction {
                 session_key: session_key.clone(),
-                summary_len: summary.len(),
+                summary_len: summary_for_memory.len(),
             };
             if let Err(e) = hooks.dispatch(&payload).await {
                 warn!(session = %session_key, error = %e, "AfterCompaction hook failed");
@@ -4456,19 +5470,17 @@ impl ChatService for LiveChatService {
     }
 
     async fn context(&self, params: Value) -> ServiceResult {
-        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
-            sk.to_string()
-        } else {
-            let conn_id = params
-                .get("_conn_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            self.session_key_for(conn_id.as_deref()).await
-        };
+        let session_key = self.resolve_session_key_from_params(&params).await;
 
         // Session info
         let message_count = self.session_store.count(&session_key).await.unwrap_or(0);
         let session_entry = self.session_metadata.get(&session_key).await;
+        let prompt_persona = load_prompt_persona_for_session(
+            &session_key,
+            session_entry.as_ref(),
+            self.session_state_store.as_deref(),
+        )
+        .await;
         let (provider_name, supports_tools) = {
             let reg = self.providers.read().await;
             let session_model = session_entry.as_ref().and_then(|e| e.model.as_deref());
@@ -4555,8 +5567,12 @@ impl ChatService for LiveChatService {
         let config = moltis_config::discover_and_load();
         let tools: Vec<Value> = if supports_tools {
             let registry_guard = self.tool_registry.read().await;
+            let list_ctx = PolicyContext {
+                agent_id: "main".into(),
+                ..Default::default()
+            };
             let effective_registry =
-                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled);
+                apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled, &list_ctx);
             effective_registry
                 .list_schemas()
                 .iter()
@@ -4653,23 +5669,20 @@ impl ChatService for LiveChatService {
             "promptSymbol": exec_prompt_symbol,
         });
 
-        // Discover enabled skills/plugins (only if provider supports tools)
+        // Discover enabled skills/plugins (only if provider supports tools and
+        // `[skills] enabled` is true — see #655).
         let skills_list: Vec<Value> = if supports_tools {
-            let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
-            let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
-            match discoverer.discover().await {
-                Ok(s) => s
-                    .iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "name": s.name,
-                            "description": s.description,
-                            "source": s.source,
-                        })
+            discover_skills_if_enabled(&config)
+                .await
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name,
+                        "description": s.description,
+                        "source": s.source,
                     })
-                    .collect(),
-                Err(_) => vec![],
-            }
+                })
+                .collect()
         } else {
             vec![]
         };
@@ -4694,6 +5707,7 @@ impl ChatService for LiveChatService {
             "mcpDisabled": mcp_disabled,
             "sandbox": sandbox_info,
             "execution": execution_info,
+            "promptMemory": prompt_persona.memory_status,
             "supportsTools": supports_tools,
             "tokenUsage": {
                 "inputTokens": usage.session_input_tokens,
@@ -4709,15 +5723,7 @@ impl ChatService for LiveChatService {
     }
 
     async fn raw_prompt(&self, params: Value) -> ServiceResult {
-        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
-            sk.to_string()
-        } else {
-            let conn_id = params
-                .get("_conn_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            self.session_key_for(conn_id.as_deref()).await
-        };
+        let session_key = self.resolve_session_key_from_params(&params).await;
 
         let conn_id = params
             .get("_conn_id")
@@ -4740,7 +5746,12 @@ impl ChatService for LiveChatService {
 
         // Build runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
-        let persona = load_prompt_persona_for_session(session_entry.as_ref());
+        let persona = load_prompt_persona_for_session(
+            &session_key,
+            session_entry.as_ref(),
+            self.session_state_store.as_deref(),
+        )
+        .await;
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -4755,16 +5766,8 @@ impl ChatService for LiveChatService {
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
 
-        // Discover skills.
-        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
-        let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
-        let discovered_skills = match discoverer.discover().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("failed to discover skills: {e}");
-                Vec::new()
-            },
-        };
+        // Discover skills (gated on `[skills] enabled` — see #655).
+        let discovered_skills = discover_skills_if_enabled(&persona.config).await;
 
         // Check MCP disabled.
         let mcp_disabled = session_entry
@@ -4773,6 +5776,7 @@ impl ChatService for LiveChatService {
             .unwrap_or(false);
 
         // Build filtered tool registry.
+        let policy_ctx = build_policy_context("main", Some(&runtime_context), Some(&params));
         let filtered_registry = {
             let registry_guard = self.tool_registry.read().await;
             if tools_enabled {
@@ -4781,6 +5785,7 @@ impl ChatService for LiveChatService {
                     &persona.config,
                     &discovered_skills,
                     mcp_disabled,
+                    &policy_ctx,
                 )
             } else {
                 registry_guard.clone_without(&[])
@@ -4790,8 +5795,9 @@ impl ChatService for LiveChatService {
         let tool_count = filtered_registry.list_schemas().len();
 
         // Build the system prompt.
-        let system_prompt = if tools_enabled {
-            build_system_prompt_with_session_runtime(
+        let prompt_limits = prompt_build_limits_from_config(&persona.config);
+        let prompt_build = if tools_enabled {
+            build_system_prompt_with_session_runtime_details(
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
@@ -4799,29 +5805,39 @@ impl ChatService for LiveChatService {
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
+                persona.boot_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                prompt_limits,
             )
         } else {
-            build_system_prompt_minimal_runtime(
+            build_system_prompt_minimal_runtime_details(
                 project_context.as_deref(),
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
+                persona.boot_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                prompt_limits,
             )
         };
 
+        let truncated = prompt_build.metadata.truncated();
+        let workspace_files = prompt_build.metadata.workspace_files.clone();
+        let system_prompt = prompt_build.prompt;
         let char_count = system_prompt.len();
 
         Ok(serde_json::json!({
             "prompt": system_prompt,
             "charCount": char_count,
+            "truncated": truncated,
+            "workspaceFiles": workspace_files,
+            "promptMemory": persona.memory_status,
             "native_tools": native_tools,
             "tools_enabled": tools_enabled,
             "tool_mode": format!("{:?}", tool_mode),
@@ -4832,15 +5848,7 @@ impl ChatService for LiveChatService {
     /// Return the **full messages array** that would be sent to the LLM on the
     /// next call — system prompt + conversation history — in OpenAI format.
     async fn full_context(&self, params: Value) -> ServiceResult {
-        let session_key = if let Some(sk) = params.get("_session_key").and_then(|v| v.as_str()) {
-            sk.to_string()
-        } else {
-            let conn_id = params
-                .get("_conn_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            self.session_key_for(conn_id.as_deref()).await
-        };
+        let session_key = self.resolve_session_key_from_params(&params).await;
 
         let conn_id = params
             .get("_conn_id")
@@ -4863,7 +5871,12 @@ impl ChatService for LiveChatService {
 
         // Build runtime context.
         let session_entry = self.session_metadata.get(&session_key).await;
-        let persona = load_prompt_persona_for_session(session_entry.as_ref());
+        let persona = load_prompt_persona_for_session(
+            &session_key,
+            session_entry.as_ref(),
+            self.session_state_store.as_deref(),
+        )
+        .await;
         let mut runtime_context = build_prompt_runtime_context(
             &self.state,
             &provider,
@@ -4878,16 +5891,8 @@ impl ChatService for LiveChatService {
             .resolve_project_context(&session_key, conn_id.as_deref())
             .await;
 
-        // Discover skills.
-        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
-        let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
-        let discovered_skills = match discoverer.discover().await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("failed to discover skills: {e}");
-                Vec::new()
-            },
-        };
+        // Discover skills (gated on `[skills] enabled` — see #655).
+        let discovered_skills = discover_skills_if_enabled(&persona.config).await;
 
         // Check MCP disabled.
         let mcp_disabled = session_entry
@@ -4896,6 +5901,7 @@ impl ChatService for LiveChatService {
             .unwrap_or(false);
 
         // Build filtered tool registry.
+        let policy_ctx = build_policy_context("main", Some(&runtime_context), Some(&params));
         let filtered_registry = {
             let registry_guard = self.tool_registry.read().await;
             if tools_enabled {
@@ -4904,6 +5910,7 @@ impl ChatService for LiveChatService {
                     &persona.config,
                     &discovered_skills,
                     mcp_disabled,
+                    &policy_ctx,
                 )
             } else {
                 registry_guard.clone_without(&[])
@@ -4911,8 +5918,9 @@ impl ChatService for LiveChatService {
         };
 
         // Build the system prompt.
-        let system_prompt = if tools_enabled {
-            build_system_prompt_with_session_runtime(
+        let prompt_limits = prompt_build_limits_from_config(&persona.config);
+        let prompt_build = if tools_enabled {
+            build_system_prompt_with_session_runtime_details(
                 &filtered_registry,
                 native_tools,
                 project_context.as_deref(),
@@ -4920,24 +5928,31 @@ impl ChatService for LiveChatService {
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
+                persona.boot_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                prompt_limits,
             )
         } else {
-            build_system_prompt_minimal_runtime(
+            build_system_prompt_minimal_runtime_details(
                 project_context.as_deref(),
                 Some(&persona.identity),
                 Some(&persona.user),
                 persona.soul_text.as_deref(),
+                persona.boot_text.as_deref(),
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
                 persona.memory_text.as_deref(),
+                prompt_limits,
             )
         };
 
+        let truncated = prompt_build.metadata.truncated();
+        let workspace_files = prompt_build.metadata.workspace_files.clone();
+        let system_prompt = prompt_build.prompt;
         let system_prompt_chars = system_prompt.len();
 
         // Keep raw assistant outputs (including provider/model/token metadata)
@@ -4967,6 +5982,35 @@ impl ChatService for LiveChatService {
             "messageCount": message_count,
             "systemPromptChars": system_prompt_chars,
             "totalChars": total_chars,
+            "truncated": truncated,
+            "workspaceFiles": workspace_files,
+            "promptMemory": persona.memory_status,
+        }))
+    }
+
+    async fn refresh_prompt_memory(&self, params: Value) -> ServiceResult {
+        let session_key = self.resolve_session_key_from_params(&params).await;
+        let session_entry = self.session_metadata.get(&session_key).await;
+        let agent_id = resolve_prompt_agent_id(session_entry.as_ref());
+        let snapshot_cleared = clear_prompt_memory_snapshot(
+            &session_key,
+            &agent_id,
+            self.session_state_store.as_deref(),
+        )
+        .await;
+        let persona = load_prompt_persona_for_session(
+            &session_key,
+            session_entry.as_ref(),
+            self.session_state_store.as_deref(),
+        )
+        .await;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "sessionKey": session_key,
+            "agentId": agent_id,
+            "snapshotCleared": snapshot_cleared,
+            "promptMemory": persona.memory_status,
         }))
     }
 
@@ -5159,6 +6203,7 @@ struct ChannelReplyTargetKey {
     account_id: String,
     chat_id: String,
     message_id: Option<String>,
+    thread_id: Option<String>,
 }
 
 impl From<&moltis_channels::ChannelReplyTarget> for ChannelReplyTargetKey {
@@ -5168,6 +6213,7 @@ impl From<&moltis_channels::ChannelReplyTarget> for ChannelReplyTargetKey {
             account_id: target.account_id.clone(),
             chat_id: target.chat_id.clone(),
             message_id: target.message_id.clone(),
+            thread_id: target.thread_id.clone(),
         }
     }
 }
@@ -5236,16 +6282,17 @@ impl ChannelStreamDispatcher {
             let outbound = Arc::clone(&self.outbound);
             let completed = Arc::clone(&self.completed);
             let account_id = target.account_id.clone();
-            let chat_id = target.chat_id.clone();
+            let to = target.outbound_to().into_owned();
             let reply_to = target.message_id.clone();
             let key_for_insert = key.clone();
             let account_for_log = account_id.clone();
-            let chat_for_log = chat_id.clone();
+            let chat_for_log = target.chat_id.clone();
+            let thread_for_log = target.thread_id.clone();
 
             self.workers.push(ChannelStreamWorker { sender: tx });
             self.tasks.push(tokio::spawn(async move {
                 match outbound
-                    .send_stream(&account_id, &chat_id, reply_to.as_deref(), rx)
+                    .send_stream(&account_id, &to, reply_to.as_deref(), rx)
                     .await
                 {
                     Ok(()) => {
@@ -5255,6 +6302,7 @@ impl ChannelStreamDispatcher {
                         warn!(
                             account_id = account_for_log,
                             chat_id = chat_for_log,
+                            thread_id = thread_for_log.as_deref().unwrap_or("-"),
                             "channel stream outbound failed: {e}"
                         );
                     },
@@ -5589,13 +6637,26 @@ fn is_path_in_agent_memory_scope(path: &Path, agent_id: &str) -> bool {
 }
 
 struct AgentScopedMemoryWriter {
-    manager: Arc<moltis_memory::manager::MemoryManager>,
+    manager: moltis_memory::runtime::DynMemoryRuntime,
     agent_id: String,
+    write_mode: AgentMemoryWriteMode,
+    checkpoints: moltis_tools::checkpoints::CheckpointManager,
 }
 
 impl AgentScopedMemoryWriter {
-    fn new(manager: Arc<moltis_memory::manager::MemoryManager>, agent_id: String) -> Self {
-        Self { manager, agent_id }
+    fn new(
+        manager: moltis_memory::runtime::DynMemoryRuntime,
+        agent_id: String,
+        write_mode: AgentMemoryWriteMode,
+    ) -> Self {
+        Self {
+            manager,
+            agent_id,
+            write_mode,
+            checkpoints: moltis_tools::checkpoints::CheckpointManager::new(
+                moltis_config::data_dir(),
+            ),
+        }
     }
 }
 
@@ -5615,11 +6676,16 @@ impl moltis_agents::memory_writer::MemoryWriter for AgentScopedMemoryWriter {
             );
         }
 
+        validate_agent_memory_target_for_mode(self.write_mode, file)?;
         let path = resolve_agent_memory_target_path(&self.agent_id, file)?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let checkpoint = self
+            .checkpoints
+            .checkpoint_path(&path, "memory_write")
+            .await?;
         let final_content = if append && tokio::fs::try_exists(&path).await? {
             let existing = tokio::fs::read_to_string(&path).await?;
             format!("{existing}\n\n{content}")
@@ -5636,17 +6702,18 @@ impl moltis_agents::memory_writer::MemoryWriter for AgentScopedMemoryWriter {
         Ok(moltis_agents::memory_writer::MemoryWriteResult {
             location: path.to_string_lossy().into_owned(),
             bytes_written,
+            checkpoint_id: Some(checkpoint.id),
         })
     }
 }
 
 struct AgentScopedMemorySearchTool {
-    manager: Arc<moltis_memory::manager::MemoryManager>,
+    manager: moltis_memory::runtime::DynMemoryRuntime,
     agent_id: String,
 }
 
 impl AgentScopedMemorySearchTool {
-    fn new(manager: Arc<moltis_memory::manager::MemoryManager>, agent_id: String) -> Self {
+    fn new(manager: moltis_memory::runtime::DynMemoryRuntime, agent_id: String) -> Self {
         Self { manager, agent_id }
     }
 }
@@ -5733,12 +6800,12 @@ impl AgentTool for AgentScopedMemorySearchTool {
 }
 
 struct AgentScopedMemoryGetTool {
-    manager: Arc<moltis_memory::manager::MemoryManager>,
+    manager: moltis_memory::runtime::DynMemoryRuntime,
     agent_id: String,
 }
 
 impl AgentScopedMemoryGetTool {
-    fn new(manager: Arc<moltis_memory::manager::MemoryManager>, agent_id: String) -> Self {
+    fn new(manager: moltis_memory::runtime::DynMemoryRuntime, agent_id: String) -> Self {
         Self { manager, agent_id }
     }
 }
@@ -5795,12 +6862,18 @@ impl AgentTool for AgentScopedMemoryGetTool {
 
 struct AgentScopedMemorySaveTool {
     writer: AgentScopedMemoryWriter,
+    write_mode: AgentMemoryWriteMode,
 }
 
 impl AgentScopedMemorySaveTool {
-    fn new(manager: Arc<moltis_memory::manager::MemoryManager>, agent_id: String) -> Self {
+    fn new(
+        manager: moltis_memory::runtime::DynMemoryRuntime,
+        agent_id: String,
+        write_mode: AgentMemoryWriteMode,
+    ) -> Self {
         Self {
-            writer: AgentScopedMemoryWriter::new(manager, agent_id),
+            writer: AgentScopedMemoryWriter::new(manager, agent_id, write_mode),
+            write_mode,
         }
     }
 }
@@ -5846,7 +6919,7 @@ impl AgentTool for AgentScopedMemorySaveTool {
         let file = params
             .get("file")
             .and_then(Value::as_str)
-            .unwrap_or("MEMORY.md");
+            .unwrap_or_else(|| default_agent_memory_file_for_mode(self.write_mode));
         let append = params
             .get("append")
             .and_then(Value::as_bool)
@@ -5859,18 +6932,25 @@ impl AgentTool for AgentScopedMemorySaveTool {
             "saved": true,
             "path": file,
             "bytes_written": result.bytes_written,
+            "checkpointId": result.checkpoint_id,
         }))
     }
 }
 
 fn install_agent_scoped_memory_tools(
     registry: &mut ToolRegistry,
-    manager: &Arc<moltis_memory::manager::MemoryManager>,
+    manager: &moltis_memory::runtime::DynMemoryRuntime,
     agent_id: &str,
+    style: MemoryStyle,
+    write_mode: AgentMemoryWriteMode,
 ) {
     let had_search = registry.unregister("memory_search");
     let had_get = registry.unregister("memory_get");
     let had_save = registry.unregister("memory_save");
+
+    if !memory_style_allows_tools(style) {
+        return;
+    }
 
     let agent_id_owned = agent_id.to_string();
     if had_search {
@@ -5885,10 +6965,11 @@ fn install_agent_scoped_memory_tools(
             agent_id_owned.clone(),
         )));
     }
-    if had_save {
+    if had_save && memory_write_mode_allows_save(write_mode) {
         registry.register(Box::new(AgentScopedMemorySaveTool::new(
             Arc::clone(manager),
             agent_id_owned,
+            write_mode,
         )));
     }
 }
@@ -5916,6 +6997,7 @@ fn effective_tool_mode(provider: &dyn moltis_agents::model::LlmProvider) -> Tool
 }
 
 async fn run_with_tools(
+    persona: PromptPersona,
     state: &Arc<dyn ChatRuntime>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
     run_id: &str,
@@ -5945,22 +7027,34 @@ async fn run_with_tools(
     terminal_runs: &Arc<RwLock<HashSet<String>>>,
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
-    let persona = load_prompt_persona_for_agent(agent_id);
 
     let tool_mode = effective_tool_mode(&*provider);
     let native_tools = matches!(tool_mode, ToolMode::Native);
     let tools_enabled = !matches!(tool_mode, ToolMode::Off);
 
+    let policy_ctx = build_policy_context(agent_id, runtime_context, None);
     let mut filtered_registry = {
         let registry_guard = tool_registry.read().await;
         if tools_enabled {
-            apply_runtime_tool_filters(&registry_guard, &persona.config, skills, mcp_disabled)
+            apply_runtime_tool_filters(
+                &registry_guard,
+                &persona.config,
+                skills,
+                mcp_disabled,
+                &policy_ctx,
+            )
         } else {
             registry_guard.clone_without(&[])
         }
     };
     if tools_enabled && let Some(manager) = state.memory_manager() {
-        install_agent_scoped_memory_tools(&mut filtered_registry, manager, agent_id);
+        install_agent_scoped_memory_tools(
+            &mut filtered_registry,
+            manager,
+            agent_id,
+            persona.config.memory.style,
+            persona.config.memory.agent_write_mode,
+        );
     }
     if tools_enabled
         && matches!(
@@ -5975,8 +7069,9 @@ async fn run_with_tools(
     // - Native tools: full prompt with tool schemas sent via API
     // - Text tools: full prompt with tool schemas embedded + call guidance
     // - Off: minimal prompt without tools
+    let prompt_limits = prompt_build_limits_from_config(&persona.config);
     let system_prompt = if tools_enabled {
-        build_system_prompt_with_session_runtime(
+        build_system_prompt_with_session_runtime_details(
             &filtered_registry,
             native_tools,
             project_context,
@@ -5984,22 +7079,28 @@ async fn run_with_tools(
             Some(&persona.identity),
             Some(&persona.user),
             persona.soul_text.as_deref(),
+            persona.boot_text.as_deref(),
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
+            prompt_limits,
         )
+        .prompt
     } else {
-        build_system_prompt_minimal_runtime(
+        build_system_prompt_minimal_runtime_details(
             project_context,
             Some(&persona.identity),
             Some(&persona.user),
             persona.soul_text.as_deref(),
+            persona.boot_text.as_deref(),
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             runtime_context,
             persona.memory_text.as_deref(),
+            prompt_limits,
         )
+        .prompt
     };
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
@@ -6493,6 +7594,20 @@ async fn run_with_tools(
                     "toolCallsMade": tool_calls_made,
                     "seq": seq,
                 }),
+                RunnerEvent::AutoContinue {
+                    iteration,
+                    max_iterations,
+                } => serde_json::json!({
+                    "runId": run_id,
+                    "sessionKey": sk,
+                    "state": "notice",
+                    "title": "Auto-continue",
+                    "message": format!(
+                        "Model paused at iteration {}/{}. Asking it to continue...",
+                        iteration, max_iterations
+                    ),
+                    "seq": seq,
+                }),
                 RunnerEvent::RetryingAfterError { error, delay_ms } => {
                     let error_obj =
                         parse_chat_error(&error, Some(provider_name_for_events.as_str()));
@@ -6517,6 +7632,54 @@ async fn run_with_tools(
                         "state": "retrying",
                         "error": error_obj,
                         "retryAfterMs": delay_ms,
+                        "seq": seq,
+                    })
+                },
+                RunnerEvent::ToolCallRejected {
+                    id,
+                    name,
+                    arguments,
+                    error,
+                } => {
+                    // Pre-dispatch validation failure — the tool's `execute`
+                    // method never ran. Emit as a terminal tool_call_end with
+                    // a `rejected: true` marker so the UI can render it
+                    // distinctly from a normal execution failure (issue #658).
+                    if let Some(ref map) = active_tool_calls {
+                        let mut guard = map.write().await;
+                        if let Some(calls) = guard.get_mut(&sk) {
+                            calls.retain(|tc| tc.id != id);
+                            if calls.is_empty() {
+                                guard.remove(&sk);
+                            }
+                        }
+                    }
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "tool_call_end",
+                        "toolCallId": id,
+                        "toolName": name,
+                        "arguments": arguments,
+                        "success": false,
+                        "rejected": true,
+                        "error": parse_chat_error(&error, None),
+                        "seq": seq,
+                    })
+                },
+                RunnerEvent::LoopInterventionFired { stage, tool_name } => {
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "notice",
+                        "title": "Loop detected",
+                        "message": format!(
+                            "Detected repeated failed calls to `{}`. \
+                             Intervening (stage {}) to break the loop.",
+                            tool_name, stage
+                        ),
+                        "loopInterventionStage": stage,
+                        "stuckTool": tool_name,
                         "seq": seq,
                     })
                 },
@@ -6548,15 +7711,12 @@ async fn run_with_tools(
 
     // Inject session key and accept-language into tool call params so tools can
     // resolve per-session state and forward the user's locale to web requests.
-    let mut tool_context = serde_json::json!({
-        "_session_key": session_key,
-    });
-    if let Some(lang) = accept_language.as_deref() {
-        tool_context["_accept_language"] = serde_json::json!(lang);
-    }
-    if let Some(cid) = conn_id.as_deref() {
-        tool_context["_conn_id"] = serde_json::json!(cid);
-    }
+    let tool_context = build_tool_context(
+        session_key,
+        accept_language.as_deref(),
+        conn_id.as_deref(),
+        runtime_context,
+    );
 
     let provider_ref = provider.clone();
     let first_result = run_agent_loop_streaming(
@@ -6596,22 +7756,55 @@ async fn run_with_tools(
             )
             .await;
 
-            // Inline compaction: summarize history, replace in store.
-            match compact_session(store, session_key, &provider_ref).await {
-                Ok(()) => {
-                    broadcast(
-                        state,
-                        "chat",
-                        serde_json::json!({
-                            "runId": run_id,
-                            "sessionKey": session_key,
-                            "state": "auto_compact",
-                            "phase": "done",
-                            "reason": "context_window_exceeded",
-                        }),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
+            // Inline compaction: run the configured strategy, replace in store.
+            // Forward the session provider so LLM-backed modes (llm_replace
+            // / structured) have a client to summarise with.
+            match compact_session(
+                store,
+                session_key,
+                &persona.config.chat.compaction,
+                Some(&*provider_ref),
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    // Merge the compaction metadata (mode, tokens, settings
+                    // hint) into the broadcast so the UI can show a toast
+                    // like "Compacted via Structured mode (1,234 tokens)".
+                    // Respect chat.compaction.show_settings_hint so the
+                    // hint is omitted when the user has opted out.
+                    //
+                    // `compactBroadcastPath: "wrapper"` marks this as
+                    // the self-contained auto_compact event with the
+                    // metadata inline. The parallel pre-emptive path
+                    // in `send()` emits `compactBroadcastPath: "inner"`
+                    // instead, where the metadata lives on the separate
+                    // `chat.compact done` event fired from within
+                    // `self.compact()`. Hook consumers that only care
+                    // about metadata can subscribe to whichever path
+                    // matches their use case.
+                    let show_hint = persona.config.chat.compaction.show_settings_hint;
+                    let mut payload = serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": session_key,
+                        "state": "auto_compact",
+                        "phase": "done",
+                        "reason": "context_window_exceeded",
+                        "compactBroadcastPath": "wrapper",
+                    });
+                    if let (Some(obj), Some(meta)) = (
+                        payload.as_object_mut(),
+                        outcome.broadcast_metadata(show_hint).as_object().cloned(),
+                    ) {
+                        obj.extend(meta);
+                    }
+                    broadcast(state, "chat", payload, BroadcastOpts::default()).await;
+
+                    // Notify any channel (Telegram, Discord, Matrix,
+                    // WhatsApp, etc.) that has pending reply targets on
+                    // this session so channel users see the same mode +
+                    // token info as the web UI.
+                    notify_channels_of_compaction(state, session_key, &outcome, show_hint).await;
 
                     // Reload compacted history and retry.
                     let compacted_history_raw = store.read(session_key).await.unwrap_or_default();
@@ -6851,84 +8044,44 @@ async fn run_with_tools(
 ///
 /// This is a standalone helper so `run_with_tools` can call it without
 /// requiring `&self` on `LiveChatService`.
+/// Compact a session using the configured [`moltis_config::CompactionMode`].
+///
+/// Thin wrapper around [`compaction_run::run_compaction`] that owns the
+/// session-store read/write pair. `provider` is forwarded to LLM-backed
+/// modes; `None` is accepted for deterministic compaction but causes
+/// `llm_replace` / `structured` to return a [`ProviderRequired`] error.
+///
+/// Returns the full [`compaction_run::CompactionOutcome`] so the caller
+/// can surface the effective mode and token usage in its broadcast
+/// event. This is a standalone helper so `run_with_tools` can call it
+/// without requiring `&self` on `LiveChatService`.
+///
+/// [`ProviderRequired`]: compaction_run::CompactionRunError::ProviderRequired
 async fn compact_session(
     store: &Arc<SessionStore>,
     session_key: &str,
-    provider: &Arc<dyn moltis_agents::model::LlmProvider>,
-) -> error::Result<()> {
+    config: &moltis_config::CompactionConfig,
+    provider: Option<&dyn moltis_agents::model::LlmProvider>,
+) -> error::Result<compaction_run::CompactionOutcome> {
     let history = store
         .read(session_key)
         .await
         .map_err(|source| error::Error::external("failed to read session history", source))?;
-    if history.is_empty() {
-        return Err(error::Error::message("nothing to compact"));
-    }
 
-    // Use structured ChatMessage objects so role boundaries are maintained via
-    // the API's message structure, preventing prompt injection where user content
-    // could mimic role prefixes in concatenated text.
-    let mut summary_messages = vec![ChatMessage::system(
-        "You are a conversation summarizer. The messages that follow are a conversation you must summarize. Preserve all key facts, decisions, and context. After the conversation, you will receive a final instruction.",
-    )];
-    summary_messages.extend(values_to_chat_messages(&history));
-    summary_messages.push(ChatMessage::user(
-        "Summarize the conversation above into a concise form. Output only the summary, no preamble.",
-    ));
+    let mut outcome = compaction_run::run_compaction(&history, config, provider)
+        .await
+        .map_err(|e| error::Error::message(e.to_string()))?;
 
-    let mut stream = provider.stream(summary_messages);
-    let mut summary = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            StreamEvent::Delta(delta) => summary.push_str(&delta),
-            StreamEvent::Done(_) => break,
-            StreamEvent::Error(e) => {
-                return Err(error::Error::message(format!(
-                    "compact summarization failed: {e}"
-                )));
-            },
-            // Tool events not expected in summarization stream.
-            StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallArgumentsDelta { .. }
-            | StreamEvent::ToolCallComplete { .. }
-            // Provider raw payloads are debug metadata, not summary text.
-            | StreamEvent::ProviderRaw(_)
-            // Ignore provider reasoning blocks; summary body should only
-            // include final answer text.
-            | StreamEvent::ReasoningDelta(_) => {},
-        }
-    }
-
-    if summary.is_empty() {
-        return Err(error::Error::message("compact produced empty summary"));
-    }
-
-    let compacted_msg = PersistedMessage::Assistant {
-        content: format!("[Conversation Summary]\n\n{summary}"),
-        created_at: Some(now_ms()),
-        model: None,
-        provider: None,
-        input_tokens: None,
-        output_tokens: None,
-        duration_ms: None,
-        request_input_tokens: None,
-        request_output_tokens: None,
-        tool_calls: None,
-        reasoning: None,
-        llm_api_response: None,
-        audio: None,
-        seq: None,
-        run_id: None,
-    };
-    let compacted = vec![compacted_msg.to_value()];
+    // Enforce summary budget discipline on the compacted history.
+    outcome.history = compress_summary_in_history(outcome.history);
 
     store
-        .replace_history(session_key, compacted)
+        .replace_history(session_key, outcome.history.clone())
         .await
         .map_err(|source| error::Error::external("failed to replace compacted history", source))?;
 
-    Ok(())
+    Ok(outcome)
 }
-
 // ── Streaming mode (no tools) ───────────────────────────────────────────────
 
 const STREAM_RETRYABLE_SERVER_PATTERNS: &[&str] = &[
@@ -7002,6 +8155,7 @@ fn next_stream_retry_delay_ms(
 }
 
 async fn run_streaming(
+    persona: PromptPersona,
     state: &Arc<dyn ChatRuntime>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
     run_id: &str,
@@ -7011,7 +8165,7 @@ async fn run_streaming(
     provider_name: &str,
     history_raw: &[Value],
     session_key: &str,
-    agent_id: &str,
+    _agent_id: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
     user_message_index: usize,
@@ -7023,18 +8177,20 @@ async fn run_streaming(
     terminal_runs: &Arc<RwLock<HashSet<String>>>,
 ) -> Option<AssistantTurnOutput> {
     let run_started = Instant::now();
-    let persona = load_prompt_persona_for_agent(agent_id);
 
-    let system_prompt = build_system_prompt_minimal_runtime(
+    let system_prompt = build_system_prompt_minimal_runtime_details(
         project_context,
         Some(&persona.identity),
         Some(&persona.user),
         persona.soul_text.as_deref(),
+        persona.boot_text.as_deref(),
         persona.agents_text.as_deref(),
         persona.tools_text.as_deref(),
         runtime_context,
         persona.memory_text.as_deref(),
-    );
+        prompt_build_limits_from_config(&persona.config),
+    )
+    .prompt;
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
     let system_prompt = apply_voice_reply_suffix(system_prompt, desired_reply_medium);
@@ -7560,14 +8716,16 @@ async fn send_channel_logbook_follow_up_to_targets(
     for target in targets {
         let outbound = Arc::clone(&outbound);
         let html = html.clone();
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             if let Err(e) = outbound
-                .send_html(&target.account_id, &target.chat_id, &html, None)
+                .send_html(&target.account_id, &to, &html, None)
                 .await
             {
                 warn!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "failed to send logbook follow-up: {e}"
                 );
             }
@@ -7594,12 +8752,120 @@ fn format_channel_error_message(error_obj: &Value) -> String {
     let title = error_obj
         .get("title")
         .and_then(|v| v.as_str())
+        .or_else(|| match error_obj.get("type").and_then(|v| v.as_str()) {
+            Some("message_rejected") => Some("Message rejected"),
+            _ => None,
+        })
         .unwrap_or("Request failed");
     let detail = error_obj
         .get("detail")
         .and_then(|v| v.as_str())
+        .or_else(|| error_obj.get("message").and_then(|v| v.as_str()))
         .unwrap_or("Please try again.");
     format!("⚠️ {title}: {detail}")
+}
+
+/// Format a user-facing notice announcing that a session was compacted.
+///
+/// Shown verbatim to channel users (Telegram, Discord, WhatsApp, etc.) and
+/// kept short so small mobile clients don't wrap the whole thing.
+///
+/// When `include_settings_hint` is false, the "Change chat.compaction.mode…"
+/// footer is omitted so users who have set
+/// `chat.compaction.show_settings_hint = false` don't see the repetitive
+/// hint on every compaction. Mode + token lines are always included.
+/// The LLM retry path never sees this text regardless.
+fn format_channel_compaction_notice(
+    outcome: &compaction_run::CompactionOutcome,
+    include_settings_hint: bool,
+) -> String {
+    let mode_label = match outcome.effective_mode {
+        moltis_config::CompactionMode::Deterministic => "Deterministic",
+        moltis_config::CompactionMode::RecencyPreserving => "Recency preserving",
+        moltis_config::CompactionMode::Structured => "Structured",
+        moltis_config::CompactionMode::LlmReplace => "LLM replace",
+    };
+    let total = outcome.total_tokens();
+    let token_line = if total == 0 {
+        // Any strategy that made no LLM calls ends up here: Deterministic,
+        // RecencyPreserving, or a Structured run that fell back to
+        // recency_preserving before the LLM call landed. Report the
+        // actual effective mode so users don't see "deterministic
+        // strategy" when they picked recency_preserving.
+        format!(
+            "No LLM tokens used ({} strategy)",
+            mode_label.to_lowercase()
+        )
+    } else {
+        format!(
+            "Used {total} tokens ({input} in + {output} out)",
+            total = total,
+            input = outcome.input_tokens,
+            output = outcome.output_tokens,
+        )
+    };
+    let body = format!(
+        "🧹 Conversation compacted\n\
+         Mode: {mode_label}\n\
+         {token_line}",
+    );
+    if include_settings_hint {
+        format!("{body}\n{hint}", hint = compaction_run::SETTINGS_HINT)
+    } else {
+        body
+    }
+}
+
+/// Send a silent "session compacted" notice to pending channel targets
+/// without draining them.
+///
+/// Mirrors [`send_retry_status_to_channels`]: the targets are *peeked*,
+/// not drained, so the in-flight agent run can still deliver its final
+/// reply to them afterward. Uses `send_text_silent` so the channel
+/// integration doesn't count it toward user-visible interactive replies
+/// (no TTS, no delivery receipts beyond the channel's own).
+async fn notify_channels_of_compaction(
+    state: &Arc<dyn ChatRuntime>,
+    session_key: &str,
+    outcome: &compaction_run::CompactionOutcome,
+    include_settings_hint: bool,
+) {
+    let targets = state.peek_channel_replies(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let Some(outbound) = state.channel_outbound() else {
+        return;
+    };
+
+    let message = format_channel_compaction_notice(outcome, include_settings_hint);
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let message = message.clone();
+        let to = target.outbound_to().into_owned();
+        tasks.push(tokio::spawn(async move {
+            let reply_to = target.message_id.as_deref();
+            if let Err(e) = outbound
+                .send_text_silent(&target.account_id, &to, &message, reply_to)
+                .await
+            {
+                warn!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
+                    "failed to send compaction notice to channel: {e}"
+                );
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel compaction notice task join failed");
+        }
+    }
 }
 
 /// Send a short retry status update to pending channel targets without draining
@@ -7625,15 +8891,17 @@ async fn send_retry_status_to_channels(
     for target in targets {
         let outbound = Arc::clone(&outbound);
         let message = message.clone();
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             let reply_to = target.message_id.as_deref();
             if let Err(e) = outbound
-                .send_text_silent(&target.account_id, &target.chat_id, &message, reply_to)
+                .send_text_silent(&target.account_id, &to, &message, reply_to)
                 .await
             {
                 warn!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "failed to send retry status to channel: {e}"
                 );
             }
@@ -7667,17 +8935,18 @@ async fn deliver_channel_error(state: &Arc<dyn ChatRuntime>, session_key: &str, 
         let outbound = Arc::clone(&outbound);
         let error_text = error_text.clone();
         let logbook_html = logbook_html.clone();
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             let reply_to = target.message_id.as_deref();
             let send_result = if logbook_html.is_empty() {
                 outbound
-                    .send_text(&target.account_id, &target.chat_id, &error_text, reply_to)
+                    .send_text(&target.account_id, &to, &error_text, reply_to)
                     .await
             } else {
                 outbound
                     .send_text_with_suffix(
                         &target.account_id,
-                        &target.chat_id,
+                        &to,
                         &error_text,
                         &logbook_html,
                         reply_to,
@@ -7688,6 +8957,7 @@ async fn deliver_channel_error(state: &Arc<dyn ChatRuntime>, session_key: &str, 
                 warn!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "failed to send channel error reply: {e}"
                 );
             }
@@ -7725,6 +8995,7 @@ async fn deliver_channel_replies_to_targets(
         // caption/follow-up and only send the TTS voice audio.
         let text_already_streamed =
             streamed_target_keys.contains(&ChannelReplyTargetKey::from(&target));
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             let tts_payload = match desired_reply_medium {
                 ReplyMedium::Voice => build_tts_payload(&state, &session_key, &target, &text).await,
@@ -7739,29 +9010,26 @@ async fn deliver_channel_replies_to_targets(
                         if text_already_streamed {
                             // Text was already streamed — send voice audio only.
                             if let Err(e) = outbound
-                                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                                .send_media(&target.account_id, &to, &payload, reply_to)
                                 .await
                             {
                                 warn!(
                                     account_id = target.account_id,
                                     chat_id = target.chat_id,
+                                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                     "failed to send channel voice reply: {e}"
                                 );
                             }
                             // Send logbook as a follow-up if present.
                             if !logbook_html.is_empty()
                                 && let Err(e) = outbound
-                                    .send_html(
-                                        &target.account_id,
-                                        &target.chat_id,
-                                        &logbook_html,
-                                        None,
-                                    )
+                                    .send_html(&target.account_id, &to, &logbook_html, None)
                                     .await
                             {
                                 warn!(
                                     account_id = target.account_id,
                                     chat_id = target.chat_id,
+                                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                     "failed to send logbook follow-up: {e}"
                                 );
                             }
@@ -7771,29 +9039,26 @@ async fn deliver_channel_replies_to_targets(
                             // Short transcript fits as a caption on the voice message.
                             payload.text = transcript;
                             if let Err(e) = outbound
-                                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                                .send_media(&target.account_id, &to, &payload, reply_to)
                                 .await
                             {
                                 warn!(
                                     account_id = target.account_id,
                                     chat_id = target.chat_id,
+                                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                     "failed to send channel voice reply: {e}"
                                 );
                             }
                             // Send logbook as a follow-up if present.
                             if !logbook_html.is_empty()
                                 && let Err(e) = outbound
-                                    .send_html(
-                                        &target.account_id,
-                                        &target.chat_id,
-                                        &logbook_html,
-                                        None,
-                                    )
+                                    .send_html(&target.account_id, &to, &logbook_html, None)
                                     .await
                             {
                                 warn!(
                                     account_id = target.account_id,
                                     chat_id = target.chat_id,
+                                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                     "failed to send logbook follow-up: {e}"
                                 );
                             }
@@ -7801,29 +9066,25 @@ async fn deliver_channel_replies_to_targets(
                             // Transcript too long for a caption — send voice
                             // without caption, then the full text as a follow-up.
                             if let Err(e) = outbound
-                                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                                .send_media(&target.account_id, &to, &payload, reply_to)
                                 .await
                             {
                                 warn!(
                                     account_id = target.account_id,
                                     chat_id = target.chat_id,
+                                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                     "failed to send channel voice reply: {e}"
                                 );
                             }
                             let text_result = if logbook_html.is_empty() {
                                 outbound
-                                    .send_text(
-                                        &target.account_id,
-                                        &target.chat_id,
-                                        &transcript,
-                                        None,
-                                    )
+                                    .send_text(&target.account_id, &to, &transcript, None)
                                     .await
                             } else {
                                 outbound
                                     .send_text_with_suffix(
                                         &target.account_id,
-                                        &target.chat_id,
+                                        &to,
                                         &transcript,
                                         &logbook_html,
                                         None,
@@ -7834,6 +9095,7 @@ async fn deliver_channel_replies_to_targets(
                                 warn!(
                                     account_id = target.account_id,
                                     chat_id = target.chat_id,
+                                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                     "failed to send transcript follow-up: {e}"
                                 );
                             }
@@ -7844,12 +9106,13 @@ async fn deliver_channel_replies_to_targets(
                         // only send logbook follow-up if present.
                         if !logbook_html.is_empty()
                             && let Err(e) = outbound
-                                .send_html(&target.account_id, &target.chat_id, &logbook_html, None)
+                                .send_html(&target.account_id, &to, &logbook_html, None)
                                 .await
                         {
                             warn!(
                                 account_id = target.account_id,
                                 chat_id = target.chat_id,
+                                thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                 "failed to send logbook follow-up: {e}"
                             );
                         }
@@ -7857,13 +9120,13 @@ async fn deliver_channel_replies_to_targets(
                     None => {
                         let result = if logbook_html.is_empty() {
                             outbound
-                                .send_text(&target.account_id, &target.chat_id, &text, reply_to)
+                                .send_text(&target.account_id, &to, &text, reply_to)
                                 .await
                         } else {
                             outbound
                                 .send_text_with_suffix(
                                     &target.account_id,
-                                    &target.chat_id,
+                                    &to,
                                     &text,
                                     &logbook_html,
                                     reply_to,
@@ -7874,6 +9137,7 @@ async fn deliver_channel_replies_to_targets(
                             warn!(
                                 account_id = target.account_id,
                                 chat_id = target.chat_id,
+                                thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                 "failed to send channel reply: {e}"
                             );
                         }
@@ -7882,12 +9146,13 @@ async fn deliver_channel_replies_to_targets(
                 _ => match tts_payload {
                     Some(payload) => {
                         if let Err(e) = outbound
-                            .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                            .send_media(&target.account_id, &to, &payload, reply_to)
                             .await
                         {
                             warn!(
                                 account_id = target.account_id,
                                 chat_id = target.chat_id,
+                                thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                 "failed to send channel voice reply: {e}"
                             );
                         }
@@ -7897,12 +9162,13 @@ async fn deliver_channel_replies_to_targets(
                         // only send logbook follow-up if present.
                         if !logbook_html.is_empty()
                             && let Err(e) = outbound
-                                .send_html(&target.account_id, &target.chat_id, &logbook_html, None)
+                                .send_html(&target.account_id, &to, &logbook_html, None)
                                 .await
                         {
                             warn!(
                                 account_id = target.account_id,
                                 chat_id = target.chat_id,
+                                thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                 "failed to send logbook follow-up: {e}"
                             );
                         }
@@ -7910,13 +9176,13 @@ async fn deliver_channel_replies_to_targets(
                     None => {
                         let result = if logbook_html.is_empty() {
                             outbound
-                                .send_text(&target.account_id, &target.chat_id, &text, reply_to)
+                                .send_text(&target.account_id, &to, &text, reply_to)
                                 .await
                         } else {
                             outbound
                                 .send_text_with_suffix(
                                     &target.account_id,
-                                    &target.chat_id,
+                                    &to,
                                     &text,
                                     &logbook_html,
                                     reply_to,
@@ -7927,6 +9193,7 @@ async fn deliver_channel_replies_to_targets(
                             warn!(
                                 account_id = target.account_id,
                                 chat_id = target.chat_id,
+                                thread_id = target.thread_id.as_deref().unwrap_or("-"),
                                 "failed to send channel reply: {e}"
                             );
                         }
@@ -8324,27 +9591,30 @@ async fn send_screenshot_to_channels(
     for target in targets {
         let outbound = Arc::clone(&outbound);
         let payload = payload.clone();
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             {
                 let reply_to = target.message_id.as_deref();
                 if let Err(e) = outbound
-                    .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                    .send_media(&target.account_id, &to, &payload, reply_to)
                     .await
                 {
                     warn!(
                         account_id = target.account_id,
                         chat_id = target.chat_id,
+                        thread_id = target.thread_id.as_deref().unwrap_or("-"),
                         "failed to send screenshot to channel: {e}"
                     );
                     // Notify the user of the error
                     let error_msg = format!("⚠️ Failed to send screenshot: {e}");
                     let _ = outbound
-                        .send_text(&target.account_id, &target.chat_id, &error_msg, reply_to)
+                        .send_text(&target.account_id, &to, &error_msg, reply_to)
                         .await;
                 } else {
                     debug!(
                         account_id = target.account_id,
                         chat_id = target.chat_id,
+                        thread_id = target.thread_id.as_deref().unwrap_or("-"),
                         "sent screenshot to channel"
                     );
                 }
@@ -8380,25 +9650,28 @@ async fn dispatch_document_to_channels(
     for target in targets {
         let outbound = Arc::clone(&outbound);
         let payload = payload.clone();
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             let reply_to = target.message_id.as_deref();
             if let Err(e) = outbound
-                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                .send_media(&target.account_id, &to, &payload, reply_to)
                 .await
             {
                 warn!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "failed to send document to channel: {e}"
                 );
                 let error_msg = format!("\u{26a0}\u{fe0f} Failed to send document: {e}");
                 let _ = outbound
-                    .send_text(&target.account_id, &target.chat_id, &error_msg, reply_to)
+                    .send_text(&target.account_id, &to, &error_msg, reply_to)
                     .await;
             } else {
                 debug!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "sent document to channel"
                 );
             }
@@ -8517,12 +9790,13 @@ async fn send_location_to_channels(
     for target in targets {
         let outbound = Arc::clone(&outbound);
         let title_ref = title_owned.clone();
+        let to = target.outbound_to().into_owned();
         tasks.push(tokio::spawn(async move {
             let reply_to = target.message_id.as_deref();
             if let Err(e) = outbound
                 .send_location(
                     &target.account_id,
-                    &target.chat_id,
+                    &to,
                     latitude,
                     longitude,
                     title_ref.as_deref(),
@@ -8533,12 +9807,14 @@ async fn send_location_to_channels(
                 warn!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "failed to send location to channel: {e}"
                 );
             } else {
                 debug!(
                     account_id = target.account_id,
                     chat_id = target.chat_id,
+                    thread_id = target.thread_id.as_deref().unwrap_or("-"),
                     "sent location pin to channel"
                 );
             }
@@ -8560,10 +9836,13 @@ mod tests {
         anyhow::Result,
         moltis_agents::{model::LlmProvider, tool_registry::AgentTool},
         moltis_common::types::ReplyPayload,
+        moltis_memory::{
+            config::MemoryConfig, schema::run_migrations, store_sqlite::SqliteMemoryStore,
+        },
         std::{
             pin::Pin,
             sync::{
-                Arc,
+                Arc, Mutex as StdMutex,
                 atomic::{AtomicUsize, Ordering},
             },
             time::{Duration, Instant},
@@ -8571,6 +9850,8 @@ mod tests {
         tokio::sync::Notify,
         tokio_stream::Stream,
     };
+
+    static DATA_DIR_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     struct DummyTool {
         name: String,
@@ -8584,7 +9865,7 @@ mod tests {
     struct AbortThenContinueProvider {
         call_count: AtomicUsize,
         first_delta_processed: Arc<Notify>,
-        seen_messages: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+        seen_messages: Arc<StdMutex<Vec<Vec<ChatMessage>>>>,
     }
 
     impl AbortThenContinueProvider {
@@ -8592,7 +9873,7 @@ mod tests {
             Self {
                 call_count: AtomicUsize::new(0),
                 first_delta_processed: Arc::new(Notify::new()),
-                seen_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+                seen_messages: Arc::new(StdMutex::new(Vec::new())),
             }
         }
     }
@@ -8827,6 +10108,8 @@ mod tests {
     struct RecordingChannelOutbound {
         text_calls: Arc<AtomicUsize>,
         suffix_calls: Arc<AtomicUsize>,
+        text_payloads: Arc<Mutex<Vec<String>>>,
+        text_with_suffix_payloads: Arc<Mutex<Vec<(String, String)>>>,
         html_payloads: Arc<Mutex<Vec<String>>>,
     }
 
@@ -8841,8 +10124,10 @@ mod tests {
     struct MockChatRuntime {
         channel_replies: Mutex<HashMap<String, Vec<moltis_channels::ChannelReplyTarget>>>,
         channel_status_log: Mutex<HashMap<String, Vec<String>>>,
+        broadcasts: Mutex<Vec<(String, Value)>>,
         channel_outbound: Option<Arc<dyn moltis_channels::ChannelOutbound>>,
         channel_stream_outbound: Option<Arc<dyn moltis_channels::ChannelStreamOutbound>>,
+        active_sessions: HashMap<String, String>,
         tts: moltis_service_traits::NoopTtsService,
         project: moltis_service_traits::NoopProjectService,
         mcp: moltis_service_traits::NoopMcpService,
@@ -8853,12 +10138,20 @@ mod tests {
             Self {
                 channel_replies: Mutex::new(HashMap::new()),
                 channel_status_log: Mutex::new(HashMap::new()),
+                broadcasts: Mutex::new(Vec::new()),
                 channel_outbound: None,
                 channel_stream_outbound: None,
+                active_sessions: HashMap::new(),
                 tts: moltis_service_traits::NoopTtsService,
                 project: moltis_service_traits::NoopProjectService,
                 mcp: moltis_service_traits::NoopMcpService,
             }
+        }
+
+        fn with_active_session(mut self, conn_id: &str, session_key: &str) -> Self {
+            self.active_sessions
+                .insert(conn_id.to_string(), session_key.to_string());
+            self
         }
 
         fn with_channel_outbound(
@@ -8880,7 +10173,12 @@ mod tests {
 
     #[async_trait]
     impl ChatRuntime for MockChatRuntime {
-        async fn broadcast(&self, _topic: &str, _payload: Value) {}
+        async fn broadcast(&self, topic: &str, payload: Value) {
+            self.broadcasts
+                .lock()
+                .await
+                .push((topic.to_string(), payload));
+        }
 
         async fn push_channel_reply(
             &self,
@@ -8937,8 +10235,8 @@ mod tests {
 
         async fn set_run_error(&self, _run_id: &str, _error: String) {}
 
-        async fn active_session_key(&self, _conn_id: &str) -> Option<String> {
-            None
+        async fn active_session_key(&self, conn_id: &str) -> Option<String> {
+            self.active_sessions.get(conn_id).cloned()
         }
 
         async fn active_project_id(&self, _conn_id: &str) -> Option<String> {
@@ -8953,7 +10251,7 @@ mod tests {
             None
         }
 
-        fn memory_manager(&self) -> Option<&Arc<moltis_memory::manager::MemoryManager>> {
+        fn memory_manager(&self) -> Option<&moltis_memory::runtime::DynMemoryRuntime> {
             None
         }
 
@@ -9024,7 +10322,7 @@ mod tests {
 
     struct MockExecTool {
         calls: Arc<AtomicUsize>,
-        commands: Arc<std::sync::Mutex<Vec<String>>>,
+        commands: Arc<StdMutex<Vec<String>>>,
     }
 
     #[test]
@@ -9185,6 +10483,7 @@ mod tests {
             account_id: "bot-main".to_string(),
             chat_id: "123456".to_string(),
             message_id: Some("99".to_string()),
+            thread_id: None,
         };
         let binding_json = serde_json::to_string(&binding).expect("serialize binding");
         let entry = make_session_entry_with_binding(Some(binding_json));
@@ -9193,9 +10492,9 @@ mod tests {
         assert_eq!(context.surface.as_deref(), Some("telegram"));
         assert_eq!(context.session_kind.as_deref(), Some("channel"));
         assert_eq!(context.channel_type.as_deref(), Some("telegram"));
-        assert_eq!(context.channel_account_id.as_deref(), Some("bot-main"));
-        assert_eq!(context.channel_chat_id.as_deref(), Some("123456"));
-        assert_eq!(context.channel_chat_type.as_deref(), Some("private"));
+        assert_eq!(context.account_id.as_deref(), Some("bot-main"));
+        assert_eq!(context.chat_id.as_deref(), Some("123456"));
+        assert_eq!(context.chat_type.as_deref(), Some("private"));
     }
 
     #[test]
@@ -9204,8 +10503,64 @@ mod tests {
         assert_eq!(context.surface.as_deref(), Some("web"));
         assert_eq!(context.session_kind.as_deref(), Some("web"));
         assert_eq!(context.channel_type, None);
-        assert_eq!(context.channel_account_id, None);
-        assert_eq!(context.channel_chat_id, None);
+        assert_eq!(context.account_id, None);
+        assert_eq!(context.chat_id, None);
+    }
+
+    #[test]
+    fn resolve_channel_runtime_context_falls_back_to_web_when_binding_is_invalid() {
+        let entry = make_session_entry_with_binding(Some("{not-json".to_string()));
+        let context = resolve_channel_runtime_context("telegram:bot-main:123456", Some(&entry));
+        assert_eq!(context.surface.as_deref(), Some("web"));
+        assert_eq!(context.session_kind.as_deref(), Some("web"));
+        assert!(context.channel_type.is_none());
+        assert!(context.account_id.is_none());
+        assert!(context.chat_id.is_none());
+    }
+
+    #[test]
+    fn build_tool_context_includes_channel_binding() {
+        let runtime_context = PromptRuntimeContext {
+            host: PromptHostRuntimeContext {
+                surface: Some("telegram".to_string()),
+                session_kind: Some("channel".to_string()),
+                channel_type: Some("telegram".to_string()),
+                channel_account_id: Some("bot-main".to_string()),
+                channel_chat_id: Some("-100123".to_string()),
+                channel_chat_type: Some("channel_or_supergroup".to_string()),
+                channel_sender_id: Some("42".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let tool_context = build_tool_context(
+            "telegram:bot-main:-100123",
+            Some("en-US"),
+            Some("conn-1"),
+            Some(&runtime_context),
+        );
+
+        assert_eq!(tool_context["_session_key"], "telegram:bot-main:-100123");
+        assert_eq!(tool_context["_accept_language"], "en-US");
+        assert_eq!(tool_context["_conn_id"], "conn-1");
+        assert_eq!(tool_context["_channel"]["channel_type"], "telegram");
+        assert_eq!(tool_context["_channel"]["account_id"], "bot-main");
+        assert_eq!(
+            tool_context["_channel"]["chat_type"],
+            "channel_or_supergroup"
+        );
+        assert_eq!(tool_context["_channel"]["sender_id"], "42");
+    }
+
+    #[test]
+    fn build_tool_context_omits_channel_binding_without_runtime_context() {
+        let tool_context = build_tool_context("main", None, None, None);
+
+        assert_eq!(tool_context["_session_key"], "main");
+        assert!(tool_context.get("_channel").is_none());
+        assert!(tool_context.get("_accept_language").is_none());
+        assert!(tool_context.get("_conn_id").is_none());
     }
 
     #[test]
@@ -9314,6 +10669,58 @@ mod tests {
         assert!(user_audio_path_from_params(&params, "main").is_none());
     }
 
+    #[test]
+    fn user_documents_from_params_builds_session_scoped_paths() {
+        let params = serde_json::json!({
+            "_document_files": [{
+                "display_name": "report.pdf",
+                "stored_filename": "doc-file-id_report.pdf",
+                "mime_type": "application/pdf"
+            }]
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = SessionStore::new(dir.path().to_path_buf());
+        let documents =
+            user_documents_from_params(&params, "session:abc", &store).expect("documents");
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].display_name, "report.pdf");
+        assert_eq!(documents[0].stored_filename, "doc-file-id_report.pdf");
+        assert_eq!(
+            documents[0].media_ref,
+            "media/session_abc/doc-file-id_report.pdf"
+        );
+        assert_eq!(
+            documents[0].absolute_path,
+            Some(
+                dir.path()
+                    .join("media")
+                    .join("session_abc")
+                    .join("doc-file-id_report.pdf")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn user_documents_for_persistence_drops_absolute_paths() {
+        let documents = vec![UserDocument {
+            display_name: "report.pdf".to_string(),
+            stored_filename: "doc-file-id_report.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            media_ref: "media/session_abc/doc-file-id_report.pdf".to_string(),
+            absolute_path: Some("/tmp/session_abc/doc-file-id_report.pdf".to_string()),
+        }];
+        let persisted = user_documents_for_persistence(&documents).expect("documents");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].display_name, "report.pdf");
+        assert_eq!(
+            persisted[0].media_ref,
+            "media/session_abc/doc-file-id_report.pdf"
+        );
+        assert!(persisted[0].absolute_path.is_none());
+    }
+
     #[async_trait]
     impl moltis_channels::plugin::ChannelOutbound for MockChannelOutbound {
         async fn send_text(
@@ -9345,10 +10752,11 @@ mod tests {
             &self,
             _account_id: &str,
             _to: &str,
-            _text: &str,
+            text: &str,
             _reply_to: Option<&str>,
         ) -> moltis_channels::Result<()> {
             self.text_calls.fetch_add(1, Ordering::SeqCst);
+            self.text_payloads.lock().await.push(text.to_string());
             Ok(())
         }
 
@@ -9366,11 +10774,15 @@ mod tests {
             &self,
             _account_id: &str,
             _to: &str,
-            _text: &str,
-            _suffix_html: &str,
+            text: &str,
+            suffix_html: &str,
             _reply_to: Option<&str>,
         ) -> moltis_channels::Result<()> {
             self.suffix_calls.fetch_add(1, Ordering::SeqCst);
+            self.text_with_suffix_payloads
+                .lock()
+                .await
+                .push((text.to_string(), suffix_html.to_string()));
             Ok(())
         }
 
@@ -9422,12 +10834,17 @@ mod tests {
     }
 
     async fn sqlite_pool() -> sqlx::SqlitePool {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
             .await
             .expect("sqlite memory pool");
         moltis_projects::run_migrations(&pool)
             .await
             .expect("projects migrations");
+        moltis_sessions::run_migrations(&pool)
+            .await
+            .expect("sessions migrations");
         SqliteSessionMetadata::init(&pool)
             .await
             .expect("session metadata migrations");
@@ -9447,6 +10864,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: None,
+            thread_id: None,
         }];
         let state = mock_runtime();
 
@@ -9485,6 +10903,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("42".to_string()),
+            thread_id: None,
         };
 
         state
@@ -9530,6 +10949,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("42".to_string()),
+            thread_id: None,
         };
 
         state
@@ -9566,6 +10986,8 @@ mod tests {
         let outbound_impl = Arc::new(RecordingChannelOutbound {
             text_calls: Arc::clone(&text_calls),
             suffix_calls: Arc::clone(&suffix_calls),
+            text_payloads: Arc::new(Mutex::new(Vec::new())),
+            text_with_suffix_payloads: Arc::new(Mutex::new(Vec::new())),
             html_payloads: Arc::clone(&html_payloads),
         });
         let outbound: Arc<dyn moltis_channels::plugin::ChannelOutbound> = outbound_impl;
@@ -9577,6 +10999,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("42".to_string()),
+            thread_id: None,
         };
         let session_key = "telegram:acct:123";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9615,6 +11038,8 @@ mod tests {
         let outbound_impl = Arc::new(RecordingChannelOutbound {
             text_calls: Arc::clone(&text_calls),
             suffix_calls: Arc::clone(&suffix_calls),
+            text_payloads: Arc::new(Mutex::new(Vec::new())),
+            text_with_suffix_payloads: Arc::new(Mutex::new(Vec::new())),
             html_payloads: Arc::clone(&html_payloads),
         });
         let outbound: Arc<dyn moltis_channels::plugin::ChannelOutbound> = outbound_impl;
@@ -9626,6 +11051,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "456".to_string(),
             message_id: Some("99".to_string()),
+            thread_id: None,
         };
         let session_key = "discord:acct:456";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9661,6 +11087,8 @@ mod tests {
         let outbound_impl = Arc::new(RecordingChannelOutbound {
             text_calls: Arc::clone(&text_calls),
             suffix_calls: Arc::clone(&suffix_calls),
+            text_payloads: Arc::new(Mutex::new(Vec::new())),
+            text_with_suffix_payloads: Arc::new(Mutex::new(Vec::new())),
             html_payloads: Arc::clone(&html_payloads),
         });
         let outbound: Arc<dyn moltis_channels::plugin::ChannelOutbound> = outbound_impl;
@@ -9672,6 +11100,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("42".to_string()),
+            thread_id: None,
         };
         let session_key = "discord:acct:123";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9720,6 +11149,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("55".to_string()),
+            thread_id: None,
         };
         let session_key = "telegram:acct:123";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9755,6 +11185,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("55".to_string()),
+            thread_id: None,
         };
         let session_key = "telegram:acct:123";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9791,6 +11222,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("55".to_string()),
+            thread_id: None,
         };
         let session_key = "telegram:acct:123";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9823,6 +11255,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "123".to_string(),
             message_id: Some("55".to_string()),
+            thread_id: None,
         };
         let session_key = "telegram:acct:123";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9863,6 +11296,7 @@ mod tests {
             account_id: "acct".to_string(),
             chat_id: "456".to_string(),
             message_id: Some("77".to_string()),
+            thread_id: None,
         };
         let session_key = "telegram:acct:456";
         state.push_channel_reply(session_key, target.clone()).await;
@@ -9885,6 +11319,540 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_message_received_hook_block_rejects_without_persisting_or_running() {
+        struct BlockMessageReceivedHook;
+
+        #[async_trait]
+        impl moltis_common::hooks::HookHandler for BlockMessageReceivedHook {
+            fn name(&self) -> &str {
+                "block-message-received"
+            }
+
+            fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+                &[moltis_common::hooks::HookEvent::MessageReceived]
+            }
+
+            async fn handle(
+                &self,
+                _event: moltis_common::hooks::HookEvent,
+                _payload: &moltis_common::hooks::HookPayload,
+            ) -> moltis_common::error::Result<moltis_common::hooks::HookAction> {
+                Ok(moltis_common::hooks::HookAction::Block(
+                    "rejected by hook".to_string(),
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let runtime = Arc::new(MockChatRuntime::new());
+        let state: Arc<dyn ChatRuntime> = runtime.clone();
+        let mut providers = ProviderRegistry::empty();
+        providers.register(
+            moltis_providers::ModelInfo {
+                id: "block-test-model".to_string(),
+                provider: "test".to_string(),
+                display_name: "Block Test Model".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(StaticProvider {
+                name: "test".to_string(),
+                id: "block-test-model".to_string(),
+            }),
+        );
+
+        let mut hooks = moltis_common::hooks::HookRegistry::new();
+        hooks.register(Arc::new(BlockMessageReceivedHook));
+
+        let chat = LiveChatService::new(
+            Arc::new(RwLock::new(providers)),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            state,
+            Arc::clone(&store),
+            metadata,
+        )
+        .with_hooks(hooks);
+
+        let result = chat
+            .send(serde_json::json!({ "text": "please reject this" }))
+            .await
+            .expect("chat.send should return a rejection payload");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["rejected"], true);
+        assert_eq!(result["reason"], "rejected by hook");
+        assert!(
+            chat.active_runs.read().await.is_empty(),
+            "blocked messages must not spawn runs"
+        );
+        assert!(
+            chat.active_runs_by_session.read().await.is_empty(),
+            "blocked messages must not reserve a session run slot"
+        );
+        assert!(
+            store.read("main").await.unwrap_or_default().is_empty(),
+            "blocked messages must not be persisted"
+        );
+        let broadcasts = runtime.broadcasts.lock().await.clone();
+        assert_eq!(
+            broadcasts.len(),
+            1,
+            "blocked messages should broadcast a rejection"
+        );
+        assert_eq!(broadcasts[0].0, "chat");
+        assert_eq!(
+            broadcasts[0].1,
+            serde_json::json!({
+                "state": "rejected",
+                "sessionKey": "main",
+                "reason": "rejected by hook",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_received_hook_modify_rewrites_persisted_and_provider_input() {
+        struct RewriteMessageReceivedHook;
+
+        #[async_trait]
+        impl moltis_common::hooks::HookHandler for RewriteMessageReceivedHook {
+            fn name(&self) -> &str {
+                "rewrite-message-received"
+            }
+
+            fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+                &[moltis_common::hooks::HookEvent::MessageReceived]
+            }
+
+            async fn handle(
+                &self,
+                _event: moltis_common::hooks::HookEvent,
+                _payload: &moltis_common::hooks::HookPayload,
+            ) -> moltis_common::error::Result<moltis_common::hooks::HookAction> {
+                Ok(moltis_common::hooks::HookAction::ModifyPayload(
+                    serde_json::json!({ "content": "sanitized prompt" }),
+                ))
+            }
+        }
+
+        struct RecordingReplyProvider {
+            seen_messages: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for RecordingReplyProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            fn id(&self) -> &str {
+                "recording::rewrite"
+            }
+
+            async fn complete(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[Value],
+            ) -> Result<moltis_agents::model::CompletionResponse> {
+                anyhow::bail!("not implemented for test")
+            }
+
+            fn stream(
+                &self,
+                messages: Vec<ChatMessage>,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+                self.seen_messages
+                    .lock()
+                    .expect("recording provider seen_messages mutex poisoned")
+                    .push(messages);
+                Box::pin(tokio_stream::iter(vec![
+                    StreamEvent::Delta("hook reply".to_string()),
+                    StreamEvent::Done(moltis_agents::model::Usage::default()),
+                ]))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let state: Arc<dyn ChatRuntime> = Arc::new(MockChatRuntime::new());
+        let seen_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::empty();
+        providers.register(
+            moltis_providers::ModelInfo {
+                id: "recording::rewrite".to_string(),
+                provider: "recording".to_string(),
+                display_name: "Recording Rewrite Test".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(RecordingReplyProvider {
+                seen_messages: Arc::clone(&seen_messages),
+            }),
+        );
+
+        let mut hooks = moltis_common::hooks::HookRegistry::new();
+        hooks.register(Arc::new(RewriteMessageReceivedHook));
+
+        let chat = LiveChatService::new(
+            Arc::new(RwLock::new(providers)),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            state,
+            Arc::clone(&store),
+            metadata,
+        )
+        .with_hooks(hooks);
+
+        let send_result = chat
+            .send(serde_json::json!({ "text": "original prompt" }))
+            .await
+            .expect("chat.send should succeed");
+        assert!(
+            send_result
+                .get("runId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        );
+
+        let history = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let messages = store.read("main").await.unwrap_or_default();
+                let has_user = messages.iter().any(|msg| {
+                    msg.get("role").and_then(Value::as_str) == Some("user")
+                        && msg.get("content").and_then(Value::as_str) == Some("sanitized prompt")
+                });
+                let has_assistant = messages.iter().any(|msg| {
+                    msg.get("role").and_then(Value::as_str) == Some("assistant")
+                        && msg.get("content").and_then(Value::as_str) == Some("hook reply")
+                });
+                if has_user && has_assistant {
+                    return messages;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("rewritten user and assistant messages should be persisted");
+
+        assert!(
+            history.iter().any(|msg| {
+                msg.get("role").and_then(Value::as_str) == Some("user")
+                    && msg.get("content").and_then(Value::as_str) == Some("sanitized prompt")
+            }),
+            "session history must persist the rewritten user text"
+        );
+        assert!(
+            !history.iter().any(|msg| {
+                msg.get("role").and_then(Value::as_str) == Some("user")
+                    && msg.get("content").and_then(Value::as_str) == Some("original prompt")
+            }),
+            "original user text must not survive after hook rewrite"
+        );
+
+        let provider_messages = seen_messages
+            .lock()
+            .expect("recording provider seen_messages mutex poisoned")
+            .clone();
+        assert_eq!(
+            provider_messages.len(),
+            1,
+            "provider should receive one turn"
+        );
+        assert!(
+            provider_messages[0].iter().any(|msg| matches!(
+                msg,
+                ChatMessage::User {
+                    content: UserContent::Text(text),
+                } if text == "sanitized prompt"
+            )),
+            "provider input must use the rewritten user text"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_received_hook_modify_preserves_multimodal_images() {
+        struct RewriteMessageReceivedHook;
+
+        #[async_trait]
+        impl moltis_common::hooks::HookHandler for RewriteMessageReceivedHook {
+            fn name(&self) -> &str {
+                "rewrite-message-received"
+            }
+
+            fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+                &[moltis_common::hooks::HookEvent::MessageReceived]
+            }
+
+            async fn handle(
+                &self,
+                _event: moltis_common::hooks::HookEvent,
+                _payload: &moltis_common::hooks::HookPayload,
+            ) -> moltis_common::error::Result<moltis_common::hooks::HookAction> {
+                Ok(moltis_common::hooks::HookAction::ModifyPayload(
+                    serde_json::json!({ "content": "sanitized prompt" }),
+                ))
+            }
+        }
+
+        struct RecordingReplyProvider {
+            seen_messages: Arc<std::sync::Mutex<Vec<Vec<ChatMessage>>>>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for RecordingReplyProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            fn id(&self) -> &str {
+                "recording::rewrite:multimodal"
+            }
+
+            async fn complete(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[Value],
+            ) -> Result<moltis_agents::model::CompletionResponse> {
+                anyhow::bail!("not implemented for test")
+            }
+
+            fn stream(
+                &self,
+                messages: Vec<ChatMessage>,
+            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+                self.seen_messages
+                    .lock()
+                    .expect("recording provider seen_messages mutex poisoned")
+                    .push(messages);
+                Box::pin(tokio_stream::iter(vec![
+                    StreamEvent::Delta("hook reply".to_string()),
+                    StreamEvent::Done(moltis_agents::model::Usage::default()),
+                ]))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let state: Arc<dyn ChatRuntime> = Arc::new(MockChatRuntime::new());
+        let seen_messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut providers = ProviderRegistry::empty();
+        providers.register(
+            moltis_providers::ModelInfo {
+                id: "recording::rewrite:multimodal".to_string(),
+                provider: "recording".to_string(),
+                display_name: "Recording Rewrite Test Multimodal".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(RecordingReplyProvider {
+                seen_messages: Arc::clone(&seen_messages),
+            }),
+        );
+
+        let mut hooks = moltis_common::hooks::HookRegistry::new();
+        hooks.register(Arc::new(RewriteMessageReceivedHook));
+
+        let chat = LiveChatService::new(
+            Arc::new(RwLock::new(providers)),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            state,
+            Arc::clone(&store),
+            metadata,
+        )
+        .with_hooks(hooks);
+
+        let send_result = chat
+            .send(serde_json::json!({
+                "content": [
+                    { "type": "text", "text": "original prompt" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+                ]
+            }))
+            .await
+            .expect("chat.send should succeed");
+        assert!(
+            send_result
+                .get("runId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        );
+
+        let history = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let messages = store.read("main").await.unwrap_or_default();
+                let user_msg = messages
+                    .iter()
+                    .find(|msg| msg.get("role").and_then(Value::as_str) == Some("user"));
+                let has_assistant = messages.iter().any(|msg| {
+                    msg.get("role").and_then(Value::as_str) == Some("assistant")
+                        && msg.get("content").and_then(Value::as_str) == Some("hook reply")
+                });
+                if let Some(user_msg) = user_msg
+                    && user_msg
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|content| content.len() == 2)
+                    && has_assistant
+                {
+                    return messages;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("rewritten multimodal user and assistant messages should be persisted");
+
+        let user_msg = history
+            .iter()
+            .find(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
+            .expect("expected persisted user message");
+        let content = user_msg["content"]
+            .as_array()
+            .expect("expected multimodal user content");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "sanitized prompt");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+
+        let provider_messages = seen_messages
+            .lock()
+            .expect("recording provider seen_messages mutex poisoned")
+            .clone();
+        assert_eq!(
+            provider_messages.len(),
+            1,
+            "provider should receive one multimodal turn"
+        );
+        assert!(
+            provider_messages[0].iter().any(|msg| matches!(
+                msg,
+                ChatMessage::User {
+                    content: UserContent::Multimodal(parts),
+                } if parts.len() == 2
+                    && matches!(&parts[0], ContentPart::Text(text) if text == "sanitized prompt")
+                    && matches!(&parts[1], ContentPart::Image { media_type, data } if media_type == "image/png" && data == "AAAA")
+            )),
+            "provider input must preserve the image while rewriting the text block"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_message_received_hook_block_delivers_reason_to_channel_sender() {
+        struct BlockMessageReceivedHook;
+
+        #[async_trait]
+        impl moltis_common::hooks::HookHandler for BlockMessageReceivedHook {
+            fn name(&self) -> &str {
+                "block-message-received"
+            }
+
+            fn events(&self) -> &[moltis_common::hooks::HookEvent] {
+                &[moltis_common::hooks::HookEvent::MessageReceived]
+            }
+
+            async fn handle(
+                &self,
+                _event: moltis_common::hooks::HookEvent,
+                _payload: &moltis_common::hooks::HookPayload,
+            ) -> moltis_common::error::Result<moltis_common::hooks::HookAction> {
+                Ok(moltis_common::hooks::HookAction::Block(
+                    "rejected by hook".to_string(),
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let text_calls = Arc::new(AtomicUsize::new(0));
+        let suffix_calls = Arc::new(AtomicUsize::new(0));
+        let text_payloads = Arc::new(Mutex::new(Vec::new()));
+        let text_with_suffix_payloads = Arc::new(Mutex::new(Vec::new()));
+        let html_payloads = Arc::new(Mutex::new(Vec::new()));
+        let outbound_impl = Arc::new(RecordingChannelOutbound {
+            text_calls: Arc::clone(&text_calls),
+            suffix_calls: Arc::clone(&suffix_calls),
+            text_payloads: Arc::clone(&text_payloads),
+            text_with_suffix_payloads: Arc::clone(&text_with_suffix_payloads),
+            html_payloads: Arc::clone(&html_payloads),
+        });
+        let runtime = Arc::new(MockChatRuntime::new().with_channel_outbound(outbound_impl));
+        let state: Arc<dyn ChatRuntime> = runtime.clone();
+
+        let mut providers = ProviderRegistry::empty();
+        providers.register(
+            moltis_providers::ModelInfo {
+                id: "block-test-model".to_string(),
+                provider: "test".to_string(),
+                display_name: "Block Test Model".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(StaticProvider {
+                name: "test".to_string(),
+                id: "block-test-model".to_string(),
+            }),
+        );
+
+        let mut hooks = moltis_common::hooks::HookRegistry::new();
+        hooks.register(Arc::new(BlockMessageReceivedHook));
+
+        let chat = LiveChatService::new(
+            Arc::new(RwLock::new(providers)),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            state,
+            Arc::clone(&store),
+            metadata,
+        )
+        .with_hooks(hooks);
+
+        let target = moltis_channels::ChannelReplyTarget {
+            channel_type: moltis_channels::ChannelType::Telegram,
+            account_id: "acct".to_string(),
+            chat_id: "123".to_string(),
+            message_id: Some("42".to_string()),
+            thread_id: None,
+        };
+
+        let result = chat
+            .send(serde_json::json!({
+                "text": "please reject this",
+                "_channel_reply_target": serde_json::to_value(&target).expect("serialize reply target"),
+            }))
+            .await
+            .expect("chat.send should return a rejection payload");
+
+        assert_eq!(result["ok"], false);
+        assert_eq!(text_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(suffix_calls.load(Ordering::SeqCst), 0);
+        assert!(html_payloads.lock().await.is_empty());
+        assert!(text_with_suffix_payloads.lock().await.is_empty());
+        assert_eq!(text_payloads.lock().await.clone(), vec![
+            "⚠️ Message rejected: rejected by hook".to_string()
+        ]);
+        assert!(
+            runtime.peek_channel_replies("main").await.is_empty(),
+            "channel targets should be drained after delivering the rejection"
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_sh_bypasses_provider_and_executes_directly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
@@ -9897,7 +11865,7 @@ mod tests {
         let providers = Arc::new(RwLock::new(ProviderRegistry::empty()));
         let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
         let calls = Arc::new(AtomicUsize::new(0));
-        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let commands = Arc::new(StdMutex::new(Vec::new()));
 
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockExecTool {
@@ -9966,6 +11934,8 @@ mod tests {
                 provider: "test".to_string(),
                 display_name: "Auto Compact Test".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             Arc::new(AutoCompactRegressionProvider {
                 context_window: 100,
@@ -10025,15 +11995,16 @@ mod tests {
         .expect("assistant reply should be persisted");
 
         assert_eq!(history.len(), 3);
-        assert_eq!(
-            history[0].get("role").and_then(Value::as_str),
-            Some("assistant")
-        );
+        // Compacted summary must be a user message so that strict providers
+        // (e.g. llama.cpp) don't reject the history for having an assistant
+        // message without a preceding user message, and so the summary stays
+        // in the conversation turn array for the Responses API.  See #501.
+        assert_eq!(history[0].get("role").and_then(Value::as_str), Some("user"));
         assert!(
             history[0]
                 .get("content")
                 .and_then(Value::as_str)
-                .is_some_and(|content| content.starts_with("[Conversation Summary]\n\nsummary"))
+                .is_some_and(|content| content.starts_with("[Conversation Summary]\n\n"))
         );
         assert_eq!(history[1].get("role").and_then(Value::as_str), Some("user"));
         assert_eq!(
@@ -10045,6 +12016,72 @@ mod tests {
         assert!(
             main_history.is_empty(),
             "auto-compact should not touch the default web session"
+        );
+    }
+
+    /// Regression test for GitHub issue #501: compaction must produce a user
+    /// message, not an assistant message, so that strict providers (llama.cpp)
+    /// don't reject the history for having an orphan assistant turn, and the
+    /// summary stays in the conversation turn array for the Responses API.
+    #[tokio::test]
+    async fn compact_session_produces_user_role() {
+        use moltis_agents::model::values_to_chat_messages;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+
+        let session_key = "test::compact-role";
+
+        // Seed a minimal conversation.
+        store
+            .append(
+                session_key,
+                &serde_json::json!({ "role": "user", "content": "Hello" }),
+            )
+            .await
+            .expect("seed user msg");
+        store
+            .append(
+                session_key,
+                &serde_json::json!({ "role": "assistant", "content": "Hi there!" }),
+            )
+            .await
+            .expect("seed assistant msg");
+
+        let compaction_config = moltis_config::CompactionConfig::default();
+        compact_session(&store, session_key, &compaction_config, None)
+            .await
+            .expect("compact_session should succeed");
+
+        let history = store.read(session_key).await.expect("read compacted");
+        assert_eq!(
+            history.len(),
+            1,
+            "compaction should leave exactly one message"
+        );
+
+        // The compacted message must be a user message.
+        assert_eq!(
+            history[0].get("role").and_then(Value::as_str),
+            Some("user"),
+            "compacted summary must use user role, not assistant (issue #501)"
+        );
+        assert!(
+            history[0]
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.starts_with("[Conversation Summary]")),
+        );
+
+        // Verify the compacted history converts to a User ChatMessage.
+        let chat_msgs = values_to_chat_messages(&history);
+        assert!(
+            !chat_msgs.is_empty(),
+            "compacted history should convert to at least one ChatMessage"
+        );
+        assert!(
+            matches!(chat_msgs[0], ChatMessage::User { .. }),
+            "first ChatMessage after compaction must be User (issue #501)"
         );
     }
 
@@ -10063,6 +12100,128 @@ mod tests {
         });
         let msg = format_channel_error_message(&error_obj);
         assert_eq!(msg, "⚠️ Rate limited: Please wait and try again.");
+    }
+
+    #[test]
+    fn compute_auto_compact_threshold_honors_configured_fraction() {
+        // Default: 0.95 × 200K = 190K. Matches the pre-PR-#653 trigger.
+        assert_eq!(compute_auto_compact_threshold(200_000, 0.95), 190_000);
+        // Aggressive: 0.5 × 200K = 100K, catching auto-compact earlier.
+        assert_eq!(compute_auto_compact_threshold(200_000, 0.5), 100_000);
+    }
+
+    #[test]
+    fn compute_auto_compact_threshold_clamps_out_of_range_values() {
+        // Below 0.1 clamps to 0.1 so a typo like 0.01 doesn't drown the
+        // session in compactions on every single message.
+        assert_eq!(compute_auto_compact_threshold(100_000, 0.01), 10_000);
+        // Above 0.95 clamps to 0.95 so auto-compact can never be silently
+        // disabled by `threshold_percent = 1.0`.
+        assert_eq!(compute_auto_compact_threshold(100_000, 1.0), 95_000);
+    }
+
+    #[test]
+    fn compute_auto_compact_threshold_floors_at_one_for_zero_context_window() {
+        // A zero-token context window (shouldn't happen in practice) must
+        // still produce a non-zero threshold so the `>=` check in send()
+        // doesn't trigger on every message, or on none.
+        assert_eq!(compute_auto_compact_threshold(0, 0.75), 1);
+    }
+
+    #[test]
+    fn format_channel_error_message_falls_back_to_message_rejected_shape() {
+        let error_obj = serde_json::json!({
+            "type": "message_rejected",
+            "message": "rejected by hook",
+        });
+        let msg = format_channel_error_message(&error_obj);
+        assert_eq!(msg, "⚠️ Message rejected: rejected by hook");
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_zero_tokens_for_deterministic_mode() {
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::Deterministic,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let msg = format_channel_compaction_notice(&outcome, true);
+        assert!(msg.contains("🧹 Conversation compacted"));
+        assert!(msg.contains("Mode: Deterministic"));
+        assert!(msg.contains("No LLM tokens used"));
+        assert!(msg.contains("chat.compaction.mode"));
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_shows_token_breakdown_for_llm_modes() {
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::Structured,
+            input_tokens: 1_234,
+            output_tokens: 567,
+        };
+        let msg = format_channel_compaction_notice(&outcome, true);
+        assert!(msg.contains("Mode: Structured"));
+        assert!(
+            msg.contains("Used 1801 tokens (1234 in + 567 out)"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_surfaces_recency_preserving_fallback_honestly() {
+        // When Structured falls back to RecencyPreserving, the outcome's
+        // effective_mode reports what actually ran. The channel notice
+        // should show that the user's requested strategy didn't run AND
+        // label the zero-token line with the actual mode, not a
+        // hardcoded "deterministic strategy" string.
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::RecencyPreserving,
+            input_tokens: 0,
+            output_tokens: 0,
+        };
+        let msg = format_channel_compaction_notice(&outcome, true);
+        assert!(msg.contains("Mode: Recency preserving"));
+        assert!(
+            msg.contains("No LLM tokens used (recency preserving strategy)"),
+            "token line should name the effective mode, got: {msg}"
+        );
+        assert!(
+            !msg.contains("deterministic strategy"),
+            "token line must not hardcode 'deterministic strategy', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_channel_compaction_notice_omits_settings_hint_when_disabled() {
+        // Users who have set `chat.compaction.show_settings_hint = false`
+        // should still see the mode and token info but not the repetitive
+        // "Change chat.compaction.mode in moltis.toml…" footer.
+        let outcome = compaction_run::CompactionOutcome {
+            history: vec![],
+            effective_mode: moltis_config::CompactionMode::Structured,
+            input_tokens: 1_000,
+            output_tokens: 500,
+        };
+        let msg = format_channel_compaction_notice(&outcome, false);
+        assert!(
+            msg.contains("Mode: Structured"),
+            "mode still present: {msg}"
+        );
+        assert!(
+            msg.contains("Used 1500 tokens"),
+            "token line still present: {msg}"
+        );
+        assert!(
+            !msg.contains("chat.compaction.mode"),
+            "settings hint must be stripped, got: {msg}"
+        );
+        assert!(
+            !msg.contains("docs.moltis.org"),
+            "docs URL must be stripped too, got: {msg}"
+        );
     }
 
     #[test]
@@ -10746,7 +12905,11 @@ mod tests {
         cfg.tools.policy.profile = Some("full".into());
         cfg.tools.policy.deny = vec!["exec".into()];
 
-        let policy = effective_tool_policy(&cfg);
+        let ctx = PolicyContext {
+            agent_id: "main".into(),
+            ..Default::default()
+        };
+        let policy = resolve_effective_policy(&cfg, &ctx);
         assert!(!policy.is_allowed("exec"));
         assert!(policy.is_allowed("web_fetch"));
     }
@@ -10777,7 +12940,11 @@ mod tests {
             ..Default::default()
         }];
 
-        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        let ctx = PolicyContext {
+            agent_id: "main".into(),
+            ..Default::default()
+        };
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false, &ctx);
         assert!(filtered.get("exec").is_some());
         assert!(filtered.get("web_fetch").is_some());
         assert!(filtered.get("create_skill").is_some());
@@ -10804,7 +12971,11 @@ mod tests {
             ..Default::default()
         }];
 
-        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false);
+        let ctx = PolicyContext {
+            agent_id: "main".into(),
+            ..Default::default()
+        };
+        let filtered = apply_runtime_tool_filters(&registry, &cfg, &skills, false, &ctx);
         assert!(filtered.get("create_skill").is_some());
         assert!(filtered.get("web_fetch").is_some());
     }
@@ -10816,18 +12987,24 @@ mod tests {
             provider: "openai-codex".into(),
             display_name: "GPT 5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let m2 = moltis_providers::ModelInfo {
             id: "anthropic::claude-opus-4-5".into(),
             provider: "anthropic".into(),
             display_name: "Claude Opus 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-opus-4-5"),
         };
         let m3 = moltis_providers::ModelInfo {
             id: "google::gemini-3-flash".into(),
             provider: "gemini".into(),
             display_name: "Gemini 3 Flash".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gemini-3-flash"),
         };
 
         let order =
@@ -10845,18 +13022,24 @@ mod tests {
             provider: "openai-codex".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let m2 = moltis_providers::ModelInfo {
             id: "anthropic::claude-sonnet-4-5-20250929".into(),
             provider: "anthropic".into(),
             display_name: "Claude Sonnet 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-sonnet-4-5-20250929"),
         };
         let m3 = moltis_providers::ModelInfo {
             id: "google::gemini-3-flash".into(),
             provider: "gemini".into(),
             display_name: "Gemini 3 Flash".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gemini-3-flash"),
         };
 
         let order =
@@ -10874,18 +13057,24 @@ mod tests {
             provider: "openai".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let m2 = moltis_providers::ModelInfo {
             id: "openai-codex::gpt-5.2".into(),
             provider: "openai-codex".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let m3 = moltis_providers::ModelInfo {
             id: "anthropic::claude-sonnet-4-5-20250929".into(),
             provider: "anthropic".into(),
             display_name: "Claude Sonnet 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-sonnet-4-5-20250929"),
         };
 
         let order = LiveModelService::build_priority_order(&[]);
@@ -10904,12 +13093,16 @@ mod tests {
             provider: "openai".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let m2 = moltis_providers::ModelInfo {
             id: "openai-codex::gpt-5.2".into(),
             provider: "openai-codex".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
 
         let order = LiveModelService::build_priority_order(&["openai::gpt-5.2".into()]);
@@ -10925,18 +13118,24 @@ mod tests {
             provider: "anthropic".into(),
             display_name: "Claude Opus 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-opus-4-5"),
         };
         let m2 = moltis_providers::ModelInfo {
             id: "openai-codex::gpt-5.2".into(),
             provider: "openai-codex".into(),
             display_name: "GPT 5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let m3 = moltis_providers::ModelInfo {
             id: "google::gemini-3-flash".into(),
             provider: "google".into(),
             display_name: "Gemini 3 Flash".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gemini-3-flash"),
         };
 
         let patterns: Vec<String> = vec!["opus".into()];
@@ -10952,6 +13151,8 @@ mod tests {
             provider: "anthropic".into(),
             display_name: "Claude Opus 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-opus-4-5"),
         };
         assert!(model_matches_allowlist(&m, &[]));
     }
@@ -10963,6 +13164,8 @@ mod tests {
             provider: "anthropic".into(),
             display_name: "Claude Opus 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-opus-4-5"),
         };
 
         // Uppercase pattern matches lowercase model key.
@@ -10981,6 +13184,8 @@ mod tests {
             provider: "openai-codex".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
 
         let patterns = vec![normalize_model_key("gpt 5.2")];
@@ -10997,12 +13202,16 @@ mod tests {
             provider: "openai".into(),
             display_name: "GPT-5.2".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
         };
         let extended = moltis_providers::ModelInfo {
             id: "openai::gpt-5.2-chat-latest".into(),
             provider: "openai".into(),
             display_name: "GPT-5.2 Chat Latest".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2-chat-latest"),
         };
         let patterns = vec![normalize_model_key("gpt 5.2")];
 
@@ -11017,6 +13226,8 @@ mod tests {
             provider: "anthropic".into(),
             display_name: "Claude Sonnet 4.5".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("claude-sonnet-4-5"),
         };
         let patterns = vec![normalize_model_key("sonnet 4.5")];
 
@@ -11030,12 +13241,16 @@ mod tests {
             provider: "local-llm".into(),
             display_name: "Qwen2.5 Coder 7B".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("qwen2.5-coder-7b-q4_k_m"),
         };
         let ollama = moltis_providers::ModelInfo {
             id: "ollama::llama3.1:8b".into(),
             provider: "ollama".into(),
             display_name: "Llama 3.1 8B".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("llama3.1:8b"),
         };
         let patterns = vec![normalize_model_key("opus")];
 
@@ -11050,6 +13265,8 @@ mod tests {
             provider: "local-ai".into(),
             display_name: "Llama 3.1 8B".into(),
             created_at: None,
+            recommended: false,
+            capabilities: moltis_providers::ModelCapabilities::infer("llama3.1:8b"),
         };
         let patterns = vec![normalize_model_key("opus")];
 
@@ -11069,6 +13286,8 @@ mod tests {
                 provider: "anthropic".to_string(),
                 display_name: "Claude Opus 4.5".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("claude-opus-4-5"),
             },
             Arc::new(StaticProvider {
                 name: "anthropic".to_string(),
@@ -11081,6 +13300,8 @@ mod tests {
                 provider: "openai-codex".to_string(),
                 display_name: "GPT 5.2".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
             },
             Arc::new(StaticProvider {
                 name: "openai-codex".to_string(),
@@ -11093,6 +13314,8 @@ mod tests {
                 provider: "google".to_string(),
                 display_name: "Gemini 3 Flash".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("gemini-3-flash"),
             },
             Arc::new(StaticProvider {
                 name: "google".to_string(),
@@ -11105,12 +13328,12 @@ mod tests {
 
         let result = service.list().await.unwrap();
         let arr = result.as_array().unwrap();
-        // 3 base models + 3 reasoning variants for claude-opus-4-5 = 6
-        assert_eq!(arr.len(), 6);
+        // 3 base models + 3×3 reasoning variants (claude-opus-4-5, gpt-5.2, gemini-3-flash) = 12
+        assert_eq!(arr.len(), 12);
 
         let result = service.list_all().await.unwrap();
         let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 6);
+        assert_eq!(arr.len(), 12);
 
         // Verify reasoning variants are present with correct display names.
         let ids: Vec<&str> = arr.iter().filter_map(|m| m["id"].as_str()).collect();
@@ -11125,17 +13348,41 @@ mod tests {
             high["displayName"].as_str().unwrap(),
             "Claude Opus 4.5 (high reasoning)"
         );
+
+        // Verify capabilities are surfaced in JSON responses.
+        let claude = arr
+            .iter()
+            .find(|m| m["id"].as_str() == Some("anthropic::claude-opus-4-5"))
+            .unwrap();
+        assert_eq!(claude["supportsTools"].as_bool(), Some(true));
+        assert_eq!(claude["supportsVision"].as_bool(), Some(true));
+        assert_eq!(claude["supportsReasoning"].as_bool(), Some(true));
+
+        let gpt = arr
+            .iter()
+            .find(|m| m["id"].as_str() == Some("openai-codex::gpt-5.2"))
+            .unwrap();
+        assert_eq!(gpt["supportsReasoning"].as_bool(), Some(true));
     }
 
     #[tokio::test]
     async fn list_includes_created_at_in_response() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let recent_gpt = now - 10 * 24 * 60 * 60; // 10 days ago
+        let recent_babbage = now - 30 * 24 * 60 * 60; // 30 days ago
+
         let mut registry = ProviderRegistry::empty();
         registry.register(
             moltis_providers::ModelInfo {
                 id: "openai::gpt-5.3".to_string(),
                 provider: "openai".to_string(),
                 display_name: "GPT-5.3".to_string(),
-                created_at: Some(1700000000),
+                created_at: Some(recent_gpt),
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.3"),
             },
             Arc::new(StaticProvider {
                 name: "openai".to_string(),
@@ -11147,7 +13394,9 @@ mod tests {
                 id: "openai::babbage-002".to_string(),
                 provider: "openai".to_string(),
                 display_name: "babbage-002".to_string(),
-                created_at: Some(1600000000),
+                created_at: Some(recent_babbage),
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("babbage-002"),
             },
             Arc::new(StaticProvider {
                 name: "openai".to_string(),
@@ -11160,6 +13409,8 @@ mod tests {
                 provider: "anthropic".to_string(),
                 display_name: "Claude Opus".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("claude-opus"),
             },
             Arc::new(StaticProvider {
                 name: "anthropic".to_string(),
@@ -11172,17 +13423,18 @@ mod tests {
 
         let result = service.list().await.unwrap();
         let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
+        // 3 base models + 3 reasoning variants for gpt-5.3 = 6
+        assert_eq!(arr.len(), 6);
 
         // Verify createdAt is present and correct.
         let gpt = arr.iter().find(|m| m["id"] == "openai::gpt-5.3").unwrap();
-        assert_eq!(gpt["createdAt"], 1700000000);
+        assert_eq!(gpt["createdAt"], recent_gpt);
 
         let babbage = arr
             .iter()
             .find(|m| m["id"] == "openai::babbage-002")
             .unwrap();
-        assert_eq!(babbage["createdAt"], 1600000000);
+        assert_eq!(babbage["createdAt"], recent_babbage);
 
         let claude = arr
             .iter()
@@ -11197,7 +13449,7 @@ mod tests {
             .iter()
             .find(|m| m["id"] == "openai::gpt-5.3")
             .unwrap();
-        assert_eq!(gpt_all["createdAt"], 1700000000);
+        assert_eq!(gpt_all["createdAt"], recent_gpt);
     }
 
     #[tokio::test]
@@ -11209,6 +13461,8 @@ mod tests {
                 provider: "openai-codex".to_string(),
                 display_name: "GPT 5.2".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2"),
             },
             Arc::new(StaticProvider {
                 name: "openai-codex".to_string(),
@@ -11221,6 +13475,8 @@ mod tests {
                 provider: "local-ai".to_string(),
                 display_name: "Llama 3.1 8B".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("llama3.1:8b"),
             },
             Arc::new(StaticProvider {
                 name: "ollama".to_string(),
@@ -11233,7 +13489,8 @@ mod tests {
 
         let result = service.list().await.unwrap();
         let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
+        // 2 base models + 3 reasoning variants for gpt-5.2 = 5
+        assert_eq!(arr.len(), 5);
         assert!(
             arr.iter()
                 .any(|m| m.get("id").and_then(|v| v.as_str()) == Some("local-ai::llama3.1:8b"))
@@ -11241,7 +13498,7 @@ mod tests {
 
         let result = service.list_all().await.unwrap();
         let arr = result.as_array().unwrap();
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 5);
         assert!(
             arr.iter()
                 .any(|m| m.get("id").and_then(|v| v.as_str()) == Some("local-ai::llama3.1:8b"))
@@ -11319,6 +13576,8 @@ mod tests {
                 provider: "unit-test-provider".to_string(),
                 display_name: "Unit Test Model".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             Arc::new(StaticProvider {
                 name: "unit-test-provider".to_string(),
@@ -11351,6 +13610,11 @@ mod tests {
             all_entry.get("disabled").and_then(|v| v.as_bool()),
             Some(true)
         );
+        assert_eq!(
+            all_entry.get("preferred").and_then(|v| v.as_bool()),
+            Some(false),
+            "list_all should include preferred field",
+        );
 
         let visible = service.list().await.expect("models.list should succeed");
         let visible_models = visible
@@ -11362,6 +13626,122 @@ mod tests {
                 .all(|m| m.get("id").and_then(|v| v.as_str())
                     != Some("unit-test-provider::unit-test-model")),
             "disabled model should be hidden from models.list",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_hides_legacy_models_by_default() {
+        let mut registry = ProviderRegistry::empty();
+        let two_years_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - 2 * 365 * 24 * 60 * 60;
+        let recent = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - 30 * 24 * 60 * 60;
+
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "old-model".to_string(),
+                provider: "test".to_string(),
+                display_name: "Old Model".to_string(),
+                created_at: Some(two_years_ago),
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(StaticProvider {
+                name: "test".to_string(),
+                id: "old-model".to_string(),
+            }),
+        );
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "new-model".to_string(),
+                provider: "test".to_string(),
+                display_name: "New Model".to_string(),
+                created_at: Some(recent),
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(StaticProvider {
+                name: "test".to_string(),
+                id: "new-model".to_string(),
+            }),
+        );
+
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+        let service = LiveModelService::new(Arc::new(RwLock::new(registry)), disabled, vec![]);
+
+        let result = service.list().await.expect("models.list should succeed");
+        let models = result.as_array().expect("should be array");
+        let ids: Vec<_> = models
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            ids.contains(&"test::new-model"),
+            "recent model should be visible",
+        );
+        assert!(
+            !ids.contains(&"test::old-model"),
+            "legacy model should be hidden from chat selector",
+        );
+
+        // list_all still shows everything
+        let all = service.list_all().await.expect("list_all should succeed");
+        let all_ids: Vec<_> = all
+            .as_array()
+            .expect("should be array")
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            all_ids.contains(&"test::old-model"),
+            "legacy model should still appear in list_all",
+        );
+    }
+
+    #[tokio::test]
+    async fn list_shows_legacy_models_when_configured() {
+        let mut registry = ProviderRegistry::empty();
+        let two_years_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+            - 2 * 365 * 24 * 60 * 60;
+
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "old-model".to_string(),
+                provider: "test".to_string(),
+                display_name: "Old Model".to_string(),
+                created_at: Some(two_years_ago),
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(StaticProvider {
+                name: "test".to_string(),
+                id: "old-model".to_string(),
+            }),
+        );
+
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+        let service = LiveModelService::new(Arc::new(RwLock::new(registry)), disabled, vec![])
+            .with_show_legacy_models(true);
+
+        let result = service.list().await.expect("models.list should succeed");
+        let ids: Vec<_> = result
+            .as_array()
+            .expect("should be array")
+            .iter()
+            .filter_map(|m| m.get("id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            ids.contains(&"test::old-model"),
+            "legacy model should be visible when show_legacy_models is true",
         );
     }
 
@@ -11425,6 +13805,8 @@ mod tests {
                 provider: "openai".to_string(),
                 display_name: "GPT 5.2 Codex".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("gpt-5.2-codex"),
             },
             Arc::new(StaticProvider {
                 name: "openai".to_string(),
@@ -11437,6 +13819,8 @@ mod tests {
                 provider: "openai".to_string(),
                 display_name: "GPT 5".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::infer("gpt-5"),
             },
             Arc::new(StaticProvider {
                 name: "openai".to_string(),
@@ -11496,6 +13880,8 @@ mod tests {
                 provider: "test-provider".to_string(),
                 display_name: "Test Model".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             Arc::new(StaticProvider {
                 name: "test-provider".to_string(),
@@ -11533,9 +13919,31 @@ mod tests {
     #[test]
     fn to_user_content_text_only() {
         let mc = MessageContent::Text("hello".to_string());
-        let uc = to_user_content(&mc);
+        let uc = to_user_content(&mc, &[]);
         match uc {
             UserContent::Text(t) => assert_eq!(t, "hello"),
+            _ => panic!("expected Text variant"),
+        }
+    }
+
+    #[test]
+    fn to_user_content_text_appends_document_context() {
+        let mc = MessageContent::Text("please review".to_string());
+        let documents = vec![UserDocument {
+            display_name: "report.pdf".to_string(),
+            stored_filename: "abc_report.pdf".to_string(),
+            mime_type: "application/pdf".to_string(),
+            media_ref: "media/session_abc/abc_report.pdf".to_string(),
+            absolute_path: Some("/tmp/session_abc/abc_report.pdf".to_string()),
+        }];
+        let uc = to_user_content(&mc, &documents);
+        match uc {
+            UserContent::Text(t) => {
+                assert!(t.contains("please review"));
+                assert!(t.contains("[Inbound documents available]"));
+                assert!(t.contains("filename: report.pdf"));
+                assert!(t.contains("local_path: /tmp/session_abc/abc_report.pdf"));
+            },
             _ => panic!("expected Text variant"),
         }
     }
@@ -11554,7 +13962,7 @@ mod tests {
                 },
             },
         ]);
-        let uc = to_user_content(&mc);
+        let uc = to_user_content(&mc, &[]);
         match uc {
             UserContent::Multimodal(parts) => {
                 assert_eq!(parts.len(), 2);
@@ -11588,7 +13996,7 @@ mod tests {
                 },
             },
         ]);
-        let uc = to_user_content(&mc);
+        let uc = to_user_content(&mc, &[]);
         match uc {
             UserContent::Multimodal(parts) => {
                 // The https URL is not a data URI, so it should be dropped
@@ -11600,6 +14008,145 @@ mod tests {
             },
             _ => panic!("expected Multimodal variant"),
         }
+    }
+
+    #[test]
+    fn to_user_content_multimodal_appends_document_context_to_text_block() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let mc = MessageContent::Multimodal(vec![
+            ContentBlock::Text {
+                text: "describe this".to_string(),
+            },
+            ContentBlock::ImageUrl {
+                image_url: SessionImageUrl {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                },
+            },
+        ]);
+        let documents = vec![UserDocument {
+            display_name: "screenshot.png".to_string(),
+            stored_filename: "doc-image-file-id_screenshot.png".to_string(),
+            mime_type: "image/png".to_string(),
+            media_ref: "media/session_abc/doc-image-file-id_screenshot.png".to_string(),
+            absolute_path: Some("/tmp/session_abc/doc-image-file-id_screenshot.png".to_string()),
+        }];
+        let uc = to_user_content(&mc, &documents);
+        match uc {
+            UserContent::Multimodal(parts) => {
+                assert_eq!(parts.len(), 2);
+                match &parts[0] {
+                    ContentPart::Text(t) => {
+                        assert!(t.contains("describe this"));
+                        assert!(t.contains("[Inbound documents available]"));
+                        assert!(t.contains("filename: screenshot.png"));
+                    },
+                    _ => panic!("expected Text part"),
+                }
+            },
+            _ => panic!("expected Multimodal variant"),
+        }
+    }
+
+    #[test]
+    fn rewrite_multimodal_text_blocks_inserts_text_when_missing() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let blocks = vec![ContentBlock::ImageUrl {
+            image_url: SessionImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+            },
+        }];
+
+        let rewritten = rewrite_multimodal_text_blocks(&blocks, "sanitized");
+        assert_eq!(rewritten.len(), 2);
+        assert!(matches!(
+            &rewritten[0],
+            ContentBlock::Text { text } if text == "sanitized"
+        ));
+        assert!(matches!(&rewritten[1], ContentBlock::ImageUrl { .. }));
+    }
+
+    #[test]
+    fn rewrite_multimodal_text_blocks_replaces_first_and_drops_extra_text_blocks() {
+        let blocks = vec![
+            ContentBlock::Text {
+                text: "original".to_string(),
+            },
+            ContentBlock::Text {
+                text: "extra".to_string(),
+            },
+        ];
+
+        let rewritten = rewrite_multimodal_text_blocks(&blocks, "sanitized");
+        assert_eq!(rewritten.len(), 1);
+        assert!(matches!(
+            &rewritten[0],
+            ContentBlock::Text { text } if text == "sanitized"
+        ));
+    }
+
+    #[test]
+    fn apply_message_received_rewrite_updates_text_params() {
+        let mut content = MessageContent::Text("original".to_string());
+        let mut params = serde_json::json!({
+            "text": "original",
+            "content": [{ "type": "text", "text": "stale" }]
+        });
+
+        apply_message_received_rewrite(&mut content, &mut params, "sanitized");
+
+        assert!(matches!(content, MessageContent::Text(ref text) if text == "sanitized"));
+        assert_eq!(params["text"], "sanitized");
+        assert!(params.get("content").is_none());
+    }
+
+    #[test]
+    fn apply_message_received_rewrite_updates_multimodal_params() {
+        use moltis_sessions::message::{ContentBlock, ImageUrl as SessionImageUrl};
+
+        let mut content = MessageContent::Multimodal(vec![
+            ContentBlock::Text {
+                text: "original".to_string(),
+            },
+            ContentBlock::ImageUrl {
+                image_url: SessionImageUrl {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                },
+            },
+        ]);
+        let mut params = serde_json::json!({
+            "text": "original",
+            "message": "legacy",
+            "content": [
+                { "type": "text", "text": "original" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+            ]
+        });
+
+        apply_message_received_rewrite(&mut content, &mut params, "sanitized");
+
+        match content {
+            MessageContent::Multimodal(blocks) => {
+                assert_eq!(blocks.len(), 2);
+                assert!(matches!(
+                    &blocks[0],
+                    ContentBlock::Text { text } if text == "sanitized"
+                ));
+                assert!(matches!(&blocks[1], ContentBlock::ImageUrl { .. }));
+            },
+            _ => panic!("expected multimodal content"),
+        }
+        assert!(params.get("text").is_none());
+        assert!(params.get("message").is_none());
+        let content_blocks = params["content"]
+            .as_array()
+            .expect("expected serialized multimodal content");
+        assert_eq!(content_blocks[0]["text"], "sanitized");
+        assert_eq!(
+            content_blocks[1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
+        );
     }
 
     // ── Logbook formatting tests ─────────────────────────────────────────
@@ -11781,6 +14328,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_agent_memory_target_for_mode_rejects_disallowed_paths() {
+        assert!(
+            validate_agent_memory_target_for_mode(AgentMemoryWriteMode::PromptOnly, "MEMORY.md")
+                .is_ok()
+        );
+        assert!(
+            validate_agent_memory_target_for_mode(
+                AgentMemoryWriteMode::PromptOnly,
+                "memory/daily.md"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_agent_memory_target_for_mode(
+                AgentMemoryWriteMode::SearchOnly,
+                "memory/daily.md"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_agent_memory_target_for_mode(AgentMemoryWriteMode::SearchOnly, "MEMORY.md")
+                .is_err()
+        );
+        assert!(
+            validate_agent_memory_target_for_mode(AgentMemoryWriteMode::Off, "MEMORY.md").is_err()
+        );
+    }
+
+    #[test]
     fn path_in_agent_memory_scope_is_isolated_per_agent() {
         let ops_workspace = moltis_config::agent_workspace_dir("ops");
         let ops_memory = ops_workspace.join("memory").join("daily.md");
@@ -11790,6 +14366,672 @@ mod tests {
         let root_memory = moltis_config::data_dir().join("memory").join("root.md");
         assert!(is_path_in_agent_memory_scope(&root_memory, "main"));
         assert!(!is_path_in_agent_memory_scope(&root_memory, "ops"));
+    }
+
+    #[test]
+    fn load_prompt_persona_for_agent_uses_agent_scoped_memory_files() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("MEMORY.md"), "root memory").unwrap();
+        let ops_dir = dir.path().join("agents").join("ops");
+        std::fs::create_dir_all(&ops_dir).unwrap();
+        std::fs::write(ops_dir.join("MEMORY.md"), "ops memory").unwrap();
+
+        let main_persona = load_prompt_persona_for_agent("main");
+        assert_eq!(main_persona.memory_text.as_deref(), Some("root memory"));
+        assert_eq!(
+            main_persona.memory_status.mode,
+            PromptMemoryMode::LiveReload
+        );
+        assert_eq!(
+            main_persona.memory_status.file_source,
+            Some(moltis_config::WorkspaceMarkdownSource::RootWorkspace)
+        );
+
+        let ops_persona = load_prompt_persona_for_agent("ops");
+        assert_eq!(ops_persona.memory_text.as_deref(), Some("ops memory"));
+        assert_eq!(
+            ops_persona.memory_status.file_source,
+            Some(moltis_config::WorkspaceMarkdownSource::AgentWorkspace)
+        );
+
+        moltis_config::clear_data_dir();
+        moltis_config::clear_config_dir();
+    }
+
+    #[test]
+    fn load_prompt_persona_for_agent_reloads_memory_between_calls() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+
+        std::fs::write(dir.path().join("MEMORY.md"), "first memory").unwrap();
+        let first = load_prompt_persona_for_agent("main");
+        assert_eq!(first.memory_text.as_deref(), Some("first memory"));
+
+        std::fs::write(dir.path().join("MEMORY.md"), "second memory").unwrap();
+        let second = load_prompt_persona_for_agent("main");
+        assert_eq!(second.memory_text.as_deref(), Some("second memory"));
+
+        moltis_config::clear_data_dir();
+        moltis_config::clear_config_dir();
+    }
+
+    #[test]
+    fn load_prompt_persona_for_agent_prompt_only_keeps_prompt_memory() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), Some("prompt-only"), None);
+
+        std::fs::write(dir.path().join("MEMORY.md"), "prompt memory").unwrap();
+
+        let persona = load_prompt_persona_for_agent("main");
+        assert_eq!(persona.memory_text.as_deref(), Some("prompt memory"));
+        assert_eq!(persona.memory_status.style, MemoryStyle::PromptOnly);
+        assert!(persona.memory_status.present);
+
+        moltis_config::clear_data_dir();
+        moltis_config::clear_config_dir();
+    }
+
+    #[test]
+    fn load_prompt_persona_for_agent_search_only_omits_prompt_memory() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), Some("search-only"), None);
+
+        std::fs::write(dir.path().join("MEMORY.md"), "hidden memory").unwrap();
+
+        let persona = load_prompt_persona_for_agent("main");
+        assert_eq!(persona.memory_text, None);
+        assert_eq!(persona.memory_status.style, MemoryStyle::SearchOnly);
+        assert!(!persona.memory_status.present);
+
+        moltis_config::clear_data_dir();
+        moltis_config::clear_config_dir();
+    }
+
+    #[test]
+    fn load_prompt_persona_for_agent_off_omits_prompt_memory() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), Some("off"), None);
+
+        std::fs::write(dir.path().join("MEMORY.md"), "hidden memory").unwrap();
+
+        let persona = load_prompt_persona_for_agent("main");
+        assert_eq!(persona.memory_text, None);
+        assert_eq!(persona.memory_status.style, MemoryStyle::Off);
+        assert!(!persona.memory_status.present);
+
+        moltis_config::clear_data_dir();
+        moltis_config::clear_config_dir();
+    }
+
+    #[tokio::test]
+    async fn install_agent_scoped_memory_tools_respects_memory_style() {
+        let manager = test_memory_manager().await;
+        let runtime: moltis_memory::runtime::DynMemoryRuntime = manager;
+
+        for (style, expected_tools) in [
+            (MemoryStyle::Hybrid, vec![
+                "memory_get",
+                "memory_save",
+                "memory_search",
+            ]),
+            (MemoryStyle::SearchOnly, vec![
+                "memory_get",
+                "memory_save",
+                "memory_search",
+            ]),
+            (MemoryStyle::PromptOnly, Vec::new()),
+            (MemoryStyle::Off, Vec::new()),
+        ] {
+            let mut registry = ToolRegistry::new();
+            registry.register(Box::new(DummyTool {
+                name: "memory_search".to_string(),
+            }));
+            registry.register(Box::new(DummyTool {
+                name: "memory_get".to_string(),
+            }));
+            registry.register(Box::new(DummyTool {
+                name: "memory_save".to_string(),
+            }));
+            registry.register(Box::new(DummyTool {
+                name: "echo_tool".to_string(),
+            }));
+
+            install_agent_scoped_memory_tools(
+                &mut registry,
+                &runtime,
+                "ops",
+                style,
+                AgentMemoryWriteMode::Hybrid,
+            );
+
+            assert_eq!(registry.list_names(), {
+                let mut names = expected_tools
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                names.push("echo_tool".to_string());
+                names.sort();
+                names
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn install_agent_scoped_memory_tools_hides_save_when_write_mode_is_off() {
+        let manager = test_memory_manager().await;
+        let runtime: moltis_memory::runtime::DynMemoryRuntime = manager;
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(DummyTool {
+            name: "memory_search".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "memory_get".to_string(),
+        }));
+        registry.register(Box::new(DummyTool {
+            name: "memory_save".to_string(),
+        }));
+
+        install_agent_scoped_memory_tools(
+            &mut registry,
+            &runtime,
+            "ops",
+            MemoryStyle::Hybrid,
+            AgentMemoryWriteMode::Off,
+        );
+
+        assert_eq!(registry.list_names(), vec![
+            "memory_get".to_string(),
+            "memory_search".to_string()
+        ]);
+    }
+
+    fn session_entry_for_agent(session_key: &str, agent_id: &str) -> SessionEntry {
+        let mut entry = make_session_entry_with_binding(None);
+        entry.key = session_key.to_string();
+        entry.agent_id = Some(agent_id.to_string());
+        entry
+    }
+
+    fn write_prompt_memory_config(config_dir: &Path, style: Option<&str>, mode: Option<&str>) {
+        write_memory_behavior_config(config_dir, style, mode, None);
+    }
+
+    fn write_memory_behavior_config(
+        config_dir: &Path,
+        style: Option<&str>,
+        mode: Option<&str>,
+        agent_write_mode: Option<&str>,
+    ) {
+        std::fs::create_dir_all(config_dir).expect("config dir");
+        let mut config = String::new();
+        if let Some(mode) = mode {
+            config.push_str("[chat]\n");
+            config.push_str(&format!("prompt_memory_mode = \"{mode}\"\n"));
+        }
+        if style.is_some() || agent_write_mode.is_some() {
+            if !config.is_empty() {
+                config.push('\n');
+            }
+            config.push_str("[memory]\n");
+            if let Some(style) = style {
+                config.push_str(&format!("style = \"{style}\"\n"));
+            }
+            if let Some(agent_write_mode) = agent_write_mode {
+                config.push_str(&format!("agent_write_mode = \"{agent_write_mode}\"\n"));
+            }
+        }
+        std::fs::write(config_dir.join("moltis.toml"), config).expect("write config");
+    }
+
+    async fn test_memory_manager() -> Arc<moltis_memory::manager::MemoryManager> {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("connect memory db");
+        run_migrations(&pool).await.expect("run memory migrations");
+        Arc::new(moltis_memory::manager::MemoryManager::keyword_only(
+            MemoryConfig::default(),
+            Box::new(SqliteMemoryStore::new(pool)),
+        ))
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_prompt_persona_for_session_freezes_memory_at_session_start() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("frozen-at-session-start"));
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let state_store = SessionStateStore::new(sqlite_pool().await);
+        let entry = session_entry_for_agent("session-a", "main");
+        let first =
+            load_prompt_persona_for_session("session-a", Some(&entry), Some(&state_store)).await;
+        assert_eq!(first.memory_text.as_deref(), Some("first memory"));
+        assert_eq!(
+            first.memory_status.mode,
+            PromptMemoryMode::FrozenAtSessionStart
+        );
+        assert!(first.memory_status.snapshot_active);
+        let expected_path = data_dir
+            .path()
+            .join("MEMORY.md")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            first.memory_status.path.as_deref(),
+            Some(expected_path.as_str())
+        );
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "second memory").unwrap();
+        let second =
+            load_prompt_persona_for_session("session-a", Some(&entry), Some(&state_store)).await;
+        assert_eq!(second.memory_text.as_deref(), Some("first memory"));
+        assert!(second.memory_status.snapshot_active);
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_prompt_persona_for_session_frozen_mode_isolated_between_sessions() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("frozen-at-session-start"));
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let state_store = SessionStateStore::new(sqlite_pool().await);
+        let session_a = session_entry_for_agent("session-a", "main");
+        let first =
+            load_prompt_persona_for_session("session-a", Some(&session_a), Some(&state_store))
+                .await;
+        assert_eq!(first.memory_text.as_deref(), Some("first memory"));
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "second memory").unwrap();
+        let session_b = session_entry_for_agent("session-b", "main");
+        let second =
+            load_prompt_persona_for_session("session-b", Some(&session_b), Some(&state_store))
+                .await;
+        assert_eq!(second.memory_text.as_deref(), Some("second memory"));
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_prompt_persona_for_session_frozen_mode_scopes_snapshots_by_agent() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("frozen-at-session-start"));
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "root memory").unwrap();
+        let ops_dir = data_dir.path().join("agents").join("ops");
+        std::fs::create_dir_all(&ops_dir).unwrap();
+        std::fs::write(ops_dir.join("MEMORY.md"), "ops memory").unwrap();
+
+        let state_store = SessionStateStore::new(sqlite_pool().await);
+        let main_entry = session_entry_for_agent("session-a", "main");
+        let ops_entry = session_entry_for_agent("session-a", "ops");
+
+        let main =
+            load_prompt_persona_for_session("session-a", Some(&main_entry), Some(&state_store))
+                .await;
+        let ops =
+            load_prompt_persona_for_session("session-a", Some(&ops_entry), Some(&state_store))
+                .await;
+        assert_eq!(main.memory_text.as_deref(), Some("root memory"));
+        assert_eq!(ops.memory_text.as_deref(), Some("ops memory"));
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "root memory v2").unwrap();
+        std::fs::write(ops_dir.join("MEMORY.md"), "ops memory v2").unwrap();
+
+        let main_again =
+            load_prompt_persona_for_session("session-a", Some(&main_entry), Some(&state_store))
+                .await;
+        let ops_again =
+            load_prompt_persona_for_session("session-a", Some(&ops_entry), Some(&state_store))
+                .await;
+        assert_eq!(main_again.memory_text.as_deref(), Some("root memory"));
+        assert_eq!(ops_again.memory_text.as_deref(), Some("ops memory"));
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_prompt_persona_for_session_live_reload_reads_latest_memory() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("live-reload"));
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let state_store = SessionStateStore::new(sqlite_pool().await);
+        let entry = session_entry_for_agent("session-a", "main");
+        let first =
+            load_prompt_persona_for_session("session-a", Some(&entry), Some(&state_store)).await;
+        assert_eq!(first.memory_text.as_deref(), Some("first memory"));
+        assert_eq!(first.memory_status.mode, PromptMemoryMode::LiveReload);
+        assert!(!first.memory_status.snapshot_active);
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "second memory").unwrap();
+        let second =
+            load_prompt_persona_for_session("session-a", Some(&entry), Some(&state_store)).await;
+        assert_eq!(second.memory_text.as_deref(), Some("second memory"));
+        assert!(!second.memory_status.snapshot_active);
+        assert_eq!(
+            state_store
+                .get(
+                    "session-a",
+                    PROMPT_MEMORY_NAMESPACE,
+                    &prompt_memory_snapshot_key("main"),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn load_prompt_persona_for_session_search_only_skips_frozen_snapshot() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(
+            config_dir.path(),
+            Some("search-only"),
+            Some("frozen-at-session-start"),
+        );
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let state_store = SessionStateStore::new(sqlite_pool().await);
+        let entry = session_entry_for_agent("session-a", "main");
+        let persona =
+            load_prompt_persona_for_session("session-a", Some(&entry), Some(&state_store)).await;
+        assert_eq!(persona.memory_text, None);
+        assert_eq!(persona.memory_status.style, MemoryStyle::SearchOnly);
+        assert!(!persona.memory_status.present);
+        assert!(!persona.memory_status.snapshot_active);
+        assert_eq!(
+            state_store
+                .get(
+                    "session-a",
+                    PROMPT_MEMORY_NAMESPACE,
+                    &prompt_memory_snapshot_key("main"),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn memory_save_defaults_to_notes_file_in_search_only_write_mode() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_memory_behavior_config(config_dir.path(), None, None, Some("search-only"));
+
+        let manager = test_memory_manager().await;
+        let runtime: moltis_memory::runtime::DynMemoryRuntime = manager;
+        let tool = AgentScopedMemorySaveTool::new(
+            runtime,
+            "ops".to_string(),
+            AgentMemoryWriteMode::SearchOnly,
+        );
+
+        let result = tool
+            .execute(serde_json::json!({ "content": "search-only memory" }))
+            .await
+            .expect("memory_save should succeed");
+        assert_eq!(result["path"].as_str(), Some("memory/notes.md"));
+        let saved =
+            std::fs::read_to_string(data_dir.path().join("agents/ops/memory/notes.md")).unwrap();
+        assert_eq!(saved, "search-only memory");
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    async fn memory_save_rejects_memory_md_in_search_only_write_mode() {
+        let manager = test_memory_manager().await;
+        let runtime: moltis_memory::runtime::DynMemoryRuntime = manager;
+        let tool = AgentScopedMemorySaveTool::new(
+            runtime,
+            "ops".to_string(),
+            AgentMemoryWriteMode::SearchOnly,
+        );
+
+        let error = tool
+            .execute(serde_json::json!({
+                "content": "should fail",
+                "file": "MEMORY.md",
+            }))
+            .await
+            .expect_err("search-only mode should reject MEMORY.md");
+        assert!(error.to_string().contains("search-only"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn context_reports_prompt_memory_status() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("frozen-at-session-start"));
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let session_store = Arc::new(SessionStore::new(data_dir.path().join("sessions")));
+        let metadata = Arc::new(SqliteSessionMetadata::new(sqlite_pool().await));
+        let state_store = Arc::new(SessionStateStore::new(sqlite_pool().await));
+        let service = LiveChatService::new(
+            Arc::new(RwLock::new(ProviderRegistry::empty())),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            Arc::new(MockChatRuntime::new()),
+            session_store,
+            metadata,
+        )
+        .with_session_state_store(Arc::clone(&state_store));
+
+        let result = service
+            .context(serde_json::json!({ "sessionKey": "session-a" }))
+            .await
+            .expect("chat.context should succeed");
+
+        assert_eq!(
+            result["promptMemory"]["mode"].as_str(),
+            Some("frozen-at-session-start")
+        );
+        assert_eq!(result["promptMemory"]["style"].as_str(), Some("hybrid"));
+        assert_eq!(result["promptMemory"]["writeMode"].as_str(), Some("hybrid"));
+        assert_eq!(
+            result["promptMemory"]["snapshotActive"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(result["promptMemory"]["present"].as_bool(), Some(true));
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_prompt_memory_rebuilds_frozen_snapshot() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("frozen-at-session-start"));
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let session_store = Arc::new(SessionStore::new(data_dir.path().join("sessions")));
+        let metadata = Arc::new(SqliteSessionMetadata::new(sqlite_pool().await));
+        let state_store = Arc::new(SessionStateStore::new(sqlite_pool().await));
+        let service = LiveChatService::new(
+            Arc::new(RwLock::new(ProviderRegistry::empty())),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            Arc::new(MockChatRuntime::new()),
+            session_store,
+            metadata,
+        )
+        .with_session_state_store(Arc::clone(&state_store));
+
+        let first_context = service
+            .context(serde_json::json!({ "sessionKey": "session-a" }))
+            .await
+            .expect("chat.context should succeed");
+        assert_eq!(
+            first_context["promptMemory"]["chars"].as_u64(),
+            Some("first memory".chars().count() as u64)
+        );
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "second memory").unwrap();
+
+        let refresh_result = service
+            .refresh_prompt_memory(serde_json::json!({ "sessionKey": "session-a" }))
+            .await
+            .expect("chat.prompt_memory.refresh should succeed");
+        assert_eq!(refresh_result["snapshotCleared"].as_bool(), Some(true));
+        assert_eq!(
+            refresh_result["promptMemory"]["chars"].as_u64(),
+            Some("second memory".chars().count() as u64)
+        );
+        assert!(
+            state_store
+                .get(
+                    "session-a",
+                    PROMPT_MEMORY_NAMESPACE,
+                    &prompt_memory_snapshot_key("main"),
+                )
+                .await
+                .unwrap()
+                .as_deref()
+                .is_some()
+        );
+
+        let second_context = service
+            .context(serde_json::json!({ "sessionKey": "session-a" }))
+            .await
+            .expect("chat.context should succeed");
+        assert_eq!(
+            second_context["promptMemory"]["chars"].as_u64(),
+            Some("second memory".chars().count() as u64)
+        );
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn refresh_prompt_memory_in_live_mode_does_not_require_snapshot() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().expect("data dir lock");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        let config_dir = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(data_dir.path().to_path_buf());
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+        write_prompt_memory_config(config_dir.path(), None, Some("live-reload"));
+        std::fs::write(data_dir.path().join("MEMORY.md"), "first memory").unwrap();
+
+        let session_store = Arc::new(SessionStore::new(data_dir.path().join("sessions")));
+        let metadata = Arc::new(SqliteSessionMetadata::new(sqlite_pool().await));
+        let state_store = Arc::new(SessionStateStore::new(sqlite_pool().await));
+        let service = LiveChatService::new(
+            Arc::new(RwLock::new(ProviderRegistry::empty())),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            Arc::new(MockChatRuntime::new()),
+            session_store,
+            metadata,
+        )
+        .with_session_state_store(Arc::clone(&state_store));
+
+        let _ = service
+            .context(serde_json::json!({ "sessionKey": "session-a" }))
+            .await
+            .expect("chat.context should succeed");
+
+        std::fs::write(data_dir.path().join("MEMORY.md"), "second memory").unwrap();
+        let refresh_result = service
+            .refresh_prompt_memory(serde_json::json!({ "sessionKey": "session-a" }))
+            .await
+            .expect("chat.prompt_memory.refresh should succeed");
+        assert_eq!(refresh_result["snapshotCleared"].as_bool(), Some(false));
+        assert_eq!(
+            refresh_result["promptMemory"]["mode"].as_str(),
+            Some("live-reload")
+        );
+        assert_eq!(
+            refresh_result["promptMemory"]["chars"].as_u64(),
+            Some("second memory".chars().count() as u64)
+        );
+        assert_eq!(
+            state_store
+                .get(
+                    "session-a",
+                    PROMPT_MEMORY_NAMESPACE,
+                    &prompt_memory_snapshot_key("main"),
+                )
+                .await
+                .unwrap(),
+            None
+        );
+
+        moltis_config::clear_config_dir();
+        moltis_config::clear_data_dir();
     }
 
     // ── active_session_keys tests ───────────────────────────────────────
@@ -11863,6 +15105,170 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["active"], false);
+    }
+
+    #[tokio::test]
+    async fn history_prefers_public_session_key_over_connection_active_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        store
+            .append(
+                "public-session",
+                &serde_json::json!({ "role": "assistant", "content": "public history" }),
+            )
+            .await
+            .expect("seed public session history");
+        store
+            .append(
+                "conn-session",
+                &serde_json::json!({ "role": "assistant", "content": "connection history" }),
+            )
+            .await
+            .expect("seed connection session history");
+
+        let service = LiveChatService::new(
+            Arc::new(RwLock::new(ProviderRegistry::empty())),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            Arc::new(MockChatRuntime::new().with_active_session("conn-1", "conn-session")),
+            Arc::clone(&store),
+            metadata,
+        );
+
+        let history = service
+            .history(serde_json::json!({
+                "sessionKey": "public-session",
+                "_conn_id": "conn-1",
+            }))
+            .await
+            .expect("chat.history should succeed");
+
+        assert_eq!(history.as_array().map(Vec::len), Some(1));
+        assert_eq!(history[0]["content"], "public history");
+    }
+
+    #[tokio::test]
+    async fn history_internal_session_key_overrides_public_session_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        store
+            .append(
+                "internal-session",
+                &serde_json::json!({ "role": "assistant", "content": "internal history" }),
+            )
+            .await
+            .expect("seed internal session history");
+        store
+            .append(
+                "public-session",
+                &serde_json::json!({ "role": "assistant", "content": "public history" }),
+            )
+            .await
+            .expect("seed public session history");
+
+        let service = LiveChatService::new(
+            Arc::new(RwLock::new(ProviderRegistry::empty())),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            Arc::new(MockChatRuntime::new()),
+            Arc::clone(&store),
+            metadata,
+        );
+
+        let history = service
+            .history(serde_json::json!({
+                "_session_key": "internal-session",
+                "sessionKey": "public-session",
+            }))
+            .await
+            .expect("chat.history should succeed");
+
+        assert_eq!(history.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            history[0]["content"], "internal history",
+            "_session_key must take priority over public sessionKey"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_prefers_public_session_key_over_connection_active_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(SessionStore::new(dir.path().to_path_buf()));
+        let pool = sqlite_pool().await;
+        let metadata = Arc::new(SqliteSessionMetadata::new(pool));
+
+        let mut providers = ProviderRegistry::empty();
+        providers.register(
+            moltis_providers::ModelInfo {
+                id: "test::auto-compact".to_string(),
+                provider: "test".to_string(),
+                display_name: "Auto Compact Test".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(AutoCompactRegressionProvider {
+                context_window: 100,
+            }),
+        );
+
+        let chat = LiveChatService::new(
+            Arc::new(RwLock::new(providers)),
+            Arc::new(RwLock::new(DisabledModelsStore::default())),
+            Arc::new(MockChatRuntime::new().with_active_session("conn-1", "conn-session")),
+            Arc::clone(&store),
+            metadata,
+        );
+
+        let send_result = chat
+            .send(serde_json::json!({
+                "text": "ping",
+                "sessionKey": "public-session",
+                "_conn_id": "conn-1",
+            }))
+            .await
+            .expect("chat.send should succeed");
+        assert!(
+            send_result
+                .get("runId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        );
+
+        let public_history = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let messages = store.read("public-session").await.unwrap_or_default();
+                if messages
+                    .iter()
+                    .any(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant"))
+                {
+                    return messages;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("assistant turn should be persisted in public session");
+
+        let conn_history = store
+            .read("conn-session")
+            .await
+            .expect("read connection session history");
+
+        assert!(
+            public_history
+                .iter()
+                .any(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant")),
+            "assistant reply should be written to the public session"
+        );
+        assert!(
+            conn_history.is_empty(),
+            "connection-scoped active session should not override an explicit public sessionKey"
+        );
     }
 
     #[tokio::test]
@@ -12041,6 +15447,8 @@ mod tests {
                 provider: "abort-then-continue".to_string(),
                 display_name: "Abort Then Continue".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             provider.clone(),
         );
@@ -12125,6 +15533,8 @@ mod tests {
                 provider: "streaming-text-tool".to_string(),
                 display_name: "Streaming Text Tool".to_string(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             Arc::new(StreamingTextToolProvider),
         );
@@ -12284,5 +15694,326 @@ mod tests {
             mode: Some(ToolMode::Auto),
         };
         assert_eq!(effective_tool_mode(&text), ToolMode::Text);
+    }
+
+    // ── Slow-start provider for model-probe timeout regression tests ────
+
+    /// Provider that delays `startup_delay` before yielding the first token.
+    /// Simulates local LLM servers that need to load a model into memory.
+    struct SlowStartProvider {
+        name: String,
+        id: String,
+        startup_delay: Duration,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowStartProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[Value],
+        ) -> Result<moltis_agents::model::CompletionResponse> {
+            tokio::time::sleep(self.startup_delay).await;
+            Ok(moltis_agents::model::CompletionResponse {
+                text: Some("pong".to_string()),
+                tool_calls: vec![],
+                usage: moltis_agents::model::Usage::default(),
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            let delay = self.startup_delay;
+            Box::pin(async_stream::stream! {
+                tokio::time::sleep(delay).await;
+                yield StreamEvent::Delta("pong".to_string());
+                yield StreamEvent::Done(moltis_agents::model::Usage::default());
+            })
+        }
+    }
+
+    /// Regression test for GitHub issue #514: local LLM servers that need
+    /// time to load a model should not be rejected by the probe timeout.
+    /// The probe timeout is 30 s; a 2 s delay must succeed.
+    #[tokio::test]
+    async fn model_probe_succeeds_with_slow_start_provider() {
+        let mut registry = ProviderRegistry::empty();
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "local::slow-model".to_string(),
+                provider: "local".to_string(),
+                display_name: "Slow Model".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(SlowStartProvider {
+                name: "local".to_string(),
+                id: "local::slow-model".to_string(),
+                startup_delay: Duration::from_secs(2),
+            }),
+        );
+
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+        let service = LiveModelService::new(Arc::new(RwLock::new(registry)), disabled, vec![]);
+
+        let result = service
+            .test(serde_json::json!({ "modelId": "local::slow-model" }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "probe should succeed for slow-start provider: {result:?}"
+        );
+        let payload = result.unwrap();
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["modelId"], "local::slow-model");
+    }
+
+    /// Verify that a truly unreachable provider still produces a timeout error
+    /// (not an infinite hang) after the 30 s limit.
+    /// Uses `start_paused = true` so the 30 s timeout elapses instantly.
+    #[tokio::test(start_paused = true)]
+    async fn model_probe_times_out_for_unresponsive_provider() {
+        let mut registry = ProviderRegistry::empty();
+        registry.register(
+            moltis_providers::ModelInfo {
+                id: "local::stuck-model".to_string(),
+                provider: "local".to_string(),
+                display_name: "Stuck Model".to_string(),
+                created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
+            },
+            Arc::new(SlowStartProvider {
+                name: "local".to_string(),
+                id: "local::stuck-model".to_string(),
+                // Well beyond the 30 s timeout — will trigger the timeout branch.
+                startup_delay: Duration::from_secs(120),
+            }),
+        );
+
+        let disabled = Arc::new(RwLock::new(DisabledModelsStore::default()));
+        let service = LiveModelService::new(Arc::new(RwLock::new(registry)), disabled, vec![]);
+
+        let result = service
+            .test(serde_json::json!({ "modelId": "local::stuck-model" }))
+            .await;
+        assert!(result.is_err(), "probe should fail for stuck provider");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("timed out"),
+            "error should mention timeout: {err}"
+        );
+    }
+
+    // ── compress_summary tests ──────────────────────────────────────────────
+
+    #[test]
+    fn compress_summary_under_budget_returns_unchanged() {
+        let input = "# Summary\n- Key point one\n- Key point two\nDone.";
+        let result = compress_summary(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn compress_summary_strips_blank_lines() {
+        let input = "# Summary\n\n- Point one\n\n- Point two\n\nDone.";
+        let result = compress_summary(input);
+        assert_eq!(result, "# Summary\n- Point one\n- Point two\nDone.");
+    }
+
+    #[test]
+    fn compress_summary_over_char_limit() {
+        let mut lines = vec!["# Summary".to_string()];
+        for i in 0..30 {
+            lines.push(format!(
+                "- This is line {i} with some padding text to make it longer than usual"
+            ));
+        }
+        let input = lines.join("\n");
+        assert!(input.len() > 1_200, "input should exceed 1200 chars");
+
+        let result = compress_summary(&input);
+        assert!(
+            result.len() <= 1_200,
+            "result must be <= 1200 chars, got {}",
+            result.len()
+        );
+        assert!(
+            result.contains("lines omitted"),
+            "should have omission notice"
+        );
+    }
+
+    #[test]
+    fn compress_summary_over_line_count() {
+        let mut lines = vec!["# Summary".to_string()];
+        for i in 0..40 {
+            lines.push(format!("Line {i}"));
+        }
+        let input = lines.join("\n");
+
+        let result = compress_summary(&input);
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert!(
+            result_lines.len() <= 25,
+            "result should be <= 25 lines (24 + notice), got {}",
+            result_lines.len()
+        );
+        assert!(result.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compress_summary_long_line_truncation() {
+        let long_line: String = "x".repeat(200);
+        let input = format!("Header\n{long_line}");
+        let result = compress_summary(&input);
+
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines.len(), 2);
+        // The long line should be truncated to 160 chars.
+        assert!(
+            result_lines[1].len() <= 160,
+            "long line should be <= 160 chars, got {}",
+            result_lines[1].len()
+        );
+    }
+
+    #[test]
+    fn compress_summary_deduplication() {
+        let input = "Alpha\nalpha\nBeta\nBETA\nGamma";
+        let result = compress_summary(input);
+        // Case-insensitive dedup: should keep first occurrence of each.
+        let result_lines: Vec<&str> = result.lines().collect();
+        assert_eq!(result_lines, vec!["Alpha", "Beta", "Gamma"]);
+    }
+
+    #[test]
+    fn compress_summary_header_preservation() {
+        let mut lines = vec!["# Section One".to_string()];
+        for i in 0..30 {
+            lines.push(format!(
+                "Body line {i} with enough text to fill up space here"
+            ));
+        }
+        lines.push("## Section Two".to_string());
+        for i in 0..10 {
+            lines.push(format!("- Bullet {i} important"));
+        }
+        let input = lines.join("\n");
+
+        let result = compress_summary(&input);
+        assert!(
+            result.contains("# Section One"),
+            "headers should be preserved"
+        );
+        assert!(
+            result.contains("## Section Two"),
+            "second header should be preserved"
+        );
+        assert!(result.contains("lines omitted"));
+    }
+
+    #[test]
+    fn compress_summary_empty_input() {
+        assert_eq!(compress_summary(""), "");
+        assert_eq!(compress_summary("   "), "");
+    }
+
+    #[test]
+    fn compress_summary_single_very_long_line() {
+        let long_line = "a".repeat(2_000);
+        let result = compress_summary(&long_line);
+
+        // Should be truncated to 160 chars.
+        assert!(
+            result.len() <= 160,
+            "single long line should be truncated, got {} chars",
+            result.len()
+        );
+    }
+
+    /// Serializes tests that mutate the global `moltis_config` data_dir
+    /// override so they don't race within the chat crate's test binary.
+    /// A `Semaphore` with a single permit is used here instead of
+    /// `Mutex<()>` because CLAUDE.md forbids bare `Mutex<()>` — a mutex must
+    /// guard real state. This semaphore is a pure serialization primitive
+    /// for a separately-owned global (`moltis_config`'s data_dir override).
+    static SKILLS_TEST_DATA_DIR_LOCK: Semaphore = Semaphore::const_new(1);
+
+    /// Regression test for #655: `[skills] enabled = false` must short-circuit
+    /// skill discovery so nothing from the filesystem ends up in the LLM prompt.
+    #[tokio::test]
+    async fn discover_skills_if_enabled_short_circuits_when_disabled() {
+        let _permit = SKILLS_TEST_DATA_DIR_LOCK
+            .acquire()
+            .await
+            .expect("semaphore closed");
+
+        // Point data_dir at a temp dir containing a real SKILL.md so that if
+        // the helper *did* fall through to the discoverer, it would return a
+        // non-empty list and fail this assertion.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills").join("planted-skill");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
+        std::fs::write(
+            skills_dir.join("SKILL.md"),
+            "---\nname: planted-skill\ndescription: should not appear\n---\nbody",
+        )
+        .expect("write");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.skills.enabled = false;
+
+        let result = discover_skills_if_enabled(&cfg).await;
+        moltis_config::clear_data_dir();
+
+        assert!(
+            result.is_empty(),
+            "disabled skills must yield no discovered skills, got: {result:?}",
+        );
+    }
+
+    /// Complement to the short-circuit test: when enabled, the helper actually
+    /// invokes the filesystem discoverer. Validates the other arm of the
+    /// `enabled` branch so we don't accidentally hard-code `Vec::new()`.
+    #[tokio::test]
+    async fn discover_skills_if_enabled_runs_discoverer_when_enabled() {
+        let _permit = SKILLS_TEST_DATA_DIR_LOCK
+            .acquire()
+            .await
+            .expect("semaphore closed");
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_dir = tmp.path().join("skills").join("live-skill");
+        std::fs::create_dir_all(&skills_dir).expect("mkdir");
+        std::fs::write(
+            skills_dir.join("SKILL.md"),
+            "---\nname: live-skill\ndescription: visible to prompt\n---\nbody",
+        )
+        .expect("write");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+
+        let mut cfg = moltis_config::MoltisConfig::default();
+        cfg.skills.enabled = true;
+
+        let result = discover_skills_if_enabled(&cfg).await;
+        moltis_config::clear_data_dir();
+
+        assert!(
+            result.iter().any(|s| s.name == "live-skill"),
+            "enabled skills must be discovered from data_dir, got: {result:?}",
+        );
     }
 }

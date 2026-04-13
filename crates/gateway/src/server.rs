@@ -4,7 +4,7 @@ use std::{
     io::Write,
     net::SocketAddr,
     path::{Path as FsPath, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 
 use secrecy::{ExposeSecret, Secret};
@@ -17,10 +17,11 @@ use moltis_providers::ProviderRegistry;
 
 use moltis_tools::{
     approval::{ApprovalManager, ApprovalMode, SecurityLevel},
+    checkpoints::{CheckpointRestoreTool, CheckpointsListTool},
     exec::EnvVarProvider,
     sessions_communicate::{
         SendToSessionFn, SendToSessionRequest, SessionsHistoryTool, SessionsListTool,
-        SessionsSendTool,
+        SessionsSearchTool, SessionsSendTool,
     },
     sessions_manage::{
         CreateSessionFn, CreateSessionRequest, DeleteSessionFn, DeleteSessionRequest,
@@ -54,6 +55,102 @@ use crate::{
 use crate::tailscale::{
     CliTailscaleManager, TailscaleManager, TailscaleMode, validate_tailscale_config,
 };
+
+#[cfg(feature = "file-watcher")]
+async fn start_skill_hot_reload_watcher() -> anyhow::Result<(
+    moltis_skills::watcher::SkillWatcher,
+    tokio::sync::mpsc::UnboundedReceiver<moltis_skills::watcher::SkillWatchEvent>,
+)> {
+    let watch_specs = tokio::task::spawn_blocking(moltis_skills::watcher::default_watch_specs)
+        .await
+        .map_err(|error| anyhow::anyhow!("skills watcher task failed: {error}"))??;
+
+    moltis_skills::watcher::SkillWatcher::start(watch_specs)
+}
+
+#[cfg(feature = "qmd")]
+fn sanitize_qmd_index_name(root: &FsPath) -> String {
+    let mut sanitized = String::new();
+    let mut previous_was_separator = false;
+    for character in root.to_string_lossy().chars() {
+        let normalized = character.to_ascii_lowercase();
+        if normalized.is_ascii_alphanumeric() {
+            sanitized.push(normalized);
+            previous_was_separator = false;
+        } else if !previous_was_separator {
+            sanitized.push('_');
+            previous_was_separator = true;
+        }
+    }
+    let sanitized = sanitized.trim_matches('_').to_string();
+    if sanitized.is_empty() {
+        "moltis".into()
+    } else {
+        format!("moltis-{sanitized}")
+    }
+}
+
+#[cfg(feature = "qmd")]
+fn build_qmd_collections(
+    data_dir: &FsPath,
+    config: &moltis_config::schema::QmdConfig,
+) -> HashMap<String, moltis_qmd::QmdCollection> {
+    if config.collections.is_empty() {
+        return HashMap::from([
+            ("moltis-root-memory".into(), moltis_qmd::QmdCollection {
+                path: data_dir.to_path_buf(),
+                glob: "MEMORY.md".into(),
+            }),
+            (
+                "moltis-root-memory-lower".into(),
+                moltis_qmd::QmdCollection {
+                    path: data_dir.to_path_buf(),
+                    glob: "memory.md".into(),
+                },
+            ),
+            ("moltis-memory".into(), moltis_qmd::QmdCollection {
+                path: data_dir.join("memory"),
+                glob: "**/*.md".into(),
+            }),
+            ("moltis-agents".into(), moltis_qmd::QmdCollection {
+                path: data_dir.join("agents"),
+                glob: "**/*.md".into(),
+            }),
+        ]);
+    }
+
+    let mut collections = HashMap::new();
+    for (name, collection) in &config.collections {
+        let globs = if collection.globs.is_empty() {
+            vec!["**/*.md".to_string()]
+        } else {
+            collection.globs.clone()
+        };
+
+        for (path_index, path) in collection.paths.iter().enumerate() {
+            let root = FsPath::new(path);
+            let root = if root.is_absolute() {
+                root.to_path_buf()
+            } else {
+                data_dir.join(root)
+            };
+
+            for (glob_index, glob) in globs.iter().enumerate() {
+                let key = if collection.paths.len() == 1 && globs.len() == 1 {
+                    name.clone()
+                } else {
+                    format!("{name}-{path_index}-{glob_index}")
+                };
+                collections.insert(key, moltis_qmd::QmdCollection {
+                    path: root.clone(),
+                    glob: glob.clone(),
+                });
+            }
+        }
+    }
+
+    collections
+}
 
 // ── Location requester ───────────────────────────────────────────────────────
 
@@ -209,8 +306,8 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         outbound
             .send_text(
                 &reply_target.account_id,
-                &reply_target.chat_id,
-                "Please share your location in this chat.",
+                &reply_target.outbound_to(),
+                "Please share your location in this chat, or paste a geo: link / map pin.",
                 None,
             )
             .await
@@ -343,20 +440,6 @@ fn env_value_with_overrides(env_overrides: &HashMap<String, String>, key: &str) 
                 .cloned()
                 .filter(|value| !value.trim().is_empty())
         })
-}
-
-fn merge_env_overrides(
-    base_overrides: &HashMap<String, String>,
-    additional: Vec<(String, String)>,
-) -> HashMap<String, String> {
-    let mut merged = base_overrides.clone();
-    for (key, value) in additional {
-        if key.trim().is_empty() || value.trim().is_empty() {
-            continue;
-        }
-        merged.entry(key).or_insert(value);
-    }
-    merged
 }
 
 fn summarize_model_ids_for_logs(sorted_model_ids: &[String], max_items: usize) -> Vec<String> {
@@ -507,6 +590,18 @@ pub fn approval_manager_from_config(config: &moltis_config::MoltisConfig) -> App
 
     manager.allowlist = config.tools.exec.allowlist.clone();
     manager
+}
+
+#[cfg(feature = "fs-tools")]
+fn fs_tools_host_warning_message(router: &moltis_tools::sandbox::SandboxRouter) -> Option<String> {
+    if router.backend().is_real() {
+        return None;
+    }
+
+    Some(format!(
+        "fs tools are registered but no real sandbox backend is available (backend: {}). Read/Write/Edit/MultiEdit/Glob/Grep will operate on the gateway host directly. Install Docker, Podman, or Apple Container, or disable fs tools via --no-default-features for isolation. If you must run without a container runtime, constrain access with [tools.fs].allow_paths = [...].",
+        router.backend_name()
+    ))
 }
 
 fn env_var_or_unset(name: &str) -> String {
@@ -827,72 +922,129 @@ pub fn start_browser_warmup_after_listener(
     spawn_post_listener_warmups(browser_service, browser_tool);
 }
 
+/// Register a runtime-discovered host in the WebAuthn registry.
+///
+/// Returns a user-facing warning when the host is newly registered and
+/// existing passkeys may need to be re-added for that hostname.
+pub async fn sync_runtime_webauthn_host_and_notice(
+    gateway: &GatewayState,
+    registry: Option<&SharedWebAuthnRegistry>,
+    hostname: Option<&str>,
+    origin_override: Option<&str>,
+    source: &str,
+) -> Option<String> {
+    let hostname = hostname?;
+    let normalized = crate::auth_webauthn::normalize_host(hostname);
+    if normalized.is_empty() {
+        return None;
+    }
+
+    let registry = registry?;
+    if registry.read().await.contains_host(&normalized) {
+        return None;
+    }
+
+    let origin = if let Some(origin_override) = origin_override {
+        origin_override.to_string()
+    } else {
+        let scheme = if gateway.tls_active {
+            "https"
+        } else {
+            "http"
+        };
+        format!("{scheme}://{normalized}:{}", gateway.port)
+    };
+
+    let origin_url = match webauthn_rs::prelude::Url::parse(&origin) {
+        Ok(url) => url,
+        Err(error) => {
+            warn!(
+                host = %normalized,
+                origin = %origin,
+                %error,
+                "invalid runtime WebAuthn origin from {source}"
+            );
+            return None;
+        },
+    };
+    let webauthn = match crate::auth_webauthn::WebAuthnState::new(&normalized, &origin_url, &[]) {
+        Ok(webauthn) => webauthn,
+        Err(error) => {
+            warn!(
+                host = %normalized,
+                origin = %origin,
+                %error,
+                "failed to initialize runtime WebAuthn RP from {source}"
+            );
+            return None;
+        },
+    };
+
+    {
+        let mut reg = registry.write().await;
+        if reg.contains_host(&normalized) {
+            return None;
+        }
+        reg.add(normalized.clone(), webauthn);
+        info!(
+            host = %normalized,
+            origin = %origin,
+            origins = ?reg.get_all_origins(),
+            "WebAuthn RP registered from {source}"
+        );
+    }
+
+    let has_passkeys = if let Some(store) = gateway.credential_store.as_ref() {
+        store.has_passkeys().await.unwrap_or(false)
+    } else {
+        false
+    };
+
+    if has_passkeys {
+        gateway.add_passkey_host_update_pending(&normalized).await;
+        Some(format!(
+            "New host detected ({normalized}). Existing passkeys may not work on this host. Sign in with password, then add a new passkey in Settings > Authentication."
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "tailscale")]
 fn spawn_webauthn_tailscale_registration(
+    gateway: Arc<GatewayState>,
     registry: SharedWebAuthnRegistry,
-    default_scheme: String,
-    port: u16,
 ) {
     tokio::spawn(async move {
         let started = std::time::Instant::now();
         match CliTailscaleManager::new().hostname().await {
             Ok(Some(ts_hostname)) => {
-                let ts_host = crate::auth_webauthn::normalize_host(&ts_hostname);
-                if ts_host.is_empty() {
-                    debug!(
+                let registered = sync_runtime_webauthn_host_and_notice(
+                    &gateway,
+                    Some(&registry),
+                    Some(&ts_hostname),
+                    None,
+                    "tailscale hostname",
+                )
+                .await
+                .is_some()
+                    || registry
+                        .read()
+                        .await
+                        .contains_host(&crate::auth_webauthn::normalize_host(&ts_hostname));
+                if registered {
+                    info!(
+                        hostname = %ts_hostname,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "tailscale hostname is empty, skipping WebAuthn RP registration"
+                        "processed Tailscale WebAuthn hostname"
                     );
-                    return;
-                }
-
-                let ts_origin = format!("{default_scheme}://{ts_host}:{port}");
-                let origin_url = match webauthn_rs::prelude::Url::parse(&ts_origin) {
-                    Ok(origin_url) => origin_url,
-                    Err(error) => {
-                        warn!(
-                            hostname = %ts_hostname,
-                            origin = %ts_origin,
-                            %error,
-                            "invalid Tailscale WebAuthn origin URL"
-                        );
-                        return;
-                    },
-                };
-                let webauthn_state =
-                    match crate::auth_webauthn::WebAuthnState::new(&ts_host, &origin_url, &[]) {
-                        Ok(webauthn_state) => webauthn_state,
-                        Err(error) => {
-                            warn!(
-                                rp_id = %ts_host,
-                                %error,
-                                "failed to initialize Tailscale WebAuthn RP"
-                            );
-                            return;
-                        },
-                    };
-
-                let mut registry = registry.write().await;
-                if registry.contains_host(&ts_host) {
+                } else {
                     debug!(
-                        rp_id = %ts_host,
+                        hostname = %ts_hostname,
                         elapsed_ms = started.elapsed().as_millis(),
-                        "tailscale hostname already registered in WebAuthn registry"
+                        "tailscale hostname did not add a new WebAuthn RP"
                     );
-                    return;
                 }
-
-                registry.add(ts_host.clone(), webauthn_state);
-                let origins = registry.get_all_origins();
-                drop(registry);
-
-                info!(
-                    rp_id = %ts_host,
-                    origin = %ts_origin,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "WebAuthn RP registered from Tailscale hostname"
-                );
-                info!(origins = ?origins, "WebAuthn passkeys origins updated");
             },
             Ok(None) => {
                 debug!(
@@ -1159,6 +1311,10 @@ pub async fn prepare_gateway_core(
 
     // Load config file (moltis.toml / .yaml / .json) if present.
     let mut config = moltis_config::discover_and_load();
+    info!(
+        offered_channels = ?config.channels.offered,
+        "loaded offered channels from config"
+    );
     let config_env_overrides = config.env.clone();
     let instance_slug_value = instance_slug(&config);
     let browser_container_prefix = browser_container_prefix(&instance_slug_value);
@@ -1356,11 +1512,15 @@ pub async fn prepare_gateway_core(
         crate::chat::DisabledModelsStore::load(),
     ));
 
-    let live_model_service = Arc::new(LiveModelService::new(
-        Arc::clone(&registry),
-        Arc::clone(&model_store),
-        config.chat.priority_models.clone(),
-    ));
+    let live_model_service = Arc::new(
+        LiveModelService::new(
+            Arc::clone(&registry),
+            Arc::clone(&model_store),
+            config.chat.priority_models.clone(),
+        )
+        .with_show_legacy_models(config.providers.show_legacy_models)
+        .with_discovery_config(effective_providers.clone(), config_env_overrides.clone()),
+    );
     services = services
         .with_model(Arc::clone(&live_model_service) as Arc<dyn crate::services::ModelService>);
 
@@ -1391,6 +1551,9 @@ pub async fn prepare_gateway_core(
             if !merged.servers.contains_key(name) {
                 let transport = match entry.transport.as_str() {
                     "sse" => moltis_mcp::registry::TransportType::Sse,
+                    "streamable_http" | "streamable-http" | "http" => {
+                        moltis_mcp::registry::TransportType::StreamableHttp
+                    },
                     _ => moltis_mcp::registry::TransportType::Stdio,
                 };
                 let oauth = entry
@@ -1495,6 +1658,7 @@ pub async fn prepare_gateway_core(
         let mut options = SqliteConnectOptions::from_str(&format!("sqlite:{}", db_path.display()))
             .expect("invalid database path")
             .create_if_missing(true)
+            .foreign_keys(true)
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5));
         if !db_exists {
@@ -1529,6 +1693,9 @@ pub async fn prepare_gateway_core(
     moltis_cron::run_migrations(&db_pool)
         .await
         .expect("failed to run cron migrations");
+    moltis_webhooks::run_migrations(&db_pool)
+        .await
+        .expect("failed to run webhooks migrations");
     // Gateway's own tables (auth, message_log, channels).
     crate::run_migrations(&db_pool)
         .await
@@ -1576,7 +1743,9 @@ pub async fn prepare_gateway_core(
     // Runtime env overrides from the settings UI (`/api/env`) layered after
     // config `[env]`. Process env remains highest precedence.
     let runtime_env_overrides = match credential_store.get_all_env_values().await {
-        Ok(db_env_vars) => merge_env_overrides(&config_env_overrides, db_env_vars),
+        Ok(db_env_vars) => {
+            crate::mcp_service::merge_env_overrides(&config_env_overrides, db_env_vars)
+        },
         Err(error) => {
             warn!(%error, "failed to load persisted env overrides from credential store");
             config_env_overrides.clone()
@@ -1586,6 +1755,9 @@ pub async fn prepare_gateway_core(
         .manager()
         .set_env_overrides(runtime_env_overrides.clone())
         .await;
+    // Update model service env overrides with UI-stored API keys so that
+    // "Detect All Models" can discover models from those providers too.
+    *live_model_service.env_overrides_handle().write().await = runtime_env_overrides.clone();
     live_mcp
         .set_credential_store(Arc::clone(&credential_store))
         .await;
@@ -1707,17 +1879,6 @@ pub async fn prepare_gateway_core(
             None
         }
     };
-
-    #[cfg(feature = "tailscale")]
-    if explicit_rp_id.is_none()
-        && let Some(registry) = webauthn_registry.as_ref()
-    {
-        spawn_webauthn_tailscale_registration(
-            Arc::clone(registry),
-            default_scheme.to_string(),
-            port,
-        );
-    }
 
     // If MOLTIS_PASSWORD is set and no password in DB yet, migrate it.
     if let Some(ref pw) = password
@@ -1851,6 +2012,7 @@ pub async fn prepare_gateway_core(
     // Agent turn: run an LLM turn in a session determined by the job's session_target.
     let agent_state = Arc::clone(&deferred_state);
     let agent_events_queue = Arc::clone(&events_queue);
+    let global_auto_prune_containers = config.cron.auto_prune_cron_containers;
     let on_agent_turn: moltis_cron::service::AgentTurnFn = Arc::new(move |req| {
         let st = Arc::clone(&agent_state);
         let eq = Arc::clone(&agent_events_queue);
@@ -1886,6 +2048,7 @@ pub async fn prepare_gateway_core(
                         output: moltis_cron::heartbeat::HEARTBEAT_OK.to_string(),
                         input_tokens: None,
                         output_tokens: None,
+                        session_key: None,
                     });
                 }
             }
@@ -1958,8 +2121,23 @@ pub async fn prepare_gateway_core(
                 .await
                 .map_err(|e| moltis_cron::Error::message(e.to_string()));
 
-            // Clean up sandbox overrides.
-            if let Some(ref router) = state.sandbox_router {
+            // Auto-prune sandbox container if configured (before clearing overrides).
+            let auto_prune = req
+                .sandbox
+                .auto_prune_container
+                .unwrap_or(global_auto_prune_containers);
+            if req.sandbox.enabled && auto_prune {
+                if let Some(ref router) = state.sandbox_router
+                    && let Err(e) = router.cleanup_session(&session_key).await
+                {
+                    tracing::debug!(
+                        session_key = %session_key,
+                        error = %e,
+                        "cron sandbox container cleanup failed"
+                    );
+                }
+            } else if let Some(ref router) = state.sandbox_router {
+                // Just clean up sandbox overrides (not the container).
                 router.remove_override(&session_key).await;
                 router.remove_image_override(&session_key).await;
             }
@@ -1991,6 +2169,7 @@ pub async fn prepare_gateway_core(
                 output: text,
                 input_tokens,
                 output_tokens,
+                session_key: Some(session_key),
             })
         })
     });
@@ -2031,6 +2210,7 @@ pub async fn prepare_gateway_core(
         window_ms: config.cron.rate_limit_window_secs * 1000,
     };
 
+    let cron_store_for_pruning = Arc::clone(&cron_store);
     let cron_service = moltis_cron::service::CronService::with_events_queue(
         cron_store,
         on_system_event,
@@ -2044,6 +2224,21 @@ pub async fn prepare_gateway_core(
     let live_cron = Arc::new(crate::cron::LiveCronService::new(Arc::clone(&cron_service)));
     services = services.with_cron(live_cron);
 
+    // Webhooks
+    let webhook_store_inner: Arc<dyn moltis_webhooks::store::WebhookStore> = Arc::new(
+        moltis_webhooks::store::SqliteWebhookStore::with_pool(db_pool.clone()),
+    );
+    #[cfg(feature = "vault")]
+    let webhook_store: Arc<dyn moltis_webhooks::store::WebhookStore> = Arc::new(
+        crate::webhooks::VaultWebhookStore::new(Arc::clone(&webhook_store_inner), vault.clone()),
+    );
+    #[cfg(not(feature = "vault"))]
+    let webhook_store = webhook_store_inner;
+    let live_webhooks = Arc::new(crate::webhooks::LiveWebhooksService::new(Arc::clone(
+        &webhook_store,
+    )));
+    services = services.with_webhooks(live_webhooks);
+
     // Build sandbox router from config (shared across sessions).
     let mut sandbox_config = moltis_tools::sandbox::SandboxConfig::from(&config.tools.exec.sandbox);
     sandbox_config.container_prefix = Some(sandbox_container_prefix);
@@ -2055,6 +2250,21 @@ pub async fn prepare_gateway_core(
     let sandbox_router = Arc::new(moltis_tools::sandbox::SandboxRouter::new(
         sandbox_config.clone(),
     ));
+
+    // ── Upstream proxy (user-configured) ─────────────────────────────────
+    // Store the URL globally so any crate can build proxied clients, then
+    // initialise the provider shared client before the sandbox proxy.
+    let upstream_proxy = config
+        .upstream_proxy
+        .as_ref()
+        .map(|s| s.expose_secret().as_str());
+    if let Some(url) = upstream_proxy {
+        moltis_common::http_client::set_upstream_proxy(url);
+        // Redact credentials from the log output.
+        let redacted = moltis_common::http_client::redact_proxy_url(url);
+        info!(upstream_proxy = %redacted, "upstream proxy configured for providers and channels");
+    }
+    moltis_providers::init_shared_http_client(upstream_proxy);
 
     // ── Trusted-network proxy + audit ────────────────────────────────────
     #[cfg(feature = "trusted-network")]
@@ -2110,7 +2320,9 @@ pub async fn prepare_gateway_core(
                 network_policy = ?sandbox_config.network,
                 "trusted-network proxy not started (policy is not Trusted)"
             );
-            proxy_url_for_tools = None;
+            // No sandbox proxy — fall through to upstream proxy for tools too.
+            moltis_tools::init_shared_http_client(upstream_proxy);
+            proxy_url_for_tools = upstream_proxy.map(String::from);
             proxy_shutdown_tx = None;
         }
 
@@ -2120,6 +2332,13 @@ pub async fn prepare_gateway_core(
             crate::network_audit::LiveNetworkAuditService::new(audit_rx, audit_log_path, 2048);
         audit_buffer_for_broadcast = Some(audit_service.buffer().clone());
         services = services.with_network_audit(Arc::new(audit_service));
+    }
+
+    // When trusted-network feature is disabled, still initialize the tools
+    // shared client with the upstream proxy.
+    #[cfg(not(feature = "trusted-network"))]
+    {
+        moltis_tools::init_shared_http_client(upstream_proxy);
     }
 
     // Spawn background image pre-build. This bakes configured packages into a
@@ -2139,9 +2358,7 @@ pub async fn prepare_gateway_core(
             let deferred_for_build = Arc::clone(&deferred_state);
             // Mark the build as in-progress so the UI can show a banner
             // even if the WebSocket broadcast fires before the client connects.
-            sandbox_router
-                .building_flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            sandbox_router.building_flag.store(true, Ordering::Relaxed);
             let build_router = Arc::clone(&sandbox_router);
             tokio::spawn(async move {
                 // Broadcast build start event.
@@ -2166,9 +2383,7 @@ pub async fn prepare_gateway_core(
                             "sandbox image pre-build complete"
                         );
                         router.set_global_image(Some(result.tag.clone())).await;
-                        build_router
-                            .building_flag
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        build_router.building_flag.store(false, Ordering::Relaxed);
 
                         if let Some(state) = deferred_for_build.get() {
                             broadcast(
@@ -2191,15 +2406,11 @@ pub async fn prepare_gateway_core(
                         debug!(
                             "sandbox image pre-build: no-op (no packages or unsupported backend)"
                         );
-                        build_router
-                            .building_flag
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        build_router.building_flag.store(false, Ordering::Relaxed);
                     },
                     Err(e) => {
                         tracing::warn!("sandbox image pre-build failed: {e}");
-                        build_router
-                            .building_flag
-                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                        build_router.building_flag.store(false, Ordering::Relaxed);
                         if let Some(state) = deferred_for_build.get() {
                             broadcast(
                                 state,
@@ -2317,6 +2528,75 @@ pub async fn prepare_gateway_core(
         });
     }
 
+    // Periodic cron session retention pruning.
+    if let Some(retention_days) = config.cron.session_retention_days
+        && retention_days > 0
+    {
+        let prune_store = Arc::clone(&cron_store_for_pruning);
+        let prune_session_store = Arc::clone(&session_store);
+        let prune_session_metadata = Arc::clone(&session_metadata);
+        let prune_sandbox = Arc::clone(&sandbox_router);
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(60 * 60); // hourly
+            loop {
+                tokio::time::sleep(interval).await;
+                let retention_ms = time::Duration::days(retention_days as i64)
+                    .whole_milliseconds()
+                    .unsigned_abs() as u64;
+                let cutoff_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let before_ms = cutoff_ms.saturating_sub(retention_ms);
+
+                // Collect session keys from old runs before pruning.
+                // On failure, skip this cycle entirely to avoid orphaning sessions.
+                let session_keys = match prune_store.list_session_keys_before(before_ms).await {
+                    Ok(keys) => keys,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "cron session pruning: failed to list session keys");
+                        continue;
+                    },
+                };
+
+                // Clean up sessions and their sandbox containers.
+                let mut cleaned = 0u64;
+                for key in &session_keys {
+                    // Only prune isolated (UUID) sessions; named sessions are reused.
+                    let suffix = key.strip_prefix("cron:").unwrap_or(key.as_str());
+                    if uuid::Uuid::parse_str(suffix).is_err() {
+                        continue;
+                    }
+                    // Clear session file.
+                    if let Err(e) = prune_session_store.clear(key).await {
+                        tracing::debug!(key, error = %e, "cron prune: failed to clear session");
+                    }
+                    // Remove session metadata.
+                    prune_session_metadata.remove(key).await;
+                    // Clean up sandbox container.
+                    if let Err(e) = prune_sandbox.cleanup_session(key).await {
+                        tracing::debug!(key, error = %e, "cron prune: sandbox cleanup failed");
+                    }
+                    cleaned += 1;
+                }
+
+                // Prune old run records.
+                match prune_store.prune_runs_before(before_ms).await {
+                    Ok(0) => {},
+                    Ok(n) => tracing::info!(
+                        pruned_runs = n,
+                        pruned_sessions = cleaned,
+                        retention_days,
+                        "cron retention: pruned old runs and sessions"
+                    ),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "cron retention: failed to prune runs")
+                    },
+                }
+            }
+        });
+    }
+
     // Pre-pull browser container image if browser is enabled and sandbox mode is available.
     // Browser sandbox mode follows session sandbox mode, so we pre-pull if sandboxing is available.
     // Don't pre-pull if sandbox is disabled (mode = Off).
@@ -2416,6 +2696,17 @@ pub async fn prepare_gateway_core(
             store::ChannelStore,
         };
 
+        #[cfg(feature = "vault")]
+        let channel_store: Arc<dyn ChannelStore> = {
+            let inner: Arc<dyn ChannelStore> = Arc::new(
+                crate::channel_store::SqliteChannelStore::new(db_pool.clone()),
+            );
+            Arc::new(crate::channel_store::VaultChannelStore::new(
+                inner,
+                vault.clone(),
+            ))
+        };
+        #[cfg(not(feature = "vault"))]
         let channel_store: Arc<dyn ChannelStore> = Arc::new(
             crate::channel_store::SqliteChannelStore::new(db_pool.clone()),
         );
@@ -2454,6 +2745,30 @@ pub async fn prepare_gateway_core(
         registry
             .register(discord_plugin as Arc<tokio::sync::RwLock<dyn ChannelPlugin>>)
             .await;
+
+        #[cfg(feature = "matrix")]
+        {
+            let matrix_plugin = Arc::new(tokio::sync::RwLock::new(
+                moltis_matrix::MatrixPlugin::new()
+                    .with_message_log(Arc::clone(&message_log))
+                    .with_event_sink(Arc::clone(&channel_sink)),
+            ));
+            registry
+                .register(matrix_plugin as Arc<tokio::sync::RwLock<dyn ChannelPlugin>>)
+                .await;
+        }
+
+        #[cfg(feature = "nostr")]
+        {
+            let nostr_plugin = Arc::new(tokio::sync::RwLock::new(
+                moltis_nostr::NostrPlugin::new()
+                    .with_message_log(Arc::clone(&message_log))
+                    .with_event_sink(Arc::clone(&channel_sink)),
+            ));
+            registry
+                .register(nostr_plugin as Arc<tokio::sync::RwLock<dyn ChannelPlugin>>)
+                .await;
+        }
 
         #[cfg(feature = "whatsapp")]
         {
@@ -2576,6 +2891,7 @@ pub async fn prepare_gateway_core(
         let router = Arc::new(RegistryOutboundRouter::new(Arc::clone(&registry)));
 
         services = services.with_channel_registry(Arc::clone(&registry));
+        services = services.with_channel_store(Arc::clone(&channel_store));
         let outbound_router = Arc::clone(&router) as Arc<dyn moltis_channels::ChannelOutbound>;
         services = services.with_channel_outbound(Arc::clone(&outbound_router));
         services = services.with_channel_stream_outbound(
@@ -2619,12 +2935,22 @@ pub async fn prepare_gateway_core(
 
     // ── Hook discovery & registration ─────────────────────────────────────
     seed_default_workspace_markdown_files();
+    warn_on_workspace_prompt_file_truncation();
     seed_example_skill();
     seed_example_hook();
-    seed_dcg_guard_hook();
+    seed_dcg_guard_hook().await;
     let persisted_disabled = crate::methods::load_disabled_hooks();
     let (hook_registry, discovered_hooks_info) =
         discover_and_build_hooks(&persisted_disabled, Some(&session_store)).await;
+
+    #[cfg(feature = "fs-tools")]
+    let shared_fs_state = if config.tools.fs.track_reads {
+        Some(moltis_tools::fs::new_fs_state(
+            config.tools.fs.must_read_before_write,
+        ))
+    } else {
+        None
+    };
 
     // Wire live session service with sandbox router, project store, hooks, and browser.
     {
@@ -2637,6 +2963,10 @@ pub async fn prepare_gateway_core(
                 .with_project_store(Arc::clone(&project_store))
                 .with_state_store(Arc::clone(&session_state_store))
                 .with_browser_service(Arc::clone(&services.browser));
+        #[cfg(feature = "fs-tools")]
+        if let Some(ref fs_state) = shared_fs_state {
+            session_svc = session_svc.with_fs_state(Arc::clone(fs_state));
+        }
         if let Some(ref hooks) = hook_registry {
             session_svc = session_svc.with_hooks(Arc::clone(hooks));
         }
@@ -2644,7 +2974,7 @@ pub async fn prepare_gateway_core(
     }
 
     // ── Memory system initialization ─────────────────────────────────────
-    let memory_manager: Option<Arc<moltis_memory::manager::MemoryManager>> = {
+    let memory_manager: Option<moltis_memory::runtime::DynMemoryRuntime> = {
         // Build embedding provider(s) for the fallback chain.
         let mut embedding_providers: Vec<(
             String,
@@ -2657,9 +2987,9 @@ pub async fn prepare_gateway_core(
             info!("memory: RAG disabled via memory.disable_rag=true, using keyword-only search");
         } else {
             // 1. If user explicitly configured an embedding provider, use it.
-            if let Some(ref provider_name) = mem_cfg.provider {
-                match provider_name.as_str() {
-                    "local" => {
+            if let Some(provider) = mem_cfg.provider {
+                match provider {
+                    moltis_config::MemoryProvider::Local => {
                         // Local GGUF embeddings require the `local-embeddings` feature on moltis-memory.
                         #[cfg(feature = "local-embeddings")]
                         {
@@ -2691,14 +3021,16 @@ pub async fn prepare_gateway_core(
                             "memory: 'local' embedding provider requires the 'local-embeddings' feature"
                         );
                     },
-                    "ollama" | "custom" | "openai" => {
-                        let base_url = mem_cfg.base_url.clone().unwrap_or_else(|| {
-                            match provider_name.as_str() {
-                                "ollama" => "http://localhost:11434".into(),
-                                _ => "https://api.openai.com".into(),
-                            }
+                    moltis_config::MemoryProvider::Ollama
+                    | moltis_config::MemoryProvider::Custom
+                    | moltis_config::MemoryProvider::OpenAi => {
+                        let base_url = mem_cfg.base_url.clone().unwrap_or_else(|| match provider {
+                            moltis_config::MemoryProvider::Ollama => {
+                                "http://localhost:11434".into()
+                            },
+                            _ => "https://api.openai.com".into(),
                         });
-                        if provider_name == "ollama" {
+                        if provider == moltis_config::MemoryProvider::Ollama {
                             let model = mem_cfg.model.as_deref().unwrap_or("nomic-embed-text");
                             ensure_ollama_model(&base_url, model).await;
                         }
@@ -2719,9 +3051,14 @@ pub async fn prepare_gateway_core(
                             // Use a sensible default dims; the API returns the actual dims.
                             e = e.with_model(model.clone(), 1536);
                         }
-                        embedding_providers.push((provider_name.clone(), Box::new(e)));
+                        let provider_name = match provider {
+                            moltis_config::MemoryProvider::Ollama => "ollama",
+                            moltis_config::MemoryProvider::Custom => "custom",
+                            moltis_config::MemoryProvider::OpenAi => "openai",
+                            moltis_config::MemoryProvider::Local => "local",
+                        };
+                        embedding_providers.push((provider_name.to_owned(), Box::new(e)));
                     },
-                    other => warn!("memory: unknown embedding provider '{other}'"),
                 }
             }
 
@@ -2845,7 +3182,22 @@ pub async fn prepare_gateway_core(
                     let data_memory_sub = data_dir.join("memory");
                     let agents_root = data_dir.join("agents");
 
-                    let config = moltis_memory::config::MemoryConfig {
+                    if let Err(error) = std::fs::create_dir_all(&data_memory_sub) {
+                        tracing::warn!(
+                            path = %data_memory_sub.display(),
+                            error = %error,
+                            "memory: failed to create memory directory"
+                        );
+                    }
+                    if let Err(error) = std::fs::create_dir_all(&agents_root) {
+                        tracing::warn!(
+                            path = %agents_root.display(),
+                            error = %error,
+                            "memory: failed to create agents directory"
+                        );
+                    }
+
+                    let memory_runtime_config = moltis_memory::config::MemoryConfig {
                         db_path: memory_db_path.to_string_lossy().into(),
                         data_dir: Some(data_dir.clone()),
                         memory_dirs: vec![
@@ -2856,34 +3208,94 @@ pub async fn prepare_gateway_core(
                             // remain indexed across periodic full syncs.
                             agents_root,
                         ],
+                        citations: match mem_cfg.citations {
+                            moltis_config::MemoryCitationsMode::On => {
+                                moltis_memory::config::CitationMode::On
+                            },
+                            moltis_config::MemoryCitationsMode::Off => {
+                                moltis_memory::config::CitationMode::Off
+                            },
+                            moltis_config::MemoryCitationsMode::Auto => {
+                                moltis_memory::config::CitationMode::Auto
+                            },
+                        },
+                        llm_reranking: mem_cfg.llm_reranking,
+                        merge_strategy: match mem_cfg.search_merge_strategy {
+                            moltis_config::MemorySearchMergeStrategy::Rrf => {
+                                moltis_memory::config::MergeStrategy::Rrf
+                            },
+                            moltis_config::MemorySearchMergeStrategy::Linear => {
+                                moltis_memory::config::MergeStrategy::Linear
+                            },
+                        },
                         ..Default::default()
                     };
 
                     let store = Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(
                         memory_pool,
                     ));
-                    // Map file entries to their parent directory so that
-                    // root-level files like MEMORY.md are covered by the
-                    // watcher. Deduplicate via BTreeSet to avoid watching
-                    // the same directory twice.
-                    let watch_dirs: Vec<_> = config
-                        .memory_dirs
-                        .iter()
-                        .map(|p| {
-                            if p.is_dir() {
-                                p.clone()
-                            } else {
-                                p.parent().unwrap_or(p.as_path()).to_path_buf()
-                            }
-                        })
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
-                        .collect();
-                    let manager = Arc::new(if let Some(embedder) = embedder {
-                        moltis_memory::manager::MemoryManager::new(config, store, embedder)
+                    let memory_dirs_for_watch = memory_runtime_config.memory_dirs.clone();
+                    let builtin_manager = Arc::new(if let Some(embedder) = embedder {
+                        moltis_memory::manager::MemoryManager::new(
+                            memory_runtime_config,
+                            store,
+                            embedder,
+                        )
                     } else {
-                        moltis_memory::manager::MemoryManager::keyword_only(config, store)
+                        moltis_memory::manager::MemoryManager::keyword_only(
+                            memory_runtime_config,
+                            store,
+                        )
                     });
+                    let manager: moltis_memory::runtime::DynMemoryRuntime = match mem_cfg.backend {
+                        moltis_config::MemoryBackend::Builtin => builtin_manager.clone(),
+                        moltis_config::MemoryBackend::Qmd => {
+                            #[cfg(feature = "qmd")]
+                            {
+                                let qmd_manager = Arc::new(moltis_qmd::QmdManager::new(
+                                    moltis_qmd::QmdManagerConfig {
+                                        command: mem_cfg
+                                            .qmd
+                                            .command
+                                            .clone()
+                                            .unwrap_or_else(|| "qmd".into()),
+                                        collections: build_qmd_collections(&data_dir, &mem_cfg.qmd),
+                                        max_results: mem_cfg.qmd.max_results.unwrap_or(20),
+                                        timeout_ms: mem_cfg.qmd.timeout_ms.unwrap_or(30_000),
+                                        work_dir: data_dir.clone(),
+                                        index_name: sanitize_qmd_index_name(&data_dir),
+                                        env_overrides: HashMap::new(),
+                                    },
+                                ));
+
+                                if qmd_manager.is_available().await {
+                                    info!(
+                                        index = %qmd_manager.index_name(),
+                                        collections = qmd_manager.collections().len(),
+                                        "memory: using QMD backend"
+                                    );
+                                    Arc::new(moltis_qmd::QmdMemoryRuntime::new(
+                                        qmd_manager,
+                                        builtin_manager.clone(),
+                                        mem_cfg.disable_rag,
+                                    ))
+                                } else {
+                                    warn!(
+                                        "memory: QMD backend requested but qmd is unavailable, falling back to builtin memory"
+                                    );
+                                    builtin_manager.clone()
+                                }
+                            }
+
+                            #[cfg(not(feature = "qmd"))]
+                            {
+                                warn!(
+                                    "memory: QMD backend requested but the gateway was built without the qmd feature, falling back to builtin memory"
+                                );
+                                builtin_manager.clone()
+                            }
+                        },
+                    };
 
                     // Initial sync + periodic re-sync (15min with watcher, 5min without).
                     let sync_manager = Arc::clone(&manager);
@@ -2917,7 +3329,9 @@ pub async fn prepare_gateway_core(
                         #[cfg(feature = "file-watcher")]
                         {
                             let watcher_manager = Arc::clone(&sync_manager);
-                            match moltis_memory::watcher::MemoryFileWatcher::start(watch_dirs) {
+                            let watch_specs =
+                                moltis_memory::watcher::build_watch_specs(&memory_dirs_for_watch);
+                            match moltis_memory::watcher::MemoryFileWatcher::start(watch_specs) {
                                 Ok((_watcher, mut rx)) => {
                                     info!("memory: file watcher started");
                                     tokio::spawn(async move {
@@ -2976,6 +3390,7 @@ pub async fn prepare_gateway_core(
                     });
 
                     info!(
+                        backend = manager.backend_name(),
                         embeddings = manager.has_embeddings(),
                         "memory system initialized"
                     );
@@ -3044,6 +3459,7 @@ pub async fn prepare_gateway_core(
     let state = GatewayState::with_options(
         resolved_auth,
         services,
+        config.clone(),
         Some(Arc::clone(&sandbox_router)),
         Some(Arc::clone(&credential_store)),
         Some(pairing_store),
@@ -3063,7 +3479,72 @@ pub async fn prepare_gateway_core(
         #[cfg(feature = "vault")]
         vault.clone(),
     );
+
+    // Wire webhook store and worker into gateway state.
+    {
+        let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel::<i64>(256);
+        let _ = state.webhook_store.set(Arc::clone(&webhook_store));
+        let _ = state.webhook_worker_tx.set(webhook_tx);
+
+        // Spawn webhook background worker.
+        let worker_store = Arc::clone(&webhook_store);
+        let worker_state_ref = Arc::clone(&state);
+        let worker = moltis_webhooks::worker::WebhookWorker::new(
+            webhook_rx,
+            worker_store,
+            Arc::new(move |req: moltis_webhooks::worker::ExecuteRequest| {
+                let chat_state = Arc::clone(&worker_state_ref);
+                Box::pin(async move {
+                    let chat = chat_state.chat().await;
+                    let mut params = serde_json::json!({
+                        "text": req.message,
+                        "_session_key": req.session_key,
+                    });
+                    if let Some(ref model) = req.model {
+                        params["model"] = serde_json::Value::String(model.clone());
+                    }
+                    if let Some(ref agent_id) = req.agent_id {
+                        params["agent_id"] = serde_json::Value::String(agent_id.clone());
+                    }
+                    if let Some(ref tool_policy) = req.tool_policy {
+                        params["_tool_policy"] = serde_json::to_value(tool_policy)
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                    }
+                    let result = chat
+                        .send_sync(params)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    let input_tokens = result.get("inputTokens").and_then(|v| v.as_i64());
+                    let output_tokens = result.get("outputTokens").and_then(|v| v.as_i64());
+                    let output = result
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    Ok(moltis_webhooks::worker::ProcessResult {
+                        output,
+                        input_tokens,
+                        output_tokens,
+                        session_key: req.session_key,
+                    })
+                })
+            }),
+        );
+        tokio::spawn(worker.run());
+    }
+
     startup_mem_probe.checkpoint("gateway_state.created");
+
+    #[cfg(feature = "tailscale")]
+    if explicit_rp_id.is_none()
+        && let Some(registry) = webauthn_registry.as_ref()
+    {
+        spawn_webauthn_tailscale_registration(Arc::clone(&state), Arc::clone(registry));
+    }
+
+    match credential_store.ssh_target_count().await {
+        Ok(count) => state.ssh_target_count.store(count, Ordering::Relaxed),
+        Err(error) => warn!(%error, "failed to load ssh target count"),
+    }
 
     // Store discovered hook info, disabled set, and config overrides in state for the web UI.
     {
@@ -3086,7 +3567,11 @@ pub async fn prepare_gateway_core(
         if !credential_store.is_setup_complete() && !credential_store.is_auth_disabled() {
             let code = std::env::var("MOLTIS_E2E_SETUP_CODE")
                 .unwrap_or_else(|_| auth::generate_setup_code());
-            state.inner.write().await.setup_code = Some(Secret::new(code.clone()));
+            {
+                let mut inner = state.inner.write().await;
+                inner.setup_code = Some(Secret::new(code.clone()));
+                inner.setup_code_created_at = Some(std::time::Instant::now());
+            }
             Some(code)
         } else {
             None
@@ -3226,7 +3711,8 @@ pub async fn prepare_gateway_core(
 
     // Wire live chat service (needs state reference, so done after state creation).
     {
-        let broadcaster = Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
+        let broadcaster: Arc<dyn moltis_tools::exec::ApprovalBroadcaster> =
+            Arc::new(GatewayApprovalBroadcaster::new(Arc::clone(&state)));
         let env_provider: Arc<dyn EnvVarProvider> = credential_store.clone();
         let eq = cron_service.events_queue().clone();
         let cs = Arc::clone(&cron_service);
@@ -3240,7 +3726,11 @@ pub async fn prepare_gateway_core(
             });
         });
         let mut exec_tool = moltis_tools::exec::ExecTool::default()
-            .with_approval(Arc::clone(&approval_manager), broadcaster)
+            .with_default_timeout(std::time::Duration::from_secs(
+                config.tools.exec.default_timeout_secs,
+            ))
+            .with_max_output_bytes(config.tools.exec.max_output_bytes)
+            .with_approval(Arc::clone(&approval_manager), Arc::clone(&broadcaster))
             .with_sandbox_router(Arc::clone(&sandbox_router))
             .with_env_provider(Arc::clone(&env_provider))
             .with_completion_callback(exec_cb);
@@ -3254,11 +3744,14 @@ pub async fn prepare_gateway_core(
             let provider = Arc::new(crate::node_exec::GatewayNodeExecProvider::new(
                 Arc::clone(&state),
                 Arc::clone(&state.node_count),
+                Arc::clone(&state.ssh_target_count),
+                config.tools.exec.ssh_target.clone(),
+                config.tools.exec.max_output_bytes,
             ));
-            let default_node = if config.tools.exec.host == "node" {
-                config.tools.exec.node.clone()
-            } else {
-                None
+            let default_node = match config.tools.exec.host.as_str() {
+                "node" => config.tools.exec.node.clone(),
+                "ssh" => config.tools.exec.ssh_target.clone(),
+                _ => None,
             };
             exec_tool = exec_tool.with_node_provider(provider, default_node);
         }
@@ -3274,6 +3767,63 @@ pub async fn prepare_gateway_core(
 
         tool_registry.register(Box::new(exec_tool));
         tool_registry.register(Box::new(moltis_tools::calc::CalcTool::new()));
+        // Native filesystem tools (Read/Write/Edit/MultiEdit/Glob/Grep).
+        // See moltis-org/moltis#657. Phase 4 wires [tools.fs] config into
+        // the tool context: workspace_root default for Glob/Grep, path
+        // allow/deny, and FsState for must-read-before-write + loop
+        // detection (gated by track_reads).
+        #[cfg(feature = "fs-tools")]
+        {
+            use moltis_config::schema::FsBinaryPolicy;
+            let fs_cfg = &config.tools.fs;
+            let path_policy = match moltis_tools::fs::FsPathPolicy::new(
+                &fs_cfg.allow_paths,
+                &fs_cfg.deny_paths,
+            ) {
+                Ok(p) => {
+                    if p.is_empty() {
+                        None
+                    } else {
+                        Some(p)
+                    }
+                },
+                Err(e) => {
+                    warn!(error = %e, "invalid tools.fs path policy — fs tools will run without path allow/deny");
+                    None
+                },
+            };
+            let workspace_root = fs_cfg.workspace_root.as_ref().map(PathBuf::from);
+            let binary_policy = match fs_cfg.binary_policy {
+                FsBinaryPolicy::Reject => moltis_tools::fs::BinaryPolicy::Reject,
+                FsBinaryPolicy::Base64 => moltis_tools::fs::BinaryPolicy::Base64,
+            };
+            let checkpoint_manager = if fs_cfg.checkpoint_before_mutation {
+                Some(Arc::new(moltis_tools::checkpoints::CheckpointManager::new(
+                    moltis_config::data_dir(),
+                )))
+            } else {
+                None
+            };
+            let ctx = moltis_tools::fs::FsToolsContext {
+                workspace_root,
+                fs_state: shared_fs_state.clone(),
+                path_policy,
+                binary_policy,
+                respect_gitignore: fs_cfg.respect_gitignore,
+                checkpoint_manager,
+                sandbox_router: Some(Arc::clone(&sandbox_router)),
+                approval_manager: fs_cfg
+                    .require_approval
+                    .then(|| Arc::clone(&approval_manager)),
+                broadcaster: fs_cfg.require_approval.then(|| Arc::clone(&broadcaster)),
+                max_read_bytes: Some(fs_cfg.max_read_bytes),
+                context_window_tokens: fs_cfg.context_window_tokens,
+            };
+            moltis_tools::fs::register_fs_tools(&mut tool_registry, ctx);
+            if let Some(message) = fs_tools_host_warning_message(&sandbox_router) {
+                warn!("{message}");
+            }
+        }
         #[cfg(feature = "wasm")]
         {
             let wasm_limits = sandbox_router
@@ -3313,6 +3863,31 @@ pub async fn prepare_gateway_core(
         tool_registry.register(Box::new(crate::channel_agent_tools::SendMessageTool::new(
             Arc::clone(&state.services.channel),
         )));
+        // Microsoft Teams Graph API tools (search, member info, pins, edit/delete, read).
+        {
+            let tp = Arc::clone(&msteams_webhook_plugin);
+            tool_registry.register(Box::new(
+                crate::teams_agent_tools::TeamsSearchMessagesTool::new(Arc::clone(&tp)),
+            ));
+            tool_registry.register(Box::new(
+                crate::teams_agent_tools::TeamsMemberInfoTool::new(Arc::clone(&tp)),
+            ));
+            tool_registry.register(Box::new(
+                crate::teams_agent_tools::TeamsPinMessageTool::new(Arc::clone(&tp)),
+            ));
+            tool_registry.register(Box::new(
+                crate::teams_agent_tools::TeamsEditMessageTool::new(Arc::clone(&tp)),
+            ));
+            tool_registry.register(Box::new(
+                crate::teams_agent_tools::TeamsReadMessageTool::new(Arc::clone(&tp)),
+            ));
+        }
+        tool_registry.register(Box::new(
+            crate::channel_agent_tools::UpdateChannelSettingsTool::new(
+                Arc::clone(&state.services.channel),
+                state.services.channel_store.clone(),
+            ),
+        ));
         tool_registry.register(Box::new(
             moltis_tools::send_image::SendImageTool::new()
                 .with_sandbox_router(Arc::clone(&sandbox_router)),
@@ -3326,6 +3901,8 @@ pub async fn prepare_gateway_core(
             &config.tools.web.search,
             &runtime_env_overrides,
         ) {
+            #[cfg(feature = "firecrawl")]
+            let t = t.with_firecrawl_config(&config.tools.web.firecrawl);
             tool_registry.register(Box::new(t.with_env_provider(Arc::clone(&env_provider))));
         }
         if let Some(t) = moltis_tools::web_fetch::WebFetchTool::from_config(&config.tools.web.fetch)
@@ -3336,6 +3913,14 @@ pub async fn prepare_gateway_core(
             } else {
                 t
             };
+            #[cfg(feature = "firecrawl")]
+            let t = t.with_firecrawl(&config.tools.web.firecrawl);
+            tool_registry.register(Box::new(t));
+        }
+        #[cfg(feature = "firecrawl")]
+        if let Some(t) =
+            moltis_tools::firecrawl::FirecrawlScrapeTool::from_config(&config.tools.web.firecrawl)
+        {
             tool_registry.register(Box::new(t));
         }
         if let Some(t) = moltis_tools::browser::BrowserTool::from_config(&config.tools.browser) {
@@ -3369,9 +3954,11 @@ pub async fn prepare_gateway_core(
 
         // Register node info tools (list, describe, select).
         {
-            let node_info_provider: Arc<dyn moltis_tools::nodes::NodeInfoProvider> = Arc::new(
-                crate::node_exec::GatewayNodeInfoProvider::new(Arc::clone(&state)),
-            );
+            let node_info_provider: Arc<dyn moltis_node_exec_types::NodeInfoProvider> =
+                Arc::new(crate::node_exec::GatewayNodeInfoProvider::new(
+                    Arc::clone(&state),
+                    config.tools.exec.ssh_target.clone(),
+                ));
             tool_registry.register(Box::new(moltis_tools::nodes::NodesListTool::new(
                 Arc::clone(&node_info_provider),
             )));
@@ -3482,6 +4069,10 @@ pub async fn prepare_gateway_core(
             Arc::clone(&session_store),
             Arc::clone(&session_metadata),
         )));
+        tool_registry.register(Box::new(SessionsSearchTool::new(
+            Arc::clone(&session_store),
+            Arc::clone(&session_metadata),
+        )));
 
         let state_for_session_send = Arc::clone(&state);
         let send_to_session: SendToSessionFn = Arc::new(move |req: SendToSessionRequest| {
@@ -3510,6 +4101,8 @@ pub async fn prepare_gateway_core(
             Arc::clone(&session_metadata),
             send_to_session,
         )));
+        tool_registry.register(Box::new(CheckpointsListTool::new(data_dir.clone())));
+        tool_registry.register(Box::new(CheckpointRestoreTool::new(data_dir.clone())));
 
         // Register shared task coordination tool for multi-agent workflows.
         tool_registry.register(Box::new(moltis_tools::task_list::TaskListTool::new(
@@ -3527,6 +4120,8 @@ pub async fn prepare_gateway_core(
         // Register skill management tools for agent self-extension.
         // Use data_dir so created skills land in the configured workspace root.
         {
+            use moltis_skills::discover::FsSkillDiscoverer;
+
             tool_registry.register(Box::new(moltis_tools::skill_tools::CreateSkillTool::new(
                 data_dir.clone(),
             )));
@@ -3535,6 +4130,19 @@ pub async fn prepare_gateway_core(
             )));
             tool_registry.register(Box::new(moltis_tools::skill_tools::DeleteSkillTool::new(
                 data_dir.clone(),
+            )));
+            // Read-side tool: resolves skill names against the same filesystem
+            // layout the prompt builder uses, so names listed in
+            // <available_skills> always resolve without an external filesystem
+            // MCP server. Use the explicit-`data_dir` variant so the read
+            // path stays consistent with create/update/delete (which are
+            // already constructed from `data_dir`) even if
+            // `moltis_config::data_dir()` is ever reconfigured at runtime.
+            let read_discoverer = Arc::new(FsSkillDiscoverer::new(
+                FsSkillDiscoverer::default_paths_for(&data_dir),
+            ));
+            tool_registry.register(Box::new(moltis_tools::skill_tools::ReadSkillTool::new(
+                read_discoverer,
             )));
             if config.skills.enable_agent_sidecar_files {
                 tool_registry.register(Box::new(
@@ -3632,6 +4240,7 @@ pub async fn prepare_gateway_core(
             Arc::clone(&session_store),
             Arc::clone(&session_metadata),
         )
+        .with_session_state_store(Arc::clone(&session_state_store))
         .with_tools(Arc::clone(&shared_tool_registry))
         .with_failover(config.failover.clone());
 
@@ -3658,23 +4267,46 @@ pub async fn prepare_gateway_core(
     // Spawn skill file watcher for hot-reload.
     #[cfg(feature = "file-watcher")]
     {
-        let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
-        let watch_dirs: Vec<PathBuf> = search_paths.into_iter().map(|(p, _)| p).collect();
-        if let Ok((_watcher, mut rx)) = moltis_skills::watcher::SkillWatcher::start(watch_dirs) {
-            let watcher_state = Arc::clone(&state);
-            tokio::spawn(async move {
-                let _watcher = _watcher; // keep alive
-                while let Some(_event) = rx.recv().await {
-                    broadcast(
-                        &watcher_state,
-                        "skills.changed",
-                        serde_json::json!({}),
-                        BroadcastOpts::default(),
-                    )
-                    .await;
+        let watcher_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let (mut watcher, mut rx) = match start_skill_hot_reload_watcher().await {
+                Ok(started) => started,
+                Err(error) => {
+                    tracing::warn!("skills: failed to start file watcher: {error}");
+                    return;
+                },
+            };
+
+            loop {
+                let Some(event) = rx.recv().await else {
+                    break;
+                };
+                broadcast(
+                    &watcher_state,
+                    "skills.changed",
+                    serde_json::json!({}),
+                    BroadcastOpts::default(),
+                )
+                .await;
+
+                if matches!(
+                    event,
+                    moltis_skills::watcher::SkillWatchEvent::ManifestChanged
+                ) {
+                    match start_skill_hot_reload_watcher().await {
+                        Ok((new_watcher, new_rx)) => {
+                            watcher = new_watcher;
+                            rx = new_rx;
+                        },
+                        Err(error) => {
+                            tracing::warn!("skills: failed to refresh file watcher: {error}");
+                        },
+                    }
                 }
-            });
-        }
+            }
+
+            drop(watcher);
+        });
     }
 
     // Spawn MCP health polling + auto-restart background task.
@@ -3753,12 +4385,6 @@ fn builtin_hook_metadata() -> Vec<(
     use moltis_common::hooks::HookEvent;
     vec![
         (
-            "boot-md",
-            "Reads BOOT.md from the workspace on startup and injects its content as the initial user message to the agent.",
-            vec![HookEvent::GatewayStart],
-            "crates/plugins/src/bundled/boot_md.rs",
-        ),
-        (
             "command-logger",
             "Logs all slash-command invocations to a JSONL audit file at ~/.moltis/logs/commands.log.",
             vec![HookEvent::Command],
@@ -3792,32 +4418,182 @@ fn seed_example_hook() {
     }
 }
 
-/// Seed the `dcg-guard` hook into `~/.moltis/hooks/dcg-guard/` on first run.
+/// Marker string that must be present in an up-to-date seeded `handler.sh`.
 ///
-/// Writes both `HOOK.md` and `handler.sh`. The handler gracefully no-ops when
-/// `dcg` is not installed, so the hook is always eligible.
-fn seed_dcg_guard_hook() {
+/// If the on-disk handler is missing this marker it predates the PATH-fix
+/// in #626 and must be rewritten — otherwise existing installs silently
+/// keep the broken handler while the startup log reports the guard as
+/// active. Matching on `export PATH=` is enough because the stale handler
+/// never contained any `export` statement.
+const DCG_GUARD_HANDLER_FINGERPRINT: &str = "export PATH=";
+
+/// Marker string that must be present in an up-to-date seeded `HOOK.md`.
+///
+/// Older installs shipped `cargo install dcg`, which never worked. We
+/// refresh `HOOK.md` in place whenever the new upstream install command
+/// is missing, so users reading the seeded docs don't get stale advice.
+const DCG_GUARD_HOOK_MD_FINGERPRINT: &str = "uv tool install destructive-command-guard";
+
+/// Seed the `dcg-guard` hook into `~/.moltis/hooks/dcg-guard/` on first run,
+/// and refresh on-disk files that predate the PATH-fix in #626.
+///
+/// Writes both `HOOK.md` and `handler.sh`. The handler gracefully no-ops
+/// (fail-open) when `dcg` is not installed, so the hook is always eligible.
+///
+/// Existing installs affected by the original bug already have `HOOK.md`
+/// on disk, so a naive `if !hook_md.exists()` guard would leave the stale
+/// handler in place and the startup log would lie about the guard being
+/// active. We instead fingerprint both files and rewrite them in place
+/// when the marker is missing.
+///
+/// After (re)seeding, probes for `dcg` on the same augmented `PATH` the
+/// handler will use and emits exactly one log line so operators can tell
+/// at boot whether the guard is active or inert.
+async fn seed_dcg_guard_hook() {
     let hook_dir = moltis_config::data_dir().join("hooks/dcg-guard");
     let hook_md = hook_dir.join("HOOK.md");
-    if hook_md.exists() {
-        return;
-    }
-    if let Err(e) = std::fs::create_dir_all(&hook_dir) {
-        tracing::debug!("could not create dcg-guard hook dir: {e}");
-        return;
-    }
-    if let Err(e) = std::fs::write(&hook_md, DCG_GUARD_HOOK_MD) {
-        tracing::debug!("could not write dcg-guard HOOK.md: {e}");
-    }
     let handler = hook_dir.join("handler.sh");
-    if let Err(e) = std::fs::write(&handler, DCG_GUARD_HANDLER_SH) {
-        tracing::debug!("could not write dcg-guard handler.sh: {e}");
+
+    // We always want the startup status log to fire, even if the hook dir
+    // could not be created — operators need to know the guard state on
+    // every boot. So treat directory creation failure as "skip the file
+    // writes but still log the status" rather than an early return.
+    let dir_ok = match std::fs::create_dir_all(&hook_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("could not create dcg-guard hook dir: {e}");
+            false
+        },
+    };
+
+    if dir_ok {
+        // Refresh HOOK.md if missing or fingerprint missing (stale install).
+        let hook_md_needs_write = match std::fs::read_to_string(&hook_md) {
+            Ok(existing) => !existing.contains(DCG_GUARD_HOOK_MD_FINGERPRINT),
+            Err(_) => true,
+        };
+        if hook_md_needs_write && let Err(e) = std::fs::write(&hook_md, DCG_GUARD_HOOK_MD) {
+            tracing::debug!("could not write dcg-guard HOOK.md: {e}");
+        }
+
+        // Refresh handler.sh if missing or fingerprint missing (stale install).
+        let handler_needs_write = match std::fs::read_to_string(&handler) {
+            Ok(existing) => !existing.contains(DCG_GUARD_HANDLER_FINGERPRINT),
+            Err(_) => true,
+        };
+        if handler_needs_write {
+            if let Err(e) = std::fs::write(&handler, DCG_GUARD_HANDLER_SH) {
+                tracing::debug!("could not write dcg-guard handler.sh: {e}");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&handler, std::fs::Permissions::from_mode(0o755));
+            }
+            if !hook_md_needs_write {
+                // Handler was stale but HOOK.md was already current — this
+                // is exactly the #626 repro. Make it visible in the log.
+                tracing::info!(
+                    "dcg-guard: refreshed stale handler.sh to apply PATH augmentation fix"
+                );
+            }
+        }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&handler, std::fs::Permissions::from_mode(0o755));
+
+    log_dcg_guard_status().await;
+}
+
+/// PATH augmentation prepended by the dcg-guard handler script. Kept in sync
+/// with `DCG_GUARD_HANDLER_SH` so the startup check resolves `dcg` the same
+/// way the handler will at invocation time.
+const DCG_GUARD_EXTRA_PATH_DIRS: &[&str] = &[".local/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+
+/// Fallback `$HOME` used by `resolve_dcg_binary` when the environment has
+/// no `HOME` set. Must match the `${HOME:-/root}` fallback in
+/// `DCG_GUARD_HANDLER_SH` so the Rust startup probe and the shell handler
+/// agree on which paths are searched.
+const DCG_GUARD_HOME_FALLBACK: &str = "/root";
+
+/// Resolve `dcg` using the same augmented `PATH` as the handler script.
+/// Returns the absolute path to the binary if found.
+fn resolve_dcg_binary() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // Mirror the shell handler's `${HOME:-/root}` behaviour so the Rust
+    // startup probe and the handler agree on which paths are searched.
+    // If `HOME` is unset we must still try `$FALLBACK/.local/bin` — skipping
+    // HOME-relative entries outright was inconsistent with the handler.
+    let home_path = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(DCG_GUARD_HOME_FALLBACK));
+    for rel in DCG_GUARD_EXTRA_PATH_DIRS {
+        if rel.starts_with('/') {
+            dirs.push(PathBuf::from(rel));
+        } else {
+            dirs.push(home_path.join(rel));
+        }
     }
+
+    // Existing `$PATH`, falling back to a sane default matching the handler.
+    let existing = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+    for entry in existing.split(':').filter(|s| !s.is_empty()) {
+        dirs.push(PathBuf::from(entry));
+    }
+
+    for dir in dirs {
+        let candidate = dir.join("dcg");
+        if candidate.is_file() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&candidate)
+                    && meta.permissions().mode() & 0o111 != 0
+                {
+                    return Some(candidate);
+                }
+                continue;
+            }
+            #[cfg(not(unix))]
+            {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+/// Emit a single startup log line describing whether the dcg-guard is
+/// active. Uses `tokio::process::Command` for the `--version` probe so we
+/// do not stall the async executor at startup.
+async fn log_dcg_guard_status() {
+    let Some(path) = resolve_dcg_binary() else {
+        tracing::warn!(
+            "dcg-guard: 'dcg' not found on PATH; destructive command guard is INACTIVE. \
+             Install dcg from https://github.com/Dicklesworthstone/destructive_command_guard"
+        );
+        return;
+    };
+
+    let version = tokio::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .await
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown version".to_string());
+
+    tracing::info!(
+        dcg_path = %path.display(),
+        "dcg-guard: dcg {version} detected, guard active"
+    );
 }
 
 /// Seed built-in personal skills into `~/.moltis/skills/`.
@@ -3879,6 +4655,45 @@ fn seed_default_workspace_markdown_files() {
     seed_file_if_missing(data_dir.join("AGENTS.md"), DEFAULT_WORKSPACE_AGENTS_MD);
     seed_file_if_missing(data_dir.join("TOOLS.md"), DEFAULT_TOOLS_MD);
     seed_file_if_missing(data_dir.join("HEARTBEAT.md"), DEFAULT_HEARTBEAT_MD);
+}
+
+fn warn_on_workspace_prompt_file_truncation() {
+    let limit_chars = moltis_config::discover_and_load()
+        .chat
+        .workspace_file_max_chars;
+    let data_dir = moltis_config::data_dir();
+    let mut paths = vec![data_dir.join("AGENTS.md"), data_dir.join("TOOLS.md")];
+    let agents_dir = data_dir.join("agents");
+    if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            paths.push(path.join("AGENTS.md"));
+            paths.push(path.join("TOOLS.md"));
+        }
+    }
+
+    for path in paths {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Some(normalized) = moltis_config::normalize_workspace_markdown_content(&content) else {
+            continue;
+        };
+        let char_count = normalized.chars().count();
+        if char_count <= limit_chars {
+            continue;
+        }
+        tracing::warn!(
+            path = %path.display(),
+            char_count,
+            limit_chars,
+            truncated_chars = char_count.saturating_sub(limit_chars),
+            "workspace prompt file exceeds configured prompt cap and will be truncated"
+        );
+    }
 }
 
 fn seed_file_if_missing(path: PathBuf, content: &str) {
@@ -3943,8 +4758,13 @@ echo "$(date -Iseconds) tool=$tool" >> /tmp/moltis-hook.log
 
 **Can modify or block (sequential dispatch):**
 - `BeforeAgentStart` — before a new agent run begins
+- `BeforeLLMCall` — before a prompt is sent to the LLM provider
+- `AfterLLMCall` — after an LLM response arrives, before any tool execution
 - `BeforeToolCall` — before executing a tool (inspect/modify arguments)
 - `BeforeCompaction` — before compacting chat history
+- `MessageReceived` — when an inbound channel/UI message arrives;
+  `Block(reason)` rejects it, `ModifyPayload({"content": "..."})` rewrites
+  the text before the turn begins
 - `MessageSending` — before sending a message to the LLM
 - `ToolResultPersist` — before persisting a tool result
 
@@ -3952,7 +4772,6 @@ echo "$(date -Iseconds) tool=$tool" >> /tmp/moltis-hook.log
 - `AgentEnd` — after an agent run completes
 - `AfterToolCall` — after a tool finishes (observe result)
 - `AfterCompaction` — after compaction completes
-- `MessageReceived` — after receiving an LLM response
 - `MessageSent` — after a message is sent
 - `SessionStart` / `SessionEnd` — session lifecycle
 - `GatewayStart` / `GatewayStop` — server lifecycle
@@ -3992,27 +4811,52 @@ tool to scan shell commands before execution. dcg ships 49+ pattern categories
 covering filesystem, git, database, cloud, and infrastructure commands.
 
 This hook is **seeded by default** into `~/.moltis/hooks/dcg-guard/` on first
-run. When `dcg` is not installed the hook is a no-op (all commands pass through).
+run. When `dcg` is not installed the hook fails open (all commands pass
+through) and writes a loud warning to stderr on every invocation — check the
+gateway log if the guard appears inert.
 
 ## Install dcg
 
+See the upstream [installation section](https://github.com/Dicklesworthstone/destructive_command_guard#installation).
+The two supported commands from that README are:
+
 ```bash
-cargo install dcg
+uv tool install destructive-command-guard
+# or
+pipx install destructive-command-guard
 ```
 
-Once installed, the hook will automatically start guarding destructive commands
-on the next Moltis restart.
+> **Important:** this hook runs inside the **Moltis service environment**,
+> not your interactive shell. `dcg` must be resolvable on the service's
+> `PATH`. The handler already prepends `$HOME/.local/bin`, `/usr/local/bin`
+> and `/opt/homebrew/bin`, which covers the default install locations of
+> `uv tool`, `pipx` and Homebrew. If you install `dcg` elsewhere, make sure
+> that directory is on the gateway process `PATH` (e.g. via the systemd
+> unit's `Environment=PATH=...`).
+
+Once installed, restart Moltis. The startup log will print either
+`dcg-guard: dcg <version> detected, guard active` or
+`dcg-guard: 'dcg' not found on PATH; destructive command guard is INACTIVE`.
 "#;
 
 /// Content for the seeded dcg-guard handler script.
 const DCG_GUARD_HANDLER_SH: &str = r#"#!/usr/bin/env bash
 # Hook handler: translates Moltis BeforeToolCall payload to dcg format.
-# When dcg is not installed the hook is a no-op (all commands pass through).
+# When dcg is not installed the hook is a fail-open no-op (all commands pass
+# through) but a loud warning is written to stderr so the gateway log makes
+# it obvious that the guard is inert.
 
 set -euo pipefail
 
-# Gracefully skip when dcg is not installed.
+# Hooks run in the Moltis gateway process environment, which under systemd
+# often strips `$HOME/.local/bin` and friends. Prepend the usual user/local
+# bin directories so `dcg` installed via `uv tool install` / `pipx` / brew is
+# resolvable regardless of how Moltis was launched.
+export PATH="${HOME:-/root}/.local/bin:/usr/local/bin:/opt/homebrew/bin:${PATH:-/usr/bin:/bin}"
+
+# Warn loudly (but do not block) when dcg is not installed.
 if ! command -v dcg >/dev/null 2>&1; then
+    echo "dcg-guard: 'dcg' binary not found on PATH (PATH=$PATH); command NOT scanned. Install dcg to enable the guard." >&2
     cat >/dev/null   # drain stdin
     exit 0
 fi
@@ -4189,9 +5033,9 @@ const DEFAULT_BOOT_MD: &str = r#"<!--
 BOOT.md is optional startup context.
 
 How Moltis uses this file:
-- Read on every GatewayStart by the built-in boot-md hook.
+- Loaded per session and injected into the system prompt.
 - Missing/empty/comment-only file = no startup injection.
-- Non-empty content = injected as startup user message context.
+- Agent-specific overrides: place in agents/<id>/BOOT.md.
 
 Recommended usage:
 - Keep it short and explicit.
@@ -4249,10 +5093,7 @@ pub(crate) async fn discover_and_build_hooks(
     Vec<crate::state::DiscoveredHookInfo>,
 ) {
     use moltis_plugins::{
-        bundled::{
-            boot_md::BootMdHook, command_logger::CommandLoggerHook,
-            session_memory::SessionMemoryHook,
-        },
+        bundled::{command_logger::CommandLoggerHook, session_memory::SessionMemoryHook},
         hook_discovery::{FsHookDiscoverer, HookDiscoverer, HookSource},
         hook_eligibility::check_hook_eligibility,
         shell_hook::ShellHookHandler,
@@ -4260,6 +5101,7 @@ pub(crate) async fn discover_and_build_hooks(
 
     let discoverer = FsHookDiscoverer::new(FsHookDiscoverer::default_paths());
     let discovered = discoverer.discover().await.unwrap_or_default();
+    let session_export_mode = moltis_config::discover_and_load().memory.session_export;
 
     let mut registry = moltis_common::hooks::HookRegistry::new();
     let mut info_list = Vec::with_capacity(discovered.len());
@@ -4331,10 +5173,6 @@ pub(crate) async fn discover_and_build_hooks(
     {
         let data = moltis_config::data_dir();
 
-        // boot-md: inject BOOT.md content on GatewayStart.
-        let boot = BootMdHook::new(data.clone());
-        registry.register(Arc::new(boot));
-
         // command-logger: append JSONL entries for every slash command.
         let log_path =
             CommandLoggerHook::default_path().unwrap_or_else(|| data.join("logs/commands.log"));
@@ -4342,13 +5180,20 @@ pub(crate) async fn discover_and_build_hooks(
         registry.register(Arc::new(logger));
 
         // session-memory: save conversation to memory on /new or /reset.
-        if let Some(store) = session_store {
+        if let Some(store) = session_store
+            && !matches!(session_export_mode, moltis_config::SessionExportMode::Off)
+        {
             let memory_hook = SessionMemoryHook::new(data.clone(), Arc::clone(store));
             registry.register(Arc::new(memory_hook));
         }
     }
 
     for (name, description, events, source_file) in builtin_hook_metadata() {
+        let enabled = if name == "session-memory" {
+            !matches!(session_export_mode, moltis_config::SessionExportMode::Off)
+        } else {
+            true
+        };
         info_list.push(crate::state::DiscoveredHookInfo {
             name: name.to_string(),
             description: description.to_string(),
@@ -4363,7 +5208,7 @@ pub(crate) async fn discover_and_build_hooks(
             missing_os: false,
             missing_bins: vec![],
             missing_env: vec![],
-            enabled: true,
+            enabled,
             body: String::new(),
             body_html: format!(
                 "<p><em>Built-in hook implemented in Rust.</em></p><p>{}</p>",
@@ -4394,22 +5239,14 @@ mod tests {
     use {
         super::*,
         async_trait::async_trait,
+        moltis_auth::{AuthMode, CredentialStore, ResolvedAuth},
         moltis_common::types::ReplyPayload,
         moltis_providers::raw_model_id,
         secrecy::Secret,
-        std::{
-            collections::{HashMap, HashSet},
-            sync::OnceLock,
-        },
+        sqlx::SqlitePool,
+        std::collections::{HashMap, HashSet},
         tokio::sync::Mutex,
     };
-
-    fn local_model_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap()
-    }
 
     struct LocalModelConfigTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -4418,7 +5255,7 @@ mod tests {
     impl LocalModelConfigTestGuard {
         fn new() -> Self {
             Self {
-                _lock: local_model_config_test_lock(),
+                _lock: crate::config_override_test_lock(),
             }
         }
     }
@@ -4544,6 +5381,111 @@ mod tests {
         maybe_deliver_cron_output(None, &req, "Daily digest ready").await;
     }
 
+    #[tokio::test]
+    async fn sync_runtime_webauthn_host_registers_new_origin() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let credential_store = Arc::new(CredentialStore::new(pool).await.unwrap());
+        let gateway = GatewayState::with_options(
+            ResolvedAuth {
+                mode: AuthMode::Token,
+                token: None,
+                password: None,
+            },
+            GatewayServices::noop(),
+            moltis_config::MoltisConfig::default(),
+            None,
+            Some(Arc::clone(&credential_store)),
+            None,
+            false,
+            false,
+            false,
+            None,
+            None,
+            18789,
+            false,
+            None,
+            None,
+            #[cfg(feature = "metrics")]
+            None,
+            #[cfg(feature = "metrics")]
+            None,
+            #[cfg(feature = "vault")]
+            None,
+        );
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::auth_webauthn::WebAuthnRegistry::new(),
+        ));
+
+        let notice = sync_runtime_webauthn_host_and_notice(
+            &gateway,
+            Some(&registry),
+            Some("team-gateway.ngrok.app"),
+            Some("https://team-gateway.ngrok.app"),
+            "test",
+        )
+        .await;
+
+        assert!(notice.is_none(), "unexpected notice: {notice:?}");
+        assert!(
+            registry
+                .read()
+                .await
+                .contains_host("team-gateway.ngrok.app")
+        );
+        assert!(
+            gateway.passkey_host_update_pending().await.is_empty(),
+            "passkey warning should not be queued without existing passkeys"
+        );
+    }
+
+    #[cfg(feature = "qmd")]
+    #[test]
+    fn sanitize_qmd_index_name_normalizes_non_alphanumeric_segments() {
+        let path = FsPath::new("/Users/Penso/.moltis/data///");
+        assert_eq!(
+            sanitize_qmd_index_name(path),
+            "moltis-users_penso_moltis_data"
+        );
+    }
+
+    #[cfg(feature = "qmd")]
+    #[test]
+    fn sanitize_qmd_index_name_falls_back_for_empty_root() {
+        assert_eq!(sanitize_qmd_index_name(FsPath::new("///")), "moltis");
+    }
+
+    #[tokio::test]
+    async fn sync_runtime_webauthn_host_rejects_invalid_origin() {
+        let gateway = GatewayState::new(
+            ResolvedAuth {
+                mode: AuthMode::Token,
+                token: None,
+                password: None,
+            },
+            GatewayServices::noop(),
+        );
+        let registry = Arc::new(tokio::sync::RwLock::new(
+            crate::auth_webauthn::WebAuthnRegistry::new(),
+        ));
+
+        let notice = sync_runtime_webauthn_host_and_notice(
+            &gateway,
+            Some(&registry),
+            Some("team-gateway.ngrok.app"),
+            Some("not a url"),
+            "test",
+        )
+        .await;
+
+        assert!(notice.is_none());
+        assert!(
+            !registry
+                .read()
+                .await
+                .contains_host("team-gateway.ngrok.app")
+        );
+    }
+
     #[test]
     fn summarize_model_ids_for_logs_returns_all_when_within_limit() {
         let model_ids = vec!["a", "b", "c"]
@@ -4595,6 +5537,68 @@ mod tests {
         assert_eq!(manager.security_level, SecurityLevel::Allowlist);
     }
 
+    #[cfg(feature = "fs-tools")]
+    #[test]
+    fn fs_tools_host_warning_message_only_triggers_without_real_backend() {
+        use {
+            moltis_tools::{
+                exec::{ExecOpts, ExecResult},
+                sandbox::{Sandbox, SandboxId},
+            },
+            std::sync::Arc,
+        };
+
+        struct TestRealSandbox;
+
+        #[async_trait]
+        impl Sandbox for TestRealSandbox {
+            fn backend_name(&self) -> &'static str {
+                "test-real"
+            }
+
+            async fn ensure_ready(
+                &self,
+                _id: &SandboxId,
+                _image_override: Option<&str>,
+            ) -> moltis_tools::Result<()> {
+                Ok(())
+            }
+
+            async fn exec(
+                &self,
+                _id: &SandboxId,
+                _command: &str,
+                _opts: &ExecOpts,
+            ) -> moltis_tools::Result<ExecResult> {
+                Ok(ExecResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            }
+
+            async fn cleanup(&self, _id: &SandboxId) -> moltis_tools::Result<()> {
+                Ok(())
+            }
+        }
+
+        let real_backend: Arc<dyn Sandbox> = Arc::new(TestRealSandbox);
+        let real_router = moltis_tools::sandbox::SandboxRouter::with_backend(
+            moltis_tools::sandbox::SandboxConfig::default(),
+            real_backend,
+        );
+        assert!(fs_tools_host_warning_message(&real_router).is_none());
+
+        let no_backend: Arc<dyn Sandbox> = Arc::new(moltis_tools::sandbox::NoSandbox);
+        let no_router = moltis_tools::sandbox::SandboxRouter::with_backend(
+            moltis_tools::sandbox::SandboxConfig::default(),
+            no_backend,
+        );
+        let warning = fs_tools_host_warning_message(&no_router).expect("warning");
+        assert!(warning.contains("fs tools are registered"));
+        assert!(warning.contains("[tools.fs].allow_paths"));
+    }
+
     #[cfg(feature = "local-llm")]
     #[test]
     fn restore_saved_local_llm_models_rehydrates_custom_models_after_registry_rebuild() {
@@ -4630,6 +5634,8 @@ mod tests {
                 provider: "openai".into(),
                 display_name: "Remote Model".into(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             remote_provider,
         );
@@ -4698,7 +5704,18 @@ mod tests {
 
     #[tokio::test]
     async fn discover_hooks_registers_builtin_handlers() {
+        let _guard = LocalModelConfigTestGuard::new();
         let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_dir.path()).unwrap();
+        std::fs::write(
+            config_dir.path().join("moltis.toml"),
+            "[memory]\nsession_export = \"on-new-or-reset\"\n",
+        )
+        .unwrap();
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
         let session_store = Arc::new(SessionStore::new(sessions_dir));
@@ -4708,14 +5725,9 @@ mod tests {
         let registry = registry.expect("expected hook registry to be created");
         let handler_names = registry.handler_names();
 
-        assert!(handler_names.iter().any(|n| n == "boot-md"));
         assert!(handler_names.iter().any(|n| n == "command-logger"));
         assert!(handler_names.iter().any(|n| n == "session-memory"));
 
-        assert!(
-            info.iter()
-                .any(|h| h.name == "boot-md" && h.source == "builtin")
-        );
         assert!(
             info.iter()
                 .any(|h| h.name == "command-logger" && h.source == "builtin")
@@ -4724,6 +5736,44 @@ mod tests {
             info.iter()
                 .any(|h| h.name == "session-memory" && h.source == "builtin")
         );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        moltis_config::clear_config_dir();
+    }
+
+    #[tokio::test]
+    async fn discover_hooks_respects_session_export_mode_off() {
+        let _guard = LocalModelConfigTestGuard::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let old_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(project_dir.path()).unwrap();
+        std::fs::write(
+            config_dir.path().join("moltis.toml"),
+            "[memory]\nsession_export = \"off\"\n",
+        )
+        .unwrap();
+        moltis_config::set_config_dir(config_dir.path().to_path_buf());
+
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let session_store = Arc::new(SessionStore::new(sessions_dir));
+
+        let (registry, info) =
+            discover_and_build_hooks(&HashSet::new(), Some(&session_store)).await;
+        let registry = registry.expect("expected hook registry to be created");
+        let handler_names = registry.handler_names();
+
+        assert!(handler_names.iter().any(|n| n == "command-logger"));
+        assert!(!handler_names.iter().any(|n| n == "session-memory"));
+        assert!(
+            info.iter()
+                .any(|h| h.name == "session-memory" && h.source == "builtin" && !h.enabled)
+        );
+
+        std::env::set_current_dir(old_cwd).unwrap();
+        moltis_config::clear_config_dir();
     }
 
     #[tokio::test]
@@ -4822,7 +5872,7 @@ mod tests {
             ("OPENAI_API_KEY".to_string(), "config-openai".to_string()),
             ("BRAVE_API_KEY".to_string(), "config-brave".to_string()),
         ]);
-        let merged = merge_env_overrides(&base, vec![
+        let merged = crate::mcp_service::merge_env_overrides(&base, vec![
             ("OPENAI_API_KEY".to_string(), "db-openai".to_string()),
             (
                 "PERPLEXITY_API_KEY".to_string(),
@@ -4907,5 +5957,235 @@ mod tests {
         assert_eq!(preset.model.as_deref(), Some("haiku"));
         assert_eq!(preset.timeout_secs, Some(30));
         assert_eq!(preset.tools.deny, vec!["exec".to_string()]);
+    }
+
+    #[test]
+    fn dcg_guard_handler_has_path_augmentation() {
+        // The handler must prepend the common user/local bin directories so
+        // that `dcg` installed via `uv tool install` / `pipx` / Homebrew is
+        // resolvable even when the gateway inherits a minimal `PATH`
+        // (notably under systemd).
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains(".local/bin"),
+            "handler must prepend $HOME/.local/bin to PATH"
+        );
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains("/usr/local/bin"),
+            "handler must prepend /usr/local/bin to PATH"
+        );
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains("/opt/homebrew/bin"),
+            "handler must prepend /opt/homebrew/bin to PATH"
+        );
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains("export PATH="),
+            "handler must export an augmented PATH before resolving dcg"
+        );
+    }
+
+    #[test]
+    fn dcg_guard_handler_warns_when_dcg_missing() {
+        // The missing-dcg branch must be loud: write to stderr and include
+        // the phrase "NOT scanned" so gateway logs surface the fact that
+        // the guard is inert.
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains("NOT scanned"),
+            "handler must print a loud warning when dcg is missing"
+        );
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains(">&2"),
+            "handler must write its warning to stderr"
+        );
+        // Regression guard: the warning must be emitted *before* stdin is
+        // drained. The old silent no-op form `cat >/dev/null; exit 0` ran
+        // without any prior stderr write, so the warning echo must precede
+        // the `cat >/dev/null` inside the missing-dcg branch.
+        let warn_idx = DCG_GUARD_HANDLER_SH
+            .find("NOT scanned")
+            .expect("handler must contain the NOT scanned warning");
+        let drain_idx = DCG_GUARD_HANDLER_SH
+            .find("cat >/dev/null")
+            .expect("handler still drains stdin in the missing-dcg branch");
+        assert!(
+            warn_idx < drain_idx,
+            "warning must be printed before stdin is drained"
+        );
+    }
+
+    #[test]
+    fn dcg_guard_hook_md_removes_cargo_install() {
+        // `cargo install dcg` never worked — make sure we don't ship it in
+        // the seeded manifest and that we point users at the upstream
+        // install docs instead.
+        assert!(
+            !DCG_GUARD_HOOK_MD.contains("cargo install dcg"),
+            "seeded HOOK.md must not recommend `cargo install dcg`"
+        );
+        assert!(
+            DCG_GUARD_HOOK_MD.contains("github.com/Dicklesworthstone/destructive_command_guard"),
+            "seeded HOOK.md must link to the upstream install section"
+        );
+        assert!(
+            DCG_GUARD_HOOK_MD.contains("uv tool install destructive-command-guard")
+                || DCG_GUARD_HOOK_MD.contains("pipx install destructive-command-guard"),
+            "seeded HOOK.md must mention a supported install command"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_dcg_guard_hook_writes_handler_with_path_fix() {
+        // Seed into a temp directory and verify the on-disk handler carries
+        // the PATH augmentation.
+        let _guard = LocalModelConfigTestGuard::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+
+        seed_dcg_guard_hook().await;
+
+        let handler_path = tmp.path().join("hooks/dcg-guard/handler.sh");
+        let written =
+            std::fs::read_to_string(&handler_path).expect("handler.sh should have been written");
+        assert!(
+            written.contains("export PATH="),
+            "written handler must export an augmented PATH"
+        );
+        assert!(
+            written.contains(".local/bin"),
+            "written handler must reference $HOME/.local/bin"
+        );
+        assert!(
+            written.contains("NOT scanned"),
+            "written handler must warn loudly when dcg is missing"
+        );
+
+        let hook_md_path = tmp.path().join("hooks/dcg-guard/HOOK.md");
+        let hook_md = std::fs::read_to_string(&hook_md_path).expect("HOOK.md written");
+        assert!(
+            !hook_md.contains("cargo install dcg"),
+            "written HOOK.md must not recommend cargo install dcg"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_dcg_guard_hook_refreshes_stale_handler() {
+        // Regression guard for the #626 false-positive: an existing install
+        // with a stale `handler.sh` (no `export PATH=`) and a matching
+        // stale `HOOK.md` (with `cargo install dcg`) must be refreshed in
+        // place. Without this, the startup log would claim the guard is
+        // active while the on-disk handler is still silently no-oping.
+        let _guard = LocalModelConfigTestGuard::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        moltis_config::set_data_dir(tmp.path().to_path_buf());
+
+        let hook_dir = tmp.path().join("hooks/dcg-guard");
+        std::fs::create_dir_all(&hook_dir).expect("create hook dir");
+
+        // Drop the exact broken files shipped before the fix.
+        let stale_handler = "#!/usr/bin/env bash\n\
+             set -euo pipefail\n\
+             if ! command -v dcg >/dev/null 2>&1; then\n    \
+                 cat >/dev/null\n    \
+                 exit 0\n\
+             fi\n";
+        let stale_hook_md = "+++\nname = \"dcg-guard\"\n+++\n\n## Install dcg\n\
+             \n```bash\ncargo install dcg\n```\n";
+
+        let handler_path = hook_dir.join("handler.sh");
+        let hook_md_path = hook_dir.join("HOOK.md");
+        std::fs::write(&handler_path, stale_handler).expect("seed stale handler");
+        std::fs::write(&hook_md_path, stale_hook_md).expect("seed stale HOOK.md");
+
+        seed_dcg_guard_hook().await;
+
+        let refreshed_handler =
+            std::fs::read_to_string(&handler_path).expect("handler.sh must still exist");
+        assert!(
+            refreshed_handler.contains("export PATH="),
+            "stale handler.sh must be rewritten with PATH augmentation, got:\n{refreshed_handler}"
+        );
+        assert!(
+            refreshed_handler.contains("NOT scanned"),
+            "refreshed handler.sh must carry the loud missing-dcg warning"
+        );
+
+        let refreshed_hook_md =
+            std::fs::read_to_string(&hook_md_path).expect("HOOK.md must still exist");
+        assert!(
+            !refreshed_hook_md.contains("cargo install dcg"),
+            "stale HOOK.md must be rewritten without `cargo install dcg`"
+        );
+        assert!(
+            refreshed_hook_md.contains("uv tool install destructive-command-guard"),
+            "refreshed HOOK.md must point at the upstream install command"
+        );
+    }
+
+    #[test]
+    fn dcg_guard_extra_path_dirs_match_handler_script() {
+        // Parity guard: every directory in DCG_GUARD_EXTRA_PATH_DIRS must
+        // appear literally in the handler's `export PATH=` line. If
+        // someone edits one list without the other, the Rust startup
+        // probe and the shell handler will disagree on which directories
+        // are searched — exactly the class of bug #626 was about. Pin
+        // them together with an explicit assertion.
+        for rel in DCG_GUARD_EXTRA_PATH_DIRS {
+            let needle = if rel.starts_with('/') {
+                (*rel).to_string()
+            } else {
+                format!("/{rel}")
+            };
+            assert!(
+                DCG_GUARD_HANDLER_SH.contains(&needle),
+                "handler script missing PATH entry for {rel:?} (needle={needle:?})"
+            );
+        }
+        // Also pin the absolute form of the $HOME-relative entry so the
+        // fallback path (${{HOME:-/root}}/.local/bin) stays in sync with
+        // the Rust probe's DCG_GUARD_HOME_FALLBACK.
+        assert!(
+            DCG_GUARD_HANDLER_SH
+                .contains(&format!("${{HOME:-{DCG_GUARD_HOME_FALLBACK}}}/.local/bin")),
+            "handler script must use ${{HOME:-{DCG_GUARD_HOME_FALLBACK}}}/.local/bin fallback"
+        );
+    }
+
+    #[test]
+    fn dcg_guard_handler_home_fallback_matches_rust_probe() {
+        // The shell handler uses `${HOME:-/root}/.local/bin`; the Rust
+        // `resolve_dcg_binary` probe must fall back to the same `/root`
+        // when HOME is unset, otherwise the startup log could claim the
+        // guard is INACTIVE while the handler still resolves dcg via
+        // /root/.local/bin (or vice versa).
+        assert!(
+            DCG_GUARD_HANDLER_SH.contains("${HOME:-/root}/.local/bin"),
+            "handler must fall back to /root when HOME is unset"
+        );
+        assert_eq!(
+            DCG_GUARD_HOME_FALLBACK, "/root",
+            "Rust probe fallback must match the handler's ${{HOME:-/root}} default"
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_dcg_guard_hook_logs_status_even_if_mkdir_fails() {
+        // If `create_dir_all` fails, we must still call
+        // `log_dcg_guard_status()` so operators see a line about guard
+        // state at boot. Simulate the failure by pointing `data_dir` at a
+        // path whose parent is a regular file — `create_dir_all` returns
+        // an error but `seed_dcg_guard_hook` must not panic and must
+        // return normally (the status log has no observable side effect
+        // in the test beyond not panicking).
+        let _guard = LocalModelConfigTestGuard::new();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").expect("write blocker file");
+        moltis_config::set_data_dir(blocker.clone());
+
+        // Sanity: `hooks/dcg-guard` under a file path cannot be created.
+        assert!(std::fs::create_dir_all(blocker.join("hooks/dcg-guard")).is_err());
+
+        // Must not panic and must return — log line is emitted via
+        // tracing which is a no-op in tests without a subscriber.
+        seed_dcg_guard_hook().await;
     }
 }

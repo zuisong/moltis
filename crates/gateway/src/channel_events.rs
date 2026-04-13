@@ -1,17 +1,19 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use {
     async_trait::async_trait,
     moltis_tools::image_cache::ImageBuilder,
+    serde::Deserialize,
     tracing::{debug, error, info, warn},
 };
 
 use {
     moltis_channels::{
         ChannelAttachment, ChannelEvent, ChannelEventSink, ChannelMessageMeta, ChannelReplyTarget,
-        Error as ChannelError, Result as ChannelResult,
+        Error as ChannelError, Result as ChannelResult, SavedChannelFile,
     },
-    moltis_sessions::metadata::SqliteSessionMetadata,
+    moltis_sessions::metadata::{SessionEntry, SqliteSessionMetadata},
+    moltis_tools::approval::PendingApprovalView,
 };
 
 use crate::{
@@ -20,11 +22,20 @@ use crate::{
 };
 
 /// Default (deterministic) session key for a channel chat.
+///
+/// For Telegram forum topics the thread ID is appended so each topic gets its
+/// own session: `telegram:bot:chat:thread`.
 fn default_channel_session_key(target: &ChannelReplyTarget) -> String {
-    format!(
-        "{}:{}:{}",
-        target.channel_type, target.account_id, target.chat_id
-    )
+    match &target.thread_id {
+        Some(tid) => format!(
+            "{}:{}:{}:{}",
+            target.channel_type, target.account_id, target.chat_id, tid
+        ),
+        None => format!(
+            "{}:{}:{}",
+            target.channel_type, target.account_id, target.chat_id
+        ),
+    }
 }
 
 /// Resolve the active session key for a channel chat.
@@ -39,6 +50,7 @@ async fn resolve_channel_session(
             target.channel_type.as_str(),
             &target.account_id,
             &target.chat_id,
+            target.thread_id.as_deref(),
         )
         .await
     {
@@ -67,6 +79,10 @@ fn is_channel_control_command_name(cmd: &str) -> bool {
             | "model"
             | "sandbox"
             | "sessions"
+            | "attach"
+            | "approvals"
+            | "approve"
+            | "deny"
             | "agent"
             | "help"
             | "sh"
@@ -88,6 +104,210 @@ fn rewrite_for_shell_mode(text: &str) -> Option<String> {
     }
 
     Some(format!("/sh {trimmed}"))
+}
+
+fn parse_numbered_selection(arg: &str, command_name: &str) -> ChannelResult<usize> {
+    arg.parse()
+        .map_err(|_| ChannelError::invalid_input(format!("usage: /{command_name} [number]")))
+}
+
+/// Check whether `sender_id` is on the channel account's DM allowlist.
+///
+/// The DM allowlist is the source of truth for privileged command access:
+/// anyone allowed to DM the bot is trusted to run commands like `/approve`
+/// and `/deny` from any context (DM or group). Users not on the allowlist
+/// can still chat (if group policy permits) but cannot run privileged
+/// commands.
+///
+/// Returns `false` when the allowlist is empty (open DM policy) because an
+/// open policy means no one has been explicitly authorized.
+async fn is_sender_on_allowlist(
+    state: &Arc<GatewayState>,
+    account_id: &str,
+    sender_id: &str,
+) -> bool {
+    let Some(ref registry) = state.services.channel_registry else {
+        return false;
+    };
+    let Some(config) = registry.account_config(account_id).await else {
+        return false;
+    };
+    let allowlist = config.allowlist();
+    // Empty allowlist = open policy → no explicit authorization.
+    if allowlist.is_empty() {
+        return false;
+    }
+    // Check the full sender_id first, then try the user part before '@'
+    // (WhatsApp JIDs are e.g. "15551234567@s.whatsapp.net" but allowlists
+    // use plain phone numbers like "15551234567").
+    moltis_channels::gating::is_allowed(sender_id, allowlist)
+        || sender_id
+            .split_once('@')
+            .is_some_and(|(user, _)| moltis_channels::gating::is_allowed(user, allowlist))
+}
+
+fn is_attachable_session(entry: &SessionEntry) -> bool {
+    !entry.archived && !entry.key.starts_with("cron:")
+}
+
+fn session_list_label(entry: &SessionEntry) -> &str {
+    entry.label.as_deref().unwrap_or(&entry.key)
+}
+
+fn format_channel_sessions_list(sessions: &[SessionEntry], current_session_key: &str) -> String {
+    let mut lines = Vec::new();
+    for (i, session) in sessions.iter().enumerate() {
+        let marker = if session.key == current_session_key {
+            " *"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "{}. {} ({} msgs){}",
+            i + 1,
+            session_list_label(session),
+            session.message_count,
+            marker,
+        ));
+    }
+    lines.push("\nUse /sessions N to switch.".to_string());
+    lines.join("\n")
+}
+
+fn format_attachable_sessions_list(sessions: &[SessionEntry], current_session_key: &str) -> String {
+    let mut lines = Vec::new();
+    for (i, session) in sessions.iter().enumerate() {
+        let label = session_list_label(session);
+        let marker = if session.key == current_session_key {
+            " *"
+        } else {
+            ""
+        };
+        let key_suffix = if label == session.key {
+            String::new()
+        } else {
+            format!(" [{}]", session.key)
+        };
+        lines.push(format!(
+            "{}. {}{} ({} msgs){}",
+            i + 1,
+            label,
+            key_suffix,
+            session.message_count,
+            marker,
+        ));
+    }
+    lines.push(
+        "\nUse /attach N to move an existing session to this chat. This rebinds it from any previous channel chat."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn format_pending_approvals_list(requests: &[PendingApprovalView]) -> String {
+    use crate::approval::{MAX_COMMAND_PREVIEW_LEN, truncate_command_preview};
+    let mut lines = Vec::new();
+    for (i, request) in requests.iter().enumerate() {
+        let preview = truncate_command_preview(&request.command, MAX_COMMAND_PREVIEW_LEN);
+        lines.push(format!("{}. `{}`", i + 1, preview));
+    }
+    lines.push("\nUse /approve N or /deny N.".to_string());
+    lines.join("\n")
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalListResponse {
+    #[serde(default)]
+    requests: Vec<PendingApprovalView>,
+}
+
+#[derive(Debug, Default)]
+struct ChannelSessionDefaults {
+    model: Option<String>,
+    agent_id: Option<String>,
+}
+
+fn config_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn override_map<'a>(
+    config: &'a serde_json::Value,
+    key: &str,
+    target_id: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    config
+        .get(key)
+        .and_then(serde_json::Value::as_object)
+        .and_then(|overrides| overrides.get(target_id))
+        .and_then(serde_json::Value::as_object)
+}
+
+async fn resolve_channel_session_defaults(
+    state: &Arc<GatewayState>,
+    reply_to: &ChannelReplyTarget,
+    sender_id: Option<&str>,
+) -> ChannelSessionDefaults {
+    let Ok(status) = state.services.channel.status().await else {
+        return ChannelSessionDefaults::default();
+    };
+    let Some(channel) = status
+        .get("channels")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|channels| {
+            channels.iter().find(|channel| {
+                channel
+                    .get("account_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(reply_to.account_id.as_str())
+                    && channel.get("type").and_then(serde_json::Value::as_str)
+                        == Some(reply_to.channel_type.as_str())
+            })
+        })
+    else {
+        return ChannelSessionDefaults::default();
+    };
+    let Some(config) = channel.get("config") else {
+        return ChannelSessionDefaults::default();
+    };
+
+    resolve_channel_session_defaults_from_config(config, &reply_to.chat_id, sender_id)
+}
+
+fn resolve_channel_session_defaults_from_config(
+    config: &serde_json::Value,
+    chat_id: &str,
+    sender_id: Option<&str>,
+) -> ChannelSessionDefaults {
+    let user_override = override_map(
+        config,
+        "user_overrides",
+        sender_id
+            .filter(|sender_id| *sender_id != chat_id)
+            .unwrap_or(chat_id),
+    );
+    let channel_override = override_map(config, "channel_overrides", chat_id);
+
+    ChannelSessionDefaults {
+        model: user_override
+            .and_then(|override_value| config_string(override_value.get("model")))
+            .or_else(|| {
+                channel_override
+                    .and_then(|override_value| config_string(override_value.get("model")))
+            })
+            .or_else(|| config_string(config.get("model"))),
+        agent_id: user_override
+            .and_then(|override_value| config_string(override_value.get("agent_id")))
+            .or_else(|| {
+                channel_override
+                    .and_then(|override_value| config_string(override_value.get("agent_id")))
+            })
+            .or_else(|| config_string(config.get("agent_id"))),
+    }
 }
 
 fn start_channel_typing_loop(
@@ -114,6 +334,59 @@ fn start_channel_typing_loop(
     Some(done_tx)
 }
 
+async fn resolve_channel_agent_id(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    requested_agent_id: Option<&str>,
+) -> String {
+    let fallback = if let Some(ref store) = state.services.agent_persona_store {
+        store
+            .default_id()
+            .await
+            .unwrap_or_else(|_| "main".to_string())
+    } else {
+        "main".to_string()
+    };
+
+    let Some(agent_id) = requested_agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return fallback;
+    };
+
+    if agent_id == "main" {
+        return "main".to_string();
+    }
+
+    let Some(ref store) = state.services.agent_persona_store else {
+        return agent_id.to_string();
+    };
+
+    match store.get(agent_id).await {
+        Ok(Some(_)) => agent_id.to_string(),
+        Ok(None) => {
+            warn!(
+                session = %session_key,
+                agent_id,
+                fallback = %fallback,
+                "channel requested unknown agent, falling back to default"
+            );
+            fallback
+        },
+        Err(error) => {
+            warn!(
+                session = %session_key,
+                agent_id,
+                fallback = %fallback,
+                %error,
+                "failed to resolve channel agent, falling back to default"
+            );
+            fallback
+        },
+    }
+}
+
 /// Broadcasts channel events over the gateway WebSocket.
 ///
 /// Uses a deferred `OnceCell` reference so the sink can be created before
@@ -132,7 +405,7 @@ impl GatewayChannelEventSink {
 impl ChannelEventSink for GatewayChannelEventSink {
     async fn emit(&self, event: ChannelEvent) {
         if let Some(state) = self.state.get() {
-            let mut payload = match serde_json::to_value(&event) {
+            let payload = match serde_json::to_value(&event) {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("failed to serialize channel event: {e}");
@@ -142,18 +415,22 @@ impl ChannelEventSink for GatewayChannelEventSink {
 
             // Render QR data as an SVG so the frontend can display it directly.
             #[cfg(feature = "whatsapp")]
-            if let ChannelEvent::PairingQrCode { ref qr_data, .. } = event
-                && let Ok(code) = qrcode::QrCode::new(qr_data)
-            {
-                let svg = code
-                    .render::<qrcode::render::svg::Color>()
-                    .min_dimensions(200, 200)
-                    .quiet_zone(true)
-                    .build();
-                if let serde_json::Value::Object(ref mut map) = payload {
-                    map.insert("qr_svg".into(), serde_json::Value::String(svg));
+            let payload = {
+                let mut payload = payload;
+                if let ChannelEvent::PairingQrCode { ref qr_data, .. } = event
+                    && let Ok(code) = qrcode::QrCode::new(qr_data)
+                {
+                    let svg = code
+                        .render::<qrcode::render::svg::Color>()
+                        .min_dimensions(200, 200)
+                        .quiet_zone(true)
+                        .build();
+                    if let serde_json::Value::Object(ref mut map) = payload {
+                        map.insert("qr_svg".into(), serde_json::Value::String(svg));
+                    }
                 }
-            }
+                payload
+            };
 
             broadcast(state, "channel", payload, BroadcastOpts {
                 drop_if_slow: true,
@@ -241,15 +518,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .map(str::trim)
                         .is_none_or(|value| value.is_empty())
                 {
-                    let default_agent = if let Some(ref store) = state.services.agent_persona_store
-                    {
-                        store
-                            .default_id()
-                            .await
-                            .unwrap_or_else(|_| "main".to_string())
-                    } else {
-                        "main".to_string()
-                    };
+                    let default_agent =
+                        resolve_channel_agent_id(state, &session_key, meta.agent_id.as_deref())
+                            .await;
                     let _ = session_meta
                         .set_agent_id(&session_key, Some(&default_agent))
                         .await;
@@ -310,6 +581,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
             // Thread saved voice audio filename so chat.rs persists the audio path.
             if let Some(ref audio_filename) = meta.audio_filename {
                 params["_audio_filename"] = serde_json::json!(audio_filename);
+            }
+            if let Some(ref documents) = meta.documents {
+                params["_document_files"] = serde_json::json!(documents);
             }
 
             // Forward the channel's default model to chat.send() if configured.
@@ -399,7 +673,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     if let Err(send_err) = outbound
                         .send_text(
                             &reply_to.account_id,
-                            &reply_to.chat_id,
+                            &reply_to.outbound_to(),
                             &error_msg,
                             reply_to.message_id.as_deref(),
                         )
@@ -460,12 +734,13 @@ impl ChannelEventSink for GatewayChannelEventSink {
 
     async fn request_sender_approval(
         &self,
-        _channel_type: &str,
+        channel_type: &str,
         account_id: &str,
         identifier: &str,
     ) {
         if let Some(state) = self.state.get() {
             let params = serde_json::json!({
+                "type": channel_type,
                 "account_id": account_id,
                 "identifier": identifier,
             });
@@ -510,6 +785,47 @@ impl ChannelEventSink for GatewayChannelEventSink {
             },
             Err(e) => {
                 warn!(session_key, filename, error = %e, "failed to save channel voice audio");
+                None
+            },
+        }
+    }
+
+    async fn save_channel_attachment(
+        &self,
+        file_data: &[u8],
+        filename: &str,
+        reply_to: &ChannelReplyTarget,
+    ) -> Option<SavedChannelFile> {
+        let state = self.state.get()?;
+        let session_key = if let Some(ref sm) = state.services.session_metadata {
+            resolve_channel_session(reply_to, sm).await
+        } else {
+            default_channel_session_key(reply_to)
+        };
+        let store = state.services.session_store.as_ref()?;
+        match store.save_media(&session_key, filename, file_data).await {
+            Ok(media_ref) => {
+                let absolute_path = store
+                    .media_path_for(&session_key, filename)
+                    .to_string_lossy()
+                    .to_string();
+                debug!(
+                    session_key,
+                    filename, media_ref, absolute_path, "saved channel attachment to session media"
+                );
+                Some(SavedChannelFile {
+                    filename: filename.to_string(),
+                    media_ref,
+                    absolute_path,
+                })
+            },
+            Err(e) => {
+                warn!(
+                    session_key,
+                    filename,
+                    error = %e,
+                    "failed to save channel attachment"
+                );
                 None
             },
         }
@@ -581,7 +897,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
             )));
         };
 
-        self.dispatch_command(&cmd_text, reply_to).await
+        self.dispatch_command(&cmd_text, reply_to, None).await
     }
 
     async fn update_location(
@@ -605,11 +921,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
         let geo = moltis_config::GeoLocation::now(latitude, longitude, None);
         state.inner.write().await.cached_location = Some(geo.clone());
 
-        // Persist to USER.md (best-effort).
-        let mut user = moltis_config::load_user().unwrap_or_default();
-        user.location = Some(geo);
-        if let Err(e) = moltis_config::save_user(&user) {
-            warn!(error = %e, "failed to persist location to USER.md");
+        let write_mode = moltis_config::discover_and_load()
+            .memory
+            .user_profile_write_mode;
+        if write_mode.allows_auto_write() {
+            let mut user = moltis_config::resolve_user_profile();
+            user.location = Some(geo);
+            if let Err(e) = moltis_config::save_user_with_mode(&user, write_mode) {
+                warn!(error = %e, "failed to persist location to USER.md");
+            }
         }
 
         // Check for a pending tool-triggered location request.
@@ -666,10 +986,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
             let geo = moltis_config::GeoLocation::now(latitude, longitude, None);
             state.inner.write().await.cached_location = Some(geo.clone());
 
-            let mut user = moltis_config::load_user().unwrap_or_default();
-            user.location = Some(geo);
-            if let Err(e) = moltis_config::save_user(&user) {
-                warn!(error = %e, "failed to persist location to USER.md");
+            let write_mode = moltis_config::discover_and_load()
+                .memory
+                .user_profile_write_mode;
+            if write_mode.allows_auto_write() {
+                let mut user = moltis_config::resolve_user_profile();
+                user.location = Some(geo);
+                if let Err(e) = moltis_config::save_user_with_mode(&user, write_mode) {
+                    warn!(error = %e, "failed to persist location to USER.md");
+                }
             }
 
             let result = serde_json::json!({
@@ -798,14 +1123,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     .map(str::trim)
                     .is_none_or(|value| value.is_empty())
             {
-                let default_agent = if let Some(ref store) = state.services.agent_persona_store {
-                    store
-                        .default_id()
-                        .await
-                        .unwrap_or_else(|_| "main".to_string())
-                } else {
-                    "main".to_string()
-                };
+                let default_agent =
+                    resolve_channel_agent_id(state, &session_key, meta.agent_id.as_deref()).await;
                 let _ = session_meta
                     .set_agent_id(&session_key, Some(&default_agent))
                     .await;
@@ -825,6 +1144,9 @@ impl ChannelEventSink for GatewayChannelEventSink {
             // starts executing this message (after semaphore acquire).
             "_channel_reply_target": &reply_to,
         });
+        if let Some(ref documents) = meta.documents {
+            params["_document_files"] = serde_json::json!(documents);
+        }
 
         // Forward the channel's default model if configured
         if let Some(ref model) = meta.model {
@@ -903,7 +1225,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 if let Err(send_err) = outbound
                     .send_text(
                         &reply_to.account_id,
-                        &reply_to.chat_id,
+                        &reply_to.outbound_to(),
                         &error_msg,
                         reply_to.message_id.as_deref(),
                     )
@@ -919,6 +1241,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
         &self,
         command: &str,
         reply_to: ChannelReplyTarget,
+        sender_id: Option<&str>,
     ) -> ChannelResult<String> {
         let state = self
             .state
@@ -967,6 +1290,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
 
                 // Ensure the old session also has a channel binding (for listing).
                 let old_entry = session_metadata.get(&session_key).await;
+                let channel_defaults =
+                    resolve_channel_session_defaults(state, &reply_to, sender_id).await;
                 if old_entry
                     .as_ref()
                     .and_then(|e| e.channel_binding.as_ref())
@@ -984,6 +1309,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     .filter(|value| !value.is_empty())
                     .map(str::to_string);
                 let target_agent = if let Some(agent_id) = inherited_agent {
+                    agent_id
+                } else if let Some(agent_id) = channel_defaults.agent_id.clone() {
                     agent_id
                 } else if let Some(ref store) = state.services.agent_persona_store {
                     store
@@ -1003,6 +1330,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         reply_to.channel_type.as_str(),
                         &reply_to.account_id,
                         &reply_to.chat_id,
+                        reply_to.thread_id.as_deref(),
                         &new_key,
                     )
                     .await;
@@ -1015,25 +1343,11 @@ impl ChannelEventSink for GatewayChannelEventSink {
 
                 // Assign a model to the new session: prefer the channel's
                 // configured model, fall back to the first registered model.
-                let channel_model: Option<String> =
-                    state.services.channel.status().await.ok().and_then(|v| {
-                        let channels = v.get("channels")?.as_array()?;
-                        channels
-                            .iter()
-                            .find(|ch| {
-                                ch.get("account_id").and_then(|v| v.as_str())
-                                    == Some(&reply_to.account_id)
-                            })
-                            .and_then(|ch| {
-                                ch.get("config")?.get("model")?.as_str().map(String::from)
-                            })
-                    });
-
                 let models_val = state.services.model.list().await.ok();
                 let models = models_val.as_ref().and_then(|v| v.as_array());
 
                 let (model_id, model_display): (Option<String>, String) = if let Some(ref cm) =
-                    channel_model
+                    channel_defaults.model
                 {
                     let d = models
                         .and_then(|ms| {
@@ -1182,30 +1496,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 }
 
                 if args.is_empty() {
-                    // List mode.
-                    let mut lines = Vec::new();
-                    for (i, s) in sessions.iter().enumerate() {
-                        let label = s.label.as_deref().unwrap_or(&s.key);
-                        let marker = if s.key == session_key {
-                            " *"
-                        } else {
-                            ""
-                        };
-                        lines.push(format!(
-                            "{}. {} ({} msgs){}",
-                            i + 1,
-                            label,
-                            s.message_count,
-                            marker,
-                        ));
-                    }
-                    lines.push("\nUse /sessions N to switch.".to_string());
-                    Ok(lines.join("\n"))
+                    Ok(format_channel_sessions_list(&sessions, &session_key))
                 } else {
                     // Switch mode.
-                    let n: usize = args
-                        .parse()
-                        .map_err(|_| ChannelError::invalid_input("usage: /sessions [number]"))?;
+                    let n = parse_numbered_selection(args, "sessions")?;
                     if n == 0 || n > sessions.len() {
                         return Err(ChannelError::invalid_input(format!(
                             "invalid session number. Use 1–{}.",
@@ -1220,6 +1514,7 @@ impl ChannelEventSink for GatewayChannelEventSink {
                             reply_to.channel_type.as_str(),
                             &reply_to.account_id,
                             &reply_to.chat_id,
+                            reply_to.thread_id.as_deref(),
                             &target_session.key,
                         )
                         .await;
@@ -1248,6 +1543,154 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     .await;
 
                     Ok(format!("Switched to: {label}"))
+                }
+            },
+            "attach" => {
+                let sessions: Vec<_> = session_metadata
+                    .list_account_sessions(reply_to.channel_type.as_str(), &reply_to.account_id)
+                    .await
+                    .into_iter()
+                    .filter(is_attachable_session)
+                    .collect();
+
+                if sessions.is_empty() {
+                    return Ok("No attachable sessions found yet.".to_string());
+                }
+
+                if args.is_empty() {
+                    return Ok(format_attachable_sessions_list(&sessions, &session_key));
+                }
+
+                let n = parse_numbered_selection(args, "attach")?;
+                if n == 0 || n > sessions.len() {
+                    return Err(ChannelError::invalid_input(format!(
+                        "invalid session number. Use 1–{}.",
+                        sessions.len()
+                    )));
+                }
+
+                let target_session = &sessions[n - 1];
+                let binding_json = serde_json::to_string(&reply_to)
+                    .map_err(|e| ChannelError::external("serialize channel binding", e))?;
+
+                session_metadata
+                    .clear_active_session_mappings(&target_session.key)
+                    .await;
+                session_metadata
+                    .set_channel_binding(&target_session.key, Some(binding_json))
+                    .await;
+                session_metadata
+                    .set_active_session(
+                        reply_to.channel_type.as_str(),
+                        &reply_to.account_id,
+                        &reply_to.chat_id,
+                        reply_to.thread_id.as_deref(),
+                        &target_session.key,
+                    )
+                    .await;
+
+                let label = session_list_label(target_session);
+                info!(
+                    session = %target_session.key,
+                    "channel /attach: rebound existing session to current chat"
+                );
+
+                broadcast(
+                    state,
+                    "session",
+                    serde_json::json!({
+                        "kind": "switched",
+                        "sessionKey": &target_session.key,
+                    }),
+                    BroadcastOpts {
+                        drop_if_slow: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+                Ok(format!("Attached here: {label}"))
+            },
+            "approvals" => {
+                let response = state
+                    .services
+                    .exec_approval
+                    .request(serde_json::json!({ "sessionKey": &session_key }))
+                    .await
+                    .map_err(ChannelError::unavailable)?;
+                let approvals: ApprovalListResponse = serde_json::from_value(response)
+                    .map_err(|e| ChannelError::external("parse approval list", e))?;
+
+                if approvals.requests.is_empty() {
+                    Ok("No pending approvals for this session.".to_string())
+                } else {
+                    Ok(format_pending_approvals_list(&approvals.requests))
+                }
+            },
+            "approve" | "deny" => {
+                let authorized = match sender_id {
+                    Some(sid) => is_sender_on_allowlist(state, &reply_to.account_id, sid).await,
+                    None => false,
+                };
+                if !authorized {
+                    return Err(ChannelError::invalid_input(
+                        "You are not authorized to manage approvals. Only users on this bot's allowlist can use /approve and /deny.",
+                    ));
+                }
+                if args.is_empty() {
+                    return Err(ChannelError::invalid_input(format!(
+                        "usage: /{cmd} [number]"
+                    )));
+                }
+
+                let response = state
+                    .services
+                    .exec_approval
+                    .request(serde_json::json!({ "sessionKey": &session_key }))
+                    .await
+                    .map_err(ChannelError::unavailable)?;
+                let approvals: ApprovalListResponse = serde_json::from_value(response)
+                    .map_err(|e| ChannelError::external("parse approval list", e))?;
+
+                if approvals.requests.is_empty() {
+                    return Ok("No pending approvals for this session.".to_string());
+                }
+
+                let n = parse_numbered_selection(args, cmd)?;
+                if n == 0 || n > approvals.requests.len() {
+                    return Err(ChannelError::invalid_input(format!(
+                        "invalid approval number. Use 1–{}.",
+                        approvals.requests.len()
+                    )));
+                }
+
+                let request = &approvals.requests[n - 1];
+                let decision = if cmd == "approve" {
+                    "approved"
+                } else {
+                    "denied"
+                };
+                let mut params = serde_json::json!({
+                    "requestId": &request.id,
+                    "decision": decision,
+                });
+                if cmd == "approve" {
+                    params["command"] = serde_json::json!(&request.command);
+                }
+
+                state
+                    .services
+                    .exec_approval
+                    .resolve(params)
+                    .await
+                    .map_err(ChannelError::unavailable)?;
+
+                use crate::approval::{MAX_COMMAND_PREVIEW_LEN, truncate_command_preview};
+                let preview = truncate_command_preview(&request.command, MAX_COMMAND_PREVIEW_LEN);
+                if cmd == "approve" {
+                    Ok(format!("Approved: `{preview}`"))
+                } else {
+                    Ok(format!("Denied: `{preview}`"))
                 }
             },
             "agent" => {
@@ -1356,14 +1799,8 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 };
 
                 if args.is_empty() {
-                    // List unique providers.
-                    let mut providers: Vec<String> = models
-                        .iter()
-                        .filter_map(|m| {
-                            m.get("provider").and_then(|v| v.as_str()).map(String::from)
-                        })
-                        .collect();
-                    providers.dedup();
+                    // List unique providers (sorted, deduplicated).
+                    let providers = unique_providers(models);
 
                     if providers.len() <= 1 {
                         // Single provider — list models directly.
@@ -1702,6 +2139,19 @@ impl ChannelEventSink for GatewayChannelEventSink {
     }
 }
 
+/// Collect the set of distinct `provider` values from a model list.
+///
+/// A `BTreeSet` makes the contract explicit: provider names are unique and
+/// returned in deterministic order for the Telegram `/model` inline keyboard.
+fn unique_providers(models: &[serde_json::Value]) -> Vec<String> {
+    models
+        .iter()
+        .filter_map(|m| m.get("provider").and_then(|v| v.as_str()).map(String::from))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// Format a numbered model list, optionally filtered by provider.
 ///
 /// Each line is: `N. DisplayName [provider] *` (where `*` marks the current model).
@@ -1766,6 +2216,7 @@ mod tests {
             account_id: "bot1".into(),
             chat_id: "12345".into(),
             message_id: None,
+            thread_id: None,
         };
         assert_eq!(default_channel_session_key(&target), "telegram:bot1:12345");
     }
@@ -1777,10 +2228,26 @@ mod tests {
             account_id: "bot1".into(),
             chat_id: "-100999".into(),
             message_id: None,
+            thread_id: None,
         };
         assert_eq!(
             default_channel_session_key(&target),
             "telegram:bot1:-100999"
+        );
+    }
+
+    #[test]
+    fn channel_session_key_forum_topic() {
+        let target = ChannelReplyTarget {
+            channel_type: ChannelType::Telegram,
+            account_id: "bot1".into(),
+            chat_id: "-100999".into(),
+            message_id: None,
+            thread_id: Some("42".into()),
+        };
+        assert_eq!(
+            default_channel_session_key(&target),
+            "telegram:bot1:-100999:42"
         );
     }
 
@@ -1812,6 +2279,7 @@ mod tests {
     #[test]
     fn shell_mode_rewrite_skips_control_commands() {
         assert!(rewrite_for_shell_mode("/context").is_none());
+        assert!(rewrite_for_shell_mode("/attach").is_none());
         assert!(rewrite_for_shell_mode("/sh uname -a").is_none());
     }
 
@@ -1819,11 +2287,221 @@ mod tests {
     fn peek_and_stop_are_control_commands() {
         assert!(is_channel_control_command_name("peek"));
         assert!(is_channel_control_command_name("stop"));
+        assert!(is_channel_control_command_name("attach"));
+        assert!(is_channel_control_command_name("approvals"));
+        assert!(is_channel_control_command_name("approve"));
+        assert!(is_channel_control_command_name("deny"));
     }
 
     #[test]
     fn shell_mode_rewrite_skips_peek_and_stop() {
         assert!(rewrite_for_shell_mode("/peek").is_none());
         assert!(rewrite_for_shell_mode("/stop").is_none());
+    }
+
+    // ── unique_providers ───────────────────────────────────────────
+
+    /// Regression test for GitHub issue #637: providers must be deduplicated
+    /// even when duplicates are not adjacent in the model list. Prior to the
+    /// fix, a bare `Vec::dedup` left non-consecutive duplicates in place,
+    /// surfacing as duplicate Telegram `/model` inline keyboard buttons.
+    #[test]
+    fn unique_providers_dedups_non_adjacent() {
+        let models = vec![
+            serde_json::json!({"id": "gpt-4o", "provider": "openai"}),
+            serde_json::json!({"id": "claude-3.5", "provider": "anthropic"}),
+            serde_json::json!({"id": "gpt-4o-mini", "provider": "openai"}),
+            serde_json::json!({"id": "gemini-pro", "provider": "google"}),
+            serde_json::json!({"id": "claude-3.7", "provider": "anthropic"}),
+        ];
+        let providers = unique_providers(&models);
+        assert_eq!(providers, vec!["anthropic", "google", "openai"]);
+    }
+
+    #[test]
+    fn unique_providers_sorted_alphabetically() {
+        let models = vec![
+            serde_json::json!({"id": "m1", "provider": "zeta"}),
+            serde_json::json!({"id": "m2", "provider": "alpha"}),
+            serde_json::json!({"id": "m3", "provider": "mu"}),
+        ];
+        assert_eq!(unique_providers(&models), vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn unique_providers_skips_entries_without_provider() {
+        let models = vec![
+            serde_json::json!({"id": "m1"}),
+            serde_json::json!({"id": "m2", "provider": "openai"}),
+            serde_json::json!({"id": "m3", "provider": serde_json::Value::Null}),
+        ];
+        assert_eq!(unique_providers(&models), vec!["openai"]);
+    }
+
+    #[test]
+    fn unique_providers_empty_input() {
+        assert!(unique_providers(&[]).is_empty());
+    }
+
+    #[test]
+    fn attachable_session_filter_skips_archived_and_cron_sessions() {
+        let archived = SessionEntry {
+            id: "1".into(),
+            key: "session:archived".into(),
+            label: None,
+            created_at: 0,
+            updated_at: 0,
+            message_count: 0,
+            last_seen_message_count: 0,
+            project_id: None,
+            archived: true,
+            worktree_branch: None,
+            sandbox_enabled: None,
+            sandbox_image: None,
+            channel_binding: None,
+            parent_session_key: None,
+            fork_point: None,
+            mcp_disabled: None,
+            preview: None,
+            agent_id: None,
+            model: None,
+            node_id: None,
+            version: 0,
+        };
+        let cron = SessionEntry {
+            key: "cron:heartbeat".into(),
+            archived: false,
+            ..archived.clone()
+        };
+        let normal = SessionEntry {
+            key: "session:normal".into(),
+            archived: false,
+            ..archived.clone()
+        };
+
+        assert!(!is_attachable_session(&cron));
+        assert!(!is_attachable_session(&archived));
+        assert!(is_attachable_session(&normal));
+    }
+
+    #[test]
+    fn format_attachable_sessions_shows_session_keys_when_labels_are_present() {
+        let sessions = vec![
+            SessionEntry {
+                id: "1".into(),
+                key: "main".into(),
+                label: None,
+                created_at: 0,
+                updated_at: 0,
+                message_count: 3,
+                last_seen_message_count: 0,
+                project_id: None,
+                archived: false,
+                worktree_branch: None,
+                sandbox_enabled: None,
+                sandbox_image: None,
+                channel_binding: None,
+                parent_session_key: None,
+                fork_point: None,
+                mcp_disabled: None,
+                preview: None,
+                agent_id: None,
+                model: None,
+                node_id: None,
+                version: 0,
+            },
+            SessionEntry {
+                id: "2".into(),
+                key: "session:abc".into(),
+                label: Some("Build Fix".into()),
+                created_at: 0,
+                updated_at: 0,
+                message_count: 12,
+                last_seen_message_count: 0,
+                project_id: None,
+                archived: false,
+                worktree_branch: None,
+                sandbox_enabled: None,
+                sandbox_image: None,
+                channel_binding: None,
+                parent_session_key: None,
+                fork_point: None,
+                mcp_disabled: None,
+                preview: None,
+                agent_id: None,
+                model: None,
+                node_id: None,
+                version: 0,
+            },
+        ];
+
+        let rendered = format_attachable_sessions_list(&sessions, "session:abc");
+        assert!(rendered.contains("1. main (3 msgs)"));
+        assert!(rendered.contains("2. Build Fix [session:abc] (12 msgs) *"));
+        assert!(rendered.contains("Use /attach N to move an existing session to this chat."));
+    }
+
+    #[test]
+    fn format_pending_approvals_renders_numbered_commands() {
+        let approvals = vec![
+            PendingApprovalView {
+                id: "1".into(),
+                command: "git status".into(),
+                session_key: Some("session:a".into()),
+            },
+            PendingApprovalView {
+                id: "2".into(),
+                command: "rm -rf /tmp/build".into(),
+                session_key: Some("session:a".into()),
+            },
+        ];
+
+        let rendered = format_pending_approvals_list(&approvals);
+        assert!(rendered.contains("1. `git status`"));
+        assert!(rendered.contains("2. `rm -rf /tmp/build`"));
+        assert!(rendered.contains("Use /approve N or /deny N."));
+    }
+
+    #[test]
+    fn channel_session_defaults_use_sender_override_for_group_commands() {
+        let config = serde_json::json!({
+            "model": "default-model",
+            "agent_id": "default-agent",
+            "channel_overrides": {
+                "group-1": {
+                    "model": "channel-model",
+                    "agent_id": "channel-agent"
+                }
+            },
+            "user_overrides": {
+                "user-42": {
+                    "model": "user-model",
+                    "agent_id": "user-agent"
+                }
+            }
+        });
+
+        let defaults =
+            resolve_channel_session_defaults_from_config(&config, "group-1", Some("user-42"));
+        assert_eq!(defaults.model.as_deref(), Some("user-model"));
+        assert_eq!(defaults.agent_id.as_deref(), Some("user-agent"));
+    }
+
+    #[test]
+    fn channel_session_defaults_use_chat_id_for_dm_commands() {
+        let config = serde_json::json!({
+            "model": "default-model",
+            "agent_id": "default-agent",
+            "user_overrides": {
+                "dm-1": {
+                    "model": "dm-model",
+                    "agent_id": "dm-agent"
+                }
+            }
+        });
+
+        let defaults = resolve_channel_session_defaults_from_config(&config, "dm-1", Some("dm-1"));
+        assert_eq!(defaults.model.as_deref(), Some("dm-model"));
+        assert_eq!(defaults.agent_id.as_deref(), Some("dm-agent"));
     }
 }

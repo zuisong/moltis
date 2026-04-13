@@ -1,14 +1,12 @@
 use std::{
-    collections::HashMap,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
 };
 
 use tracing::warn;
 
 use {
-    moltis_config::VoiceSttProvider,
+    moltis_agents::prompt::WorkspaceFilePromptStatus,
     moltis_protocol::{ErrorShape, error_codes},
 };
 
@@ -18,19 +16,6 @@ use crate::{
 };
 
 use super::{MethodContext, MethodRegistry};
-
-pub(super) fn model_probe_params(provider: Option<&str>) -> serde_json::Value {
-    let mut params = serde_json::json!({
-        "background": true,
-        "reason": "provider_connected",
-    });
-    if let Some(provider) = provider
-        && !provider.trim().is_empty()
-    {
-        params["provider"] = serde_json::json!(provider);
-    }
-    params
-}
 
 async fn active_session_key_for_ctx(ctx: &MethodContext) -> Option<String> {
     if let Some(session_key) = ctx
@@ -137,15 +122,7 @@ fn read_identity_payload_for_agent(agent_id: &str) -> serde_json::Value {
             identity.theme = file_identity.theme;
         }
     }
-    let mut user = config.user;
-    if let Some(file_user) = moltis_config::load_user() {
-        if file_user.name.is_some() {
-            user.name = file_user.name;
-        }
-        if file_user.timezone.is_some() {
-            user.timezone = file_user.timezone;
-        }
-    }
+    let user = moltis_config::resolve_user_profile_from_config(&config);
     let resolved_name = identity
         .name
         .clone()
@@ -220,16 +197,194 @@ fn normalize_relative_agent_path(path: &str) -> Result<PathBuf, ErrorShape> {
     Ok(candidate.to_path_buf())
 }
 
-fn read_agent_file(agent_id: &str, relative_path: &Path) -> Result<String, ErrorShape> {
-    let primary = moltis_config::agent_workspace_dir(agent_id).join(relative_path);
-    let fallback = (agent_id == "main").then(|| moltis_config::data_dir().join(relative_path));
+#[derive(Debug, Clone, serde::Serialize)]
+struct WorkspacePromptFileStatusResponse {
+    path: String,
+    source: &'static str,
+    size: Option<u64>,
+    #[serde(flatten)]
+    prompt_status: WorkspaceFilePromptStatus,
+}
 
-    let target = if primary.exists() {
-        Some(primary)
-    } else {
-        fallback.filter(|path| path.exists())
+fn workspace_file_limit_chars(ctx: &MethodContext) -> usize {
+    ctx.state.config.chat.workspace_file_max_chars
+}
+
+fn invalid_memory_config_value(field: &str, value: &str) -> ErrorShape {
+    ErrorShape::new(
+        error_codes::INVALID_REQUEST,
+        format!("invalid memory config value for '{field}': '{value}'"),
+    )
+}
+
+fn parse_memory_style(value: &str) -> Result<moltis_config::MemoryStyle, ErrorShape> {
+    match value {
+        "hybrid" => Ok(moltis_config::MemoryStyle::Hybrid),
+        "prompt-only" => Ok(moltis_config::MemoryStyle::PromptOnly),
+        "search-only" => Ok(moltis_config::MemoryStyle::SearchOnly),
+        "off" => Ok(moltis_config::MemoryStyle::Off),
+        _ => Err(invalid_memory_config_value("style", value)),
     }
-    .ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "file not found"))?;
+}
+
+fn parse_agent_memory_write_mode(
+    value: &str,
+) -> Result<moltis_config::AgentMemoryWriteMode, ErrorShape> {
+    match value {
+        "hybrid" => Ok(moltis_config::AgentMemoryWriteMode::Hybrid),
+        "prompt-only" => Ok(moltis_config::AgentMemoryWriteMode::PromptOnly),
+        "search-only" => Ok(moltis_config::AgentMemoryWriteMode::SearchOnly),
+        "off" => Ok(moltis_config::AgentMemoryWriteMode::Off),
+        _ => Err(invalid_memory_config_value("agent_write_mode", value)),
+    }
+}
+
+fn parse_user_profile_write_mode(
+    value: &str,
+) -> Result<moltis_config::UserProfileWriteMode, ErrorShape> {
+    match value {
+        "explicit-and-auto" => Ok(moltis_config::UserProfileWriteMode::ExplicitAndAuto),
+        "explicit-only" => Ok(moltis_config::UserProfileWriteMode::ExplicitOnly),
+        "off" => Ok(moltis_config::UserProfileWriteMode::Off),
+        _ => Err(invalid_memory_config_value(
+            "user_profile_write_mode",
+            value,
+        )),
+    }
+}
+
+fn parse_memory_backend(value: &str) -> Result<moltis_config::MemoryBackend, ErrorShape> {
+    match value {
+        "builtin" => Ok(moltis_config::MemoryBackend::Builtin),
+        "qmd" => Ok(moltis_config::MemoryBackend::Qmd),
+        _ => Err(invalid_memory_config_value("backend", value)),
+    }
+}
+
+fn parse_memory_provider(value: &str) -> Result<Option<moltis_config::MemoryProvider>, ErrorShape> {
+    match value {
+        "auto" => Ok(None),
+        "local" => Ok(Some(moltis_config::MemoryProvider::Local)),
+        "ollama" => Ok(Some(moltis_config::MemoryProvider::Ollama)),
+        "openai" => Ok(Some(moltis_config::MemoryProvider::OpenAi)),
+        "custom" => Ok(Some(moltis_config::MemoryProvider::Custom)),
+        _ => Err(invalid_memory_config_value("provider", value)),
+    }
+}
+
+fn parse_memory_citations_mode(
+    value: &str,
+) -> Result<moltis_config::MemoryCitationsMode, ErrorShape> {
+    match value {
+        "on" => Ok(moltis_config::MemoryCitationsMode::On),
+        "off" => Ok(moltis_config::MemoryCitationsMode::Off),
+        "auto" => Ok(moltis_config::MemoryCitationsMode::Auto),
+        _ => Err(invalid_memory_config_value("citations", value)),
+    }
+}
+
+fn parse_memory_search_merge_strategy(
+    value: &str,
+) -> Result<moltis_config::MemorySearchMergeStrategy, ErrorShape> {
+    match value {
+        "rrf" => Ok(moltis_config::MemorySearchMergeStrategy::Rrf),
+        "linear" => Ok(moltis_config::MemorySearchMergeStrategy::Linear),
+        _ => Err(invalid_memory_config_value("search_merge_strategy", value)),
+    }
+}
+
+fn parse_session_export_mode(
+    value: &serde_json::Value,
+) -> Result<moltis_config::SessionExportMode, ErrorShape> {
+    match value {
+        serde_json::Value::Bool(false) => Ok(moltis_config::SessionExportMode::Off),
+        serde_json::Value::Bool(true) => Ok(moltis_config::SessionExportMode::OnNewOrReset),
+        serde_json::Value::String(string) => match string.as_str() {
+            "off" => Ok(moltis_config::SessionExportMode::Off),
+            "on-new-or-reset" => Ok(moltis_config::SessionExportMode::OnNewOrReset),
+            _ => Err(invalid_memory_config_value("session_export", string)),
+        },
+        _ => Err(ErrorShape::new(
+            error_codes::INVALID_REQUEST,
+            "invalid memory config value for 'session_export': expected bool or string",
+        )),
+    }
+}
+
+fn parse_prompt_memory_mode(value: &str) -> Result<moltis_config::PromptMemoryMode, ErrorShape> {
+    match value {
+        "live-reload" => Ok(moltis_config::PromptMemoryMode::LiveReload),
+        "frozen-at-session-start" => Ok(moltis_config::PromptMemoryMode::FrozenAtSessionStart),
+        _ => Err(invalid_memory_config_value("prompt_memory_mode", value)),
+    }
+}
+
+fn should_fallback_agent_file_to_root(agent_id: &str, relative_path: &Path) -> bool {
+    if agent_id == "main" {
+        return true;
+    }
+
+    matches!(relative_path.to_str(), Some("AGENTS.md") | Some("TOOLS.md"))
+}
+
+fn resolve_agent_file_target(
+    agent_id: &str,
+    relative_path: &Path,
+) -> Option<(PathBuf, &'static str)> {
+    let primary = moltis_config::agent_workspace_dir(agent_id).join(relative_path);
+    if primary.exists() {
+        return Some((primary, "agent"));
+    }
+
+    if should_fallback_agent_file_to_root(agent_id, relative_path) {
+        let fallback = moltis_config::data_dir().join(relative_path);
+        if fallback.exists() {
+            return Some((fallback, "root"));
+        }
+    }
+
+    None
+}
+
+fn workspace_prompt_file_status(
+    agent_id: &str,
+    file_name: &str,
+    limit_chars: usize,
+) -> Option<WorkspacePromptFileStatusResponse> {
+    let relative_path = Path::new(file_name);
+    let (path, source) = resolve_agent_file_target(agent_id, relative_path)?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    let normalized = moltis_config::normalize_workspace_markdown_content(&content)?;
+    let original_chars = normalized.chars().count();
+    let size_bytes = std::fs::metadata(&path).ok().map(|meta| meta.len());
+    Some(WorkspacePromptFileStatusResponse {
+        path: file_name.to_string(),
+        source,
+        size: size_bytes,
+        prompt_status: WorkspaceFilePromptStatus {
+            name: file_name.to_string(),
+            original_chars,
+            included_chars: original_chars.min(limit_chars),
+            limit_chars,
+            truncated_chars: original_chars.saturating_sub(limit_chars),
+            truncated: original_chars > limit_chars,
+        },
+    })
+}
+
+fn workspace_prompt_files_status(agent_id: &str, limit_chars: usize) -> Vec<serde_json::Value> {
+    ["AGENTS.md", "TOOLS.md"]
+        .iter()
+        .filter_map(|file_name| {
+            workspace_prompt_file_status(agent_id, file_name, limit_chars)
+                .and_then(|status| serde_json::to_value(status).ok())
+        })
+        .collect()
+}
+
+fn read_agent_file(agent_id: &str, relative_path: &Path) -> Result<String, ErrorShape> {
+    let (target, _) = resolve_agent_file_target(agent_id, relative_path)
+        .ok_or_else(|| ErrorShape::new(error_codes::INVALID_REQUEST, "file not found"))?;
 
     std::fs::read_to_string(target)
         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))
@@ -388,7 +543,28 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                         ));
                     };
                     let default_id = store.default_id().await.map_err(ErrorShape::from)?;
-                    let agents = store.list().await.map_err(ErrorShape::from)?;
+                    let limit_chars = workspace_file_limit_chars(&ctx);
+                    let agents = store
+                        .list()
+                        .await
+                        .map_err(ErrorShape::from)?
+                        .into_iter()
+                        .map(|agent| {
+                            let agent_id = agent.id.clone();
+                            let mut value = serde_json::to_value(agent)
+                                .unwrap_or_else(|_| serde_json::json!({}));
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "workspace_prompt_files".to_string(),
+                                    serde_json::Value::Array(workspace_prompt_files_status(
+                                        &agent_id,
+                                        limit_chars,
+                                    )),
+                                );
+                            }
+                            value
+                        })
+                        .collect::<Vec<_>>();
                     Ok(serde_json::json!({
                         "default_id": default_id,
                         "agents": agents,
@@ -421,6 +597,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
 
                     let mut payload = serde_json::to_value(agent)
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e.to_string()))?;
+                    let limit_chars = workspace_file_limit_chars(&ctx);
                     if let Some(obj) = payload.as_object_mut() {
                         obj.insert(
                             "identity_fields".to_string(),
@@ -440,6 +617,13 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                     .await
                                     .unwrap_or_else(|_| "main".to_string())
                             ),
+                        );
+                        obj.insert(
+                            "workspace_prompt_files".to_string(),
+                            serde_json::Value::Array(workspace_prompt_files_status(
+                                &id,
+                                limit_chars,
+                            )),
                         );
                     }
                     Ok(payload)
@@ -694,29 +878,46 @@ pub(super) fn register(reg: &mut MethodRegistry) {
             Box::new(|ctx| {
                 Box::pin(async move {
                     let agent_id = resolve_requested_agent_id(&ctx, &ctx.params).await?;
+                    let limit_chars = workspace_file_limit_chars(&ctx);
                     let mut files: Vec<serde_json::Value> = Vec::new();
                     let root = moltis_config::agent_workspace_dir(&agent_id);
                     let root_exists = root.exists();
                     if root_exists {
                         list_agent_workspace_files_recursively(&root, &root, &mut files);
                     }
-                    if agent_id == "main" {
-                        for file_name in &[
-                            "IDENTITY.md",
-                            "SOUL.md",
-                            "MEMORY.md",
-                            "AGENTS.md",
-                            "TOOLS.md",
-                        ] {
-                            let agent_path = root.join(file_name);
-                            let root_path = moltis_config::data_dir().join(file_name);
-                            if !agent_path.exists() && root_path.exists() {
-                                files.push(serde_json::json!({
-                                    "path": file_name,
-                                    "source": "root",
-                                    "size": std::fs::metadata(root_path).ok().map(|m| m.len()),
-                                }));
+                    for file_name in &[
+                        "IDENTITY.md",
+                        "SOUL.md",
+                        "MEMORY.md",
+                        "AGENTS.md",
+                        "TOOLS.md",
+                    ] {
+                        let relative_path = Path::new(file_name);
+                        if !should_fallback_agent_file_to_root(&agent_id, relative_path) {
+                            continue;
+                        }
+                        let agent_path = root.join(file_name);
+                        let root_path = moltis_config::data_dir().join(file_name);
+                        if !agent_path.exists() && root_path.exists() {
+                            let mut entry = serde_json::json!({
+                                "path": file_name,
+                                "source": "root",
+                                "size": std::fs::metadata(&root_path).ok().map(|m| m.len()),
+                            });
+                            if matches!(*file_name, "AGENTS.md" | "TOOLS.md")
+                                && let Some(obj) = entry.as_object_mut()
+                                && let Some(status) =
+                                    workspace_prompt_file_status(&agent_id, file_name, limit_chars)
+                                && let Ok(status_value) = serde_json::to_value(status)
+                                && let Some(status_obj) = status_value.as_object()
+                            {
+                                for (key, value) in status_obj {
+                                    if key != "path" && key != "source" && key != "size" {
+                                        obj.insert(key.clone(), value.clone());
+                                    }
+                                }
                             }
+                            files.push(entry);
                         }
                     }
                     files.sort_by(|left, right| {
@@ -1344,6 +1545,19 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
     reg.register(
+        "channels.retry_ownership",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .channel
+                    .retry_ownership(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
         "channels.logout",
         Box::new(|ctx| {
             Box::pin(async move {
@@ -1569,6 +1783,138 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
 
+    // Webhooks
+    reg.register(
+        "webhooks.list",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .list()
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.get",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .get(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.create",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .create(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.update",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .update(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.delete",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .delete(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.deliveries",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .deliveries(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.delivery.get",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .delivery_get(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.delivery.payload",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .delivery_payload(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.delivery.actions",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .delivery_actions(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "webhooks.profiles",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .webhooks
+                    .profiles()
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+
     // Heartbeat
     reg.register(
         "heartbeat.status",
@@ -1682,6 +2028,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             sandbox: Some(moltis_cron::types::CronSandboxConfig {
                                 enabled: patch.sandbox_enabled,
                                 image: patch.sandbox_image.clone(),
+                                auto_prune_container: None,
                             }),
                             ..Default::default()
                         };
@@ -1718,6 +2065,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             sandbox: moltis_cron::types::CronSandboxConfig {
                                 enabled: patch.sandbox_enabled,
                                 image: patch.sandbox_image.clone(),
+                                auto_prune_container: None,
                             },
                             wake_mode: moltis_cron::types::CronWakeMode::default(),
                         };
@@ -2006,6 +2354,22 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .chat()
                     .await
                     .full_context(params)
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+
+    reg.register(
+        "chat.prompt_memory.refresh",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                let mut params = ctx.params.clone();
+                params["_conn_id"] = serde_json::json!(ctx.client_conn_id);
+                ctx.state
+                    .chat()
+                    .await
+                    .refresh_prompt_memory(params)
                     .await
                     .map_err(ErrorShape::from)
             })
@@ -2327,7 +2691,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                     )),
                                 ];
                                 let result = tokio::time::timeout(
-                                    Duration::from_secs(3),
+                                    std::time::Duration::from_secs(3),
                                     provider.complete(&messages, &[]),
                                 )
                                 .await;
@@ -2579,6 +2943,45 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     .services
                     .skills
                     .repos_remove(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.repos.export",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .repos_export(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.repos.import",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .repos_import(ctx.params.clone())
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
+        "skills.repos.unquarantine",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .skills
+                    .repos_unquarantine(ctx.params.clone())
                     .await
                     .map_err(ErrorShape::from)
             })
@@ -3129,6 +3532,19 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         }),
     );
     reg.register(
+        "models.cancel_detect",
+        Box::new(|ctx| {
+            Box::pin(async move {
+                ctx.state
+                    .services
+                    .model
+                    .cancel_detect()
+                    .await
+                    .map_err(ErrorShape::from)
+            })
+        }),
+    );
+    reg.register(
         "models.test",
         Box::new(|ctx| {
             Box::pin(async move {
@@ -3160,30 +3576,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "providers.save_key",
         Box::new(|ctx| {
             Box::pin(async move {
-                let provider_name = ctx
-                    .params
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-
-                let result = ctx
-                    .state
+                ctx.state
                     .services
                     .provider_setup
                     .save_key(ctx.params.clone())
                     .await
-                    .map_err(ErrorShape::from)?;
-
-                // Kick off background model detection after saving provider
-                // credentials, matching the behaviour of oauth.complete.
-                let model_service = Arc::clone(&ctx.state.services.model);
-                tokio::spawn(async move {
-                    let _ = model_service
-                        .detect_supported(model_probe_params(provider_name.as_deref()))
-                        .await;
-                });
-
-                Ok(result)
+                    .map_err(ErrorShape::from)
             })
         }),
     );
@@ -3204,35 +3602,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "providers.oauth.start",
         Box::new(|ctx| {
             Box::pin(async move {
-                let provider_name = ctx
-                    .params
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-                let result = ctx
-                    .state
+                ctx.state
                     .services
                     .provider_setup
                     .oauth_start(ctx.params.clone())
                     .await
-                    .map_err(ErrorShape::from)?;
-
-                // If oauth.start short-circuited because valid tokens already
-                // existed, trigger a provider-scoped background probe now.
-                if result
-                    .get("alreadyAuthenticated")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    let model_service = Arc::clone(&ctx.state.services.model);
-                    tokio::spawn(async move {
-                        let _ = model_service
-                            .detect_supported(model_probe_params(provider_name.as_deref()))
-                            .await;
-                    });
-                }
-
-                Ok(result)
+                    .map_err(ErrorShape::from)
             })
         }),
     );
@@ -3253,28 +3628,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "providers.oauth.complete",
         Box::new(|ctx| {
             Box::pin(async move {
-                let result = ctx
-                    .state
+                ctx.state
                     .services
                     .provider_setup
                     .oauth_complete(ctx.params.clone())
                     .await
-                    .map_err(ErrorShape::from)?;
-
-                let provider_name = result
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-
-                // Kick off background support probing after OAuth provider connect.
-                let model_service = Arc::clone(&ctx.state.services.model);
-                tokio::spawn(async move {
-                    let _ = model_service
-                        .detect_supported(model_probe_params(provider_name.as_deref()))
-                        .await;
-                });
-
-                Ok(result)
+                    .map_err(ErrorShape::from)
             })
         }),
     );
@@ -3295,29 +3654,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "providers.save_models",
         Box::new(|ctx| {
             Box::pin(async move {
-                let provider_name = ctx
-                    .params
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned);
-
-                let result = ctx
-                    .state
+                ctx.state
                     .services
                     .provider_setup
                     .save_models(ctx.params.clone())
                     .await
-                    .map_err(ErrorShape::from)?;
-
-                // Kick off background support probing after saving preferred models.
-                let model_service = Arc::clone(&ctx.state.services.model);
-                tokio::spawn(async move {
-                    let _ = model_service
-                        .detect_supported(model_probe_params(provider_name.as_deref()))
-                        .await;
-                });
-
-                Ok(result)
+                    .map_err(ErrorShape::from)
             })
         }),
     );
@@ -3967,7 +4309,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 // Auto-enable both TTS and STT with ElevenLabs
                                 cfg.voice.tts.provider = "elevenlabs".to_string();
                                 cfg.voice.tts.enabled = true;
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::ElevenLabs);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::ElevenLabs);
                                 cfg.voice.stt.enabled = true;
                             },
                             "openai" | "openai-tts" => {
@@ -3985,25 +4328,29 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 // Auto-enable both TTS and STT with Google
                                 cfg.voice.tts.provider = "google".to_string();
                                 cfg.voice.tts.enabled = true;
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::Google);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::Google);
                                 cfg.voice.stt.enabled = true;
                             },
                             // STT providers
                             "whisper" => {
                                 cfg.voice.stt.whisper.api_key =
                                     Some(Secret::new(api_key.to_string()));
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::Whisper);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::Whisper);
                                 cfg.voice.stt.enabled = true;
                             },
                             "groq" => {
                                 cfg.voice.stt.groq.api_key = Some(Secret::new(api_key.to_string()));
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::Groq);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::Groq);
                                 cfg.voice.stt.enabled = true;
                             },
                             "deepgram" => {
                                 cfg.voice.stt.deepgram.api_key =
                                     Some(Secret::new(api_key.to_string()));
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::Deepgram);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::Deepgram);
                                 cfg.voice.stt.enabled = true;
                             },
                             "google" => {
@@ -4013,7 +4360,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 cfg.voice.tts.google.api_key =
                                     Some(Secret::new(api_key.to_string()));
                                 // Auto-enable both STT and TTS with Google
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::Google);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::Google);
                                 cfg.voice.stt.enabled = true;
                                 cfg.voice.tts.provider = "google".to_string();
                                 cfg.voice.tts.enabled = true;
@@ -4021,7 +4369,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             "mistral" => {
                                 cfg.voice.stt.mistral.api_key =
                                     Some(Secret::new(api_key.to_string()));
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::Mistral);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::Mistral);
                                 cfg.voice.stt.enabled = true;
                             },
                             "elevenlabs-stt" => {
@@ -4031,7 +4380,8 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                 cfg.voice.tts.elevenlabs.api_key =
                                     Some(Secret::new(api_key.to_string()));
                                 // Auto-enable both STT and TTS with ElevenLabs
-                                cfg.voice.stt.provider = Some(VoiceSttProvider::ElevenLabs);
+                                cfg.voice.stt.provider =
+                                    Some(moltis_config::VoiceSttProvider::ElevenLabs);
                                 cfg.voice.stt.enabled = true;
                                 cfg.voice.tts.provider = "elevenlabs".to_string();
                                 cfg.voice.tts.enabled = true;
@@ -4239,6 +4589,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     match mm.status().await {
                         Ok(status) => Ok(serde_json::json!({
                             "available": true,
+                            "backend": mm.backend_name(),
                             "total_files": status.total_files,
                             "total_chunks": status.total_chunks,
                             "db_size": status.db_size_bytes,
@@ -4268,12 +4619,55 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 // Read memory config from the config file
                 let config = moltis_config::discover_and_load();
                 let memory = &config.memory;
+                let chat = &config.chat;
                 Ok(serde_json::json!({
-                    "backend": memory.backend.as_deref().unwrap_or("builtin"),
-                    "citations": memory.citations.as_deref().unwrap_or("auto"),
+                    "style": match memory.style {
+                        moltis_config::MemoryStyle::Hybrid => "hybrid",
+                        moltis_config::MemoryStyle::PromptOnly => "prompt-only",
+                        moltis_config::MemoryStyle::SearchOnly => "search-only",
+                        moltis_config::MemoryStyle::Off => "off",
+                    },
+                    "agent_write_mode": match memory.agent_write_mode {
+                        moltis_config::AgentMemoryWriteMode::Hybrid => "hybrid",
+                        moltis_config::AgentMemoryWriteMode::PromptOnly => "prompt-only",
+                        moltis_config::AgentMemoryWriteMode::SearchOnly => "search-only",
+                        moltis_config::AgentMemoryWriteMode::Off => "off",
+                    },
+                    "user_profile_write_mode": match memory.user_profile_write_mode {
+                        moltis_config::UserProfileWriteMode::ExplicitAndAuto => "explicit-and-auto",
+                        moltis_config::UserProfileWriteMode::ExplicitOnly => "explicit-only",
+                        moltis_config::UserProfileWriteMode::Off => "off",
+                    },
+                    "backend": match memory.backend {
+                        moltis_config::MemoryBackend::Builtin => "builtin",
+                        moltis_config::MemoryBackend::Qmd => "qmd",
+                    },
+                    "provider": match memory.provider {
+                        Some(moltis_config::MemoryProvider::Local) => "local",
+                        Some(moltis_config::MemoryProvider::Ollama) => "ollama",
+                        Some(moltis_config::MemoryProvider::OpenAi) => "openai",
+                        Some(moltis_config::MemoryProvider::Custom) => "custom",
+                        None => "auto",
+                    },
+                    "citations": match memory.citations {
+                        moltis_config::MemoryCitationsMode::On => "on",
+                        moltis_config::MemoryCitationsMode::Off => "off",
+                        moltis_config::MemoryCitationsMode::Auto => "auto",
+                    },
                     "disable_rag": memory.disable_rag,
                     "llm_reranking": memory.llm_reranking,
-                    "session_export": memory.session_export,
+                    "search_merge_strategy": match memory.search_merge_strategy {
+                        moltis_config::MemorySearchMergeStrategy::Rrf => "rrf",
+                        moltis_config::MemorySearchMergeStrategy::Linear => "linear",
+                    },
+                    "session_export": match memory.session_export {
+                        moltis_config::SessionExportMode::Off => "off",
+                        moltis_config::SessionExportMode::OnNewOrReset => "on-new-or-reset",
+                    },
+                    "prompt_memory_mode": match chat.prompt_memory_mode {
+                        moltis_config::PromptMemoryMode::LiveReload => "live-reload",
+                        moltis_config::PromptMemoryMode::FrozenAtSessionStart => "frozen-at-session-start",
+                    },
                     "qmd_feature_enabled": cfg!(feature = "qmd"),
                 }))
             })
@@ -4284,52 +4678,137 @@ pub(super) fn register(reg: &mut MethodRegistry) {
         "memory.config.update",
         Box::new(|ctx| {
             Box::pin(async move {
+                let current_config = moltis_config::discover_and_load();
+                let current_memory = current_config.memory;
+                let current_chat = current_config.chat;
+                let style = ctx.params.get("style").and_then(|v| v.as_str()).unwrap_or(
+                    match current_memory.style {
+                        moltis_config::MemoryStyle::Hybrid => "hybrid",
+                        moltis_config::MemoryStyle::PromptOnly => "prompt-only",
+                        moltis_config::MemoryStyle::SearchOnly => "search-only",
+                        moltis_config::MemoryStyle::Off => "off",
+                    },
+                );
                 let backend = ctx
                     .params
                     .get("backend")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("builtin");
+                    .unwrap_or(match current_memory.backend {
+                        moltis_config::MemoryBackend::Builtin => "builtin",
+                        moltis_config::MemoryBackend::Qmd => "qmd",
+                    });
+                let agent_write_mode = ctx
+                    .params
+                    .get("agent_write_mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(match current_memory.agent_write_mode {
+                        moltis_config::AgentMemoryWriteMode::Hybrid => "hybrid",
+                        moltis_config::AgentMemoryWriteMode::PromptOnly => "prompt-only",
+                        moltis_config::AgentMemoryWriteMode::SearchOnly => "search-only",
+                        moltis_config::AgentMemoryWriteMode::Off => "off",
+                    });
+                let user_profile_write_mode = ctx
+                    .params
+                    .get("user_profile_write_mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(match current_memory.user_profile_write_mode {
+                        moltis_config::UserProfileWriteMode::ExplicitAndAuto => "explicit-and-auto",
+                        moltis_config::UserProfileWriteMode::ExplicitOnly => "explicit-only",
+                        moltis_config::UserProfileWriteMode::Off => "off",
+                    });
                 let citations = ctx
                     .params
                     .get("citations")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("auto");
+                    .unwrap_or(match current_memory.citations {
+                        moltis_config::MemoryCitationsMode::On => "on",
+                        moltis_config::MemoryCitationsMode::Off => "off",
+                        moltis_config::MemoryCitationsMode::Auto => "auto",
+                    });
+                let provider = ctx
+                    .params
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(match current_memory.provider {
+                        Some(moltis_config::MemoryProvider::Local) => "local",
+                        Some(moltis_config::MemoryProvider::Ollama) => "ollama",
+                        Some(moltis_config::MemoryProvider::OpenAi) => "openai",
+                        Some(moltis_config::MemoryProvider::Custom) => "custom",
+                        None => "auto",
+                    });
                 let llm_reranking = ctx
                     .params
                     .get("llm_reranking")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let disable_rag = ctx.params.get("disable_rag").and_then(|v| v.as_bool());
-                let session_export = ctx
+                    .unwrap_or(current_memory.llm_reranking);
+                let search_merge_strategy = ctx
                     .params
-                    .get("session_export")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                // Persist to moltis.toml so the config survives restarts.
-                let backend_str = backend.to_string();
-                let citations_str = citations.to_string();
-                let mut effective_disable_rag =
-                    moltis_config::discover_and_load().memory.disable_rag;
+                    .get("search_merge_strategy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(match current_memory.search_merge_strategy {
+                        moltis_config::MemorySearchMergeStrategy::Rrf => "rrf",
+                        moltis_config::MemorySearchMergeStrategy::Linear => "linear",
+                    });
+                let style_value = parse_memory_style(style)?;
+                let backend_value = parse_memory_backend(backend)?;
+                let agent_write_mode_value = parse_agent_memory_write_mode(agent_write_mode)?;
+                let user_profile_write_mode_value =
+                    parse_user_profile_write_mode(user_profile_write_mode)?;
+                let citations_value = parse_memory_citations_mode(citations)?;
+                let provider_value = parse_memory_provider(provider)?;
+                let search_merge_strategy_value =
+                    parse_memory_search_merge_strategy(search_merge_strategy)?;
+                let disable_rag = ctx.params.get("disable_rag").and_then(|v| v.as_bool());
+                let session_export = match ctx.params.get("session_export") {
+                    Some(value) => parse_session_export_mode(value)?,
+                    None => current_memory.session_export,
+                };
+                let prompt_memory_mode = ctx
+                    .params
+                    .get("prompt_memory_mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(match current_chat.prompt_memory_mode {
+                        moltis_config::PromptMemoryMode::LiveReload => "live-reload",
+                        moltis_config::PromptMemoryMode::FrozenAtSessionStart => {
+                            "frozen-at-session-start"
+                        },
+                    });
+                let prompt_memory_mode_value = parse_prompt_memory_mode(prompt_memory_mode)?;
+                let mut effective_disable_rag = current_memory.disable_rag;
                 if let Err(e) = moltis_config::update_config(|cfg| {
-                    cfg.memory.backend = Some(backend_str.clone());
-                    cfg.memory.citations = Some(citations_str.clone());
+                    cfg.memory.style = style_value;
+                    cfg.memory.agent_write_mode = agent_write_mode_value;
+                    cfg.memory.user_profile_write_mode = user_profile_write_mode_value;
+                    cfg.memory.backend = backend_value;
+                    cfg.memory.provider = provider_value;
+                    cfg.memory.citations = citations_value;
                     cfg.memory.llm_reranking = llm_reranking;
+                    cfg.memory.search_merge_strategy = search_merge_strategy_value;
                     if let Some(value) = disable_rag {
                         cfg.memory.disable_rag = value;
                     }
                     cfg.memory.session_export = session_export;
+                    cfg.chat.prompt_memory_mode = prompt_memory_mode_value;
                     effective_disable_rag = cfg.memory.disable_rag;
                 }) {
                     tracing::warn!(error = %e, "failed to persist memory config");
                 }
 
                 Ok(serde_json::json!({
+                    "style": style,
+                    "agent_write_mode": agent_write_mode,
+                    "user_profile_write_mode": user_profile_write_mode,
                     "backend": backend,
+                    "provider": provider,
                     "citations": citations,
                     "disable_rag": effective_disable_rag,
                     "llm_reranking": llm_reranking,
-                    "session_export": session_export,
+                    "search_merge_strategy": search_merge_strategy,
+                    "session_export": match session_export {
+                        moltis_config::SessionExportMode::Off => "off",
+                        moltis_config::SessionExportMode::OnNewOrReset => "on-new-or-reset",
+                    },
+                    "prompt_memory_mode": prompt_memory_mode,
                 }))
             })
         }),
@@ -4352,10 +4831,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             .command
                             .clone()
                             .unwrap_or_else(|| "qmd".into()),
-                        collections: HashMap::new(),
+                        collections: std::collections::HashMap::new(),
                         max_results: config.memory.qmd.max_results.unwrap_or(10),
                         timeout_ms: config.memory.qmd.timeout_ms.unwrap_or(30_000),
                         work_dir: moltis_config::data_dir(),
+                        index_name: "moltis-status".into(),
+                        env_overrides: std::collections::HashMap::new(),
                     };
 
                     let manager = QmdManager::new(qmd_config);
@@ -4657,5 +5138,228 @@ async fn persist_disabled_hooks(state: &Arc<crate::state::GatewayState>) {
     let json = serde_json::to_string_pretty(&disabled).unwrap_or_default();
     if let Err(e) = std::fs::write(&path, json) {
         warn!("failed to persist disabled hooks: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::{
+            auth::{AuthMode, ResolvedAuth},
+            services::GatewayServices,
+            state::GatewayState,
+        },
+        tempfile::TempDir,
+    };
+
+    struct MemoryConfigTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _config_dir: TempDir,
+        _data_dir: TempDir,
+    }
+
+    impl MemoryConfigTestGuard {
+        fn new() -> Self {
+            let lock = crate::config_override_test_lock();
+            let config_dir = tempfile::tempdir()
+                .unwrap_or_else(|error| panic!("config tempdir should be created: {error}"));
+            let data_dir = tempfile::tempdir()
+                .unwrap_or_else(|error| panic!("data tempdir should be created: {error}"));
+            moltis_config::set_config_dir(config_dir.path().to_path_buf());
+            moltis_config::set_data_dir(data_dir.path().to_path_buf());
+            Self {
+                _lock: lock,
+                _config_dir: config_dir,
+                _data_dir: data_dir,
+            }
+        }
+    }
+
+    impl Drop for MemoryConfigTestGuard {
+        fn drop(&mut self) {
+            moltis_config::clear_config_dir();
+            moltis_config::clear_data_dir();
+        }
+    }
+
+    async fn dispatch_memory_method(method: &str, params: serde_json::Value) -> serde_json::Value {
+        let mut reg = MethodRegistry::default();
+        register(&mut reg);
+        let response = reg
+            .dispatch(MethodContext {
+                request_id: "test".into(),
+                method: method.to_string(),
+                params,
+                client_conn_id: "conn-1".into(),
+                client_role: "operator".into(),
+                client_scopes: vec!["operator.write".into(), "operator.read".into()],
+                state: GatewayState::new(
+                    ResolvedAuth {
+                        mode: AuthMode::Token,
+                        token: None,
+                        password: None,
+                    },
+                    GatewayServices::noop(),
+                ),
+                channel: None,
+            })
+            .await;
+
+        assert!(response.ok, "method failed: {:?}", response.error);
+        match response.payload {
+            Some(payload) => payload,
+            None => panic!("method {method} returned no payload"),
+        }
+    }
+
+    async fn dispatch_memory_method_response(
+        method: &str,
+        params: serde_json::Value,
+    ) -> moltis_protocol::ResponseFrame {
+        let mut reg = MethodRegistry::default();
+        register(&mut reg);
+        reg.dispatch(MethodContext {
+            request_id: "test".into(),
+            method: method.to_string(),
+            params,
+            client_conn_id: "conn-1".into(),
+            client_role: "operator".into(),
+            client_scopes: vec!["operator.write".into(), "operator.read".into()],
+            state: GatewayState::new(
+                ResolvedAuth {
+                    mode: AuthMode::Token,
+                    token: None,
+                    password: None,
+                },
+                GatewayServices::noop(),
+            ),
+            channel: None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn memory_config_get_reports_typed_memory_fields() {
+        let _guard = MemoryConfigTestGuard::new();
+        let update_result = moltis_config::update_config(|cfg| {
+            cfg.memory.style = moltis_config::MemoryStyle::SearchOnly;
+            cfg.memory.agent_write_mode = moltis_config::AgentMemoryWriteMode::PromptOnly;
+            cfg.memory.user_profile_write_mode = moltis_config::UserProfileWriteMode::ExplicitOnly;
+            cfg.memory.backend = moltis_config::MemoryBackend::Qmd;
+            cfg.memory.provider = Some(moltis_config::MemoryProvider::OpenAi);
+            cfg.memory.citations = moltis_config::MemoryCitationsMode::Off;
+            cfg.memory.disable_rag = true;
+            cfg.memory.llm_reranking = true;
+            cfg.memory.search_merge_strategy = moltis_config::MemorySearchMergeStrategy::Linear;
+            cfg.memory.session_export = moltis_config::SessionExportMode::Off;
+            cfg.chat.prompt_memory_mode = moltis_config::PromptMemoryMode::FrozenAtSessionStart;
+        });
+        assert!(update_result.is_ok(), "config update should succeed");
+
+        let payload = dispatch_memory_method("memory.config.get", serde_json::json!({})).await;
+        assert_eq!(payload["style"], "search-only");
+        assert_eq!(payload["agent_write_mode"], "prompt-only");
+        assert_eq!(payload["user_profile_write_mode"], "explicit-only");
+        assert_eq!(payload["backend"], "qmd");
+        assert_eq!(payload["provider"], "openai");
+        assert_eq!(payload["citations"], "off");
+        assert_eq!(payload["disable_rag"], true);
+        assert_eq!(payload["llm_reranking"], true);
+        assert_eq!(payload["search_merge_strategy"], "linear");
+        assert_eq!(payload["session_export"], "off");
+        assert_eq!(payload["prompt_memory_mode"], "frozen-at-session-start");
+    }
+
+    #[tokio::test]
+    async fn memory_config_update_persists_typed_memory_fields() {
+        let _guard = MemoryConfigTestGuard::new();
+
+        let payload = dispatch_memory_method(
+            "memory.config.update",
+            serde_json::json!({
+                "style": "prompt-only",
+                "agent_write_mode": "search-only",
+                "user_profile_write_mode": "off",
+                "backend": "qmd",
+                "provider": "custom",
+                "citations": "on",
+                "disable_rag": true,
+                "llm_reranking": true,
+                "search_merge_strategy": "linear",
+                "session_export": false,
+                "prompt_memory_mode": "frozen-at-session-start",
+            }),
+        )
+        .await;
+
+        assert_eq!(payload["style"], "prompt-only");
+        assert_eq!(payload["agent_write_mode"], "search-only");
+        assert_eq!(payload["user_profile_write_mode"], "off");
+        assert_eq!(payload["backend"], "qmd");
+        assert_eq!(payload["provider"], "custom");
+        assert_eq!(payload["citations"], "on");
+        assert_eq!(payload["disable_rag"], true);
+        assert_eq!(payload["llm_reranking"], true);
+        assert_eq!(payload["search_merge_strategy"], "linear");
+        assert_eq!(payload["session_export"], "off");
+        assert_eq!(payload["prompt_memory_mode"], "frozen-at-session-start");
+
+        let config = moltis_config::discover_and_load();
+        assert_eq!(config.memory.style, moltis_config::MemoryStyle::PromptOnly);
+        assert_eq!(
+            config.memory.agent_write_mode,
+            moltis_config::AgentMemoryWriteMode::SearchOnly
+        );
+        assert_eq!(
+            config.memory.user_profile_write_mode,
+            moltis_config::UserProfileWriteMode::Off
+        );
+        assert_eq!(config.memory.backend, moltis_config::MemoryBackend::Qmd);
+        assert_eq!(
+            config.memory.provider,
+            Some(moltis_config::MemoryProvider::Custom)
+        );
+        assert_eq!(
+            config.memory.citations,
+            moltis_config::MemoryCitationsMode::On
+        );
+        assert!(config.memory.disable_rag);
+        assert!(config.memory.llm_reranking);
+        assert_eq!(
+            config.memory.search_merge_strategy,
+            moltis_config::MemorySearchMergeStrategy::Linear
+        );
+        assert_eq!(
+            config.memory.session_export,
+            moltis_config::SessionExportMode::Off
+        );
+        assert_eq!(
+            config.chat.prompt_memory_mode,
+            moltis_config::PromptMemoryMode::FrozenAtSessionStart
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_config_update_rejects_unknown_enum_values() {
+        let _guard = MemoryConfigTestGuard::new();
+        let response = dispatch_memory_method_response(
+            "memory.config.update",
+            serde_json::json!({
+                "style": "surprise-mode",
+            }),
+        )
+        .await;
+
+        assert!(!response.ok, "invalid enum value should fail");
+        let error = match response.error {
+            Some(error) => error,
+            None => panic!("expected invalid request error"),
+        };
+        assert_eq!(error.code, error_codes::INVALID_REQUEST);
+        assert_eq!(
+            error.message,
+            "invalid memory config value for 'style': 'surprise-mode'"
+        );
     }
 }

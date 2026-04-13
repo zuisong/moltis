@@ -46,9 +46,14 @@ impl From<&str> for ServiceError {
 
 impl From<ServiceError> for moltis_protocol::ErrorShape {
     fn from(err: ServiceError) -> Self {
+        // INTERNAL is correct here: ServiceError represents application-level failures
+        // (validation errors, probe failures, noop-service "not configured" errors).
+        // Transient UNAVAILABLE codes are emitted directly by gateway/state.rs,
+        // methods/node.rs, and client-side WS checks — they do not flow through
+        // ServiceError and are unaffected by this mapping.
         let code = match &err {
             ServiceError::Forbidden { .. } => moltis_protocol::error_codes::FORBIDDEN,
-            _ => moltis_protocol::error_codes::UNAVAILABLE,
+            _ => moltis_protocol::error_codes::INTERNAL,
         };
         Self::new(code, err.to_string())
     }
@@ -191,6 +196,7 @@ pub trait ChannelService: Send + Sync {
     async fn add(&self, params: Value) -> ServiceResult;
     async fn remove(&self, params: Value) -> ServiceResult;
     async fn update(&self, params: Value) -> ServiceResult;
+    async fn retry_ownership(&self, params: Value) -> ServiceResult;
     async fn senders_list(&self, params: Value) -> ServiceResult;
     async fn sender_approve(&self, params: Value) -> ServiceResult;
     async fn sender_deny(&self, params: Value) -> ServiceResult;
@@ -221,6 +227,10 @@ impl ChannelService for NoopChannelService {
     }
 
     async fn update(&self, _p: Value) -> ServiceResult {
+        Err("no channel service configured".into())
+    }
+
+    async fn retry_ownership(&self, _p: Value) -> ServiceResult {
         Err("no channel service configured".into())
     }
 
@@ -319,6 +329,67 @@ impl CronService for NoopCronService {
     }
 }
 
+// ── Webhooks ────────────────────────────────────────────────────────────────
+
+#[async_trait]
+pub trait WebhooksService: Send + Sync {
+    async fn list(&self) -> ServiceResult;
+    async fn get(&self, params: Value) -> ServiceResult;
+    async fn create(&self, params: Value) -> ServiceResult;
+    async fn update(&self, params: Value) -> ServiceResult;
+    async fn delete(&self, params: Value) -> ServiceResult;
+    async fn deliveries(&self, params: Value) -> ServiceResult;
+    async fn delivery_get(&self, params: Value) -> ServiceResult;
+    async fn delivery_payload(&self, params: Value) -> ServiceResult;
+    async fn delivery_actions(&self, params: Value) -> ServiceResult;
+    async fn profiles(&self) -> ServiceResult;
+}
+
+pub struct NoopWebhooksService;
+
+#[async_trait]
+impl WebhooksService for NoopWebhooksService {
+    async fn list(&self) -> ServiceResult {
+        Ok(serde_json::json!([]))
+    }
+
+    async fn get(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn create(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn update(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn delete(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn deliveries(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn delivery_get(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn delivery_payload(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn delivery_actions(&self, _params: Value) -> ServiceResult {
+        Err("webhooks not configured".into())
+    }
+
+    async fn profiles(&self) -> ServiceResult {
+        Ok(serde_json::json!([]))
+    }
+}
+
 // ── Chat ────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -340,6 +411,10 @@ pub trait ChatService: Send + Sync {
     async fn raw_prompt(&self, params: Value) -> ServiceResult;
     /// Return the full messages array (system prompt + history) in OpenAI format.
     async fn full_context(&self, params: Value) -> ServiceResult;
+    /// Refresh the prompt-memory snapshot for the resolved session.
+    async fn refresh_prompt_memory(&self, _params: Value) -> ServiceResult {
+        Err("chat not configured".into())
+    }
     /// Return whether the given session has an active run (LLM responding).
     async fn active(&self, _params: Value) -> ServiceResult {
         Ok(serde_json::json!({ "active": false }))
@@ -406,6 +481,10 @@ impl ChatService for NoopChatService {
     }
 
     async fn full_context(&self, _p: Value) -> ServiceResult {
+        Err("chat not configured".into())
+    }
+
+    async fn refresh_prompt_memory(&self, _p: Value) -> ServiceResult {
         Err("chat not configured".into())
     }
 
@@ -613,6 +692,9 @@ pub trait SkillsService: Send + Sync {
     /// Full repos list with per-skill details (for search). Heavyweight.
     async fn repos_list_full(&self) -> ServiceResult;
     async fn repos_remove(&self, params: Value) -> ServiceResult;
+    async fn repos_export(&self, params: Value) -> ServiceResult;
+    async fn repos_import(&self, params: Value) -> ServiceResult;
+    async fn repos_unquarantine(&self, params: Value) -> ServiceResult;
     async fn emergency_disable(&self) -> ServiceResult;
     async fn skill_enable(&self, params: Value) -> ServiceResult;
     async fn skill_disable(&self, params: Value) -> ServiceResult;
@@ -666,6 +748,18 @@ impl SkillsService for NoopSkillsStub {
     }
 
     async fn repos_remove(&self, _params: Value) -> ServiceResult {
+        Err("skills service not configured".into())
+    }
+
+    async fn repos_export(&self, _params: Value) -> ServiceResult {
+        Err("skills service not configured".into())
+    }
+
+    async fn repos_import(&self, _params: Value) -> ServiceResult {
+        Err("skills service not configured".into())
+    }
+
+    async fn repos_unquarantine(&self, _params: Value) -> ServiceResult {
         Err("skills service not configured".into())
     }
 
@@ -887,6 +981,8 @@ pub trait ModelService: Send + Sync {
     async fn enable(&self, params: Value) -> ServiceResult;
     /// Probe configured models and flag unsupported ones for this account.
     async fn detect_supported(&self, params: Value) -> ServiceResult;
+    /// Cancel an in-flight `detect_supported` run.
+    async fn cancel_detect(&self) -> ServiceResult;
     /// Test a single model by sending a probe request.
     async fn test(&self, params: Value) -> ServiceResult;
 }
@@ -923,6 +1019,10 @@ impl ModelService for NoopModelService {
         Err(model_service_not_configured_error(
             "models.detect_supported",
         ))
+    }
+
+    async fn cancel_detect(&self) -> ServiceResult {
+        Ok(serde_json::json!({ "ok": true, "cancelled": false }))
     }
 
     async fn test(&self, _params: Value) -> ServiceResult {
@@ -1318,9 +1418,54 @@ impl Default for Services {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, serde_json::json};
 
     struct SlowShutdownBrowserService;
+
+    struct DefaultRefreshChatService;
+
+    #[async_trait::async_trait]
+    impl ChatService for DefaultRefreshChatService {
+        async fn send(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn abort(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn cancel_queued(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn history(&self, _params: Value) -> ServiceResult {
+            Ok(json!([]))
+        }
+
+        async fn inject(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn clear(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn compact(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn context(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn raw_prompt(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+
+        async fn full_context(&self, _params: Value) -> ServiceResult {
+            Ok(json!({}))
+        }
+    }
 
     #[async_trait::async_trait]
     impl BrowserService for SlowShutdownBrowserService {
@@ -1366,5 +1511,18 @@ mod tests {
     fn model_service_not_configured_error_returns_expected_message() {
         let error = model_service_not_configured_error("models.test");
         assert_eq!(error.to_string(), "model service not configured");
+    }
+
+    #[tokio::test]
+    async fn chat_service_default_refresh_prompt_memory_returns_not_configured() {
+        let svc = DefaultRefreshChatService;
+        let error = match svc
+            .refresh_prompt_memory(json!({ "sessionKey": "session-a" }))
+            .await
+        {
+            Ok(value) => panic!("default refresh should be unavailable, got {value:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "chat not configured");
     }
 }

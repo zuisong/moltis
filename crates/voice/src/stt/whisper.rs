@@ -32,6 +32,7 @@ pub struct WhisperStt {
     api_key: Option<Secret<String>>,
     base_url: String,
     model: String,
+    language: Option<String>,
 }
 
 impl std::fmt::Debug for WhisperStt {
@@ -40,6 +41,7 @@ impl std::fmt::Debug for WhisperStt {
             .field("api_key", &"[REDACTED]")
             .field("base_url", &self.base_url)
             .field("model", &self.model)
+            .field("language", &self.language)
             .finish()
     }
 }
@@ -54,26 +56,29 @@ impl WhisperStt {
     /// Create a new Whisper STT provider.
     #[must_use]
     pub fn new(api_key: Option<Secret<String>>) -> Self {
-        Self {
-            client: Client::new(),
-            api_key,
-            base_url: API_BASE.into(),
-            model: DEFAULT_MODEL.into(),
-        }
+        Self::with_options(api_key, None, None, None)
     }
 
-    /// Create with custom model and optional base URL.
+    /// Create with custom model (no base URL or language override).
+    #[must_use]
+    pub fn with_model(api_key: Option<Secret<String>>, model: Option<String>) -> Self {
+        Self::with_options(api_key, None, model, None)
+    }
+
+    /// Create with custom base URL, model, and language.
     #[must_use]
     pub fn with_options(
         api_key: Option<Secret<String>>,
         base_url: Option<String>,
         model: Option<String>,
+        language: Option<String>,
     ) -> Self {
         Self {
             client: Client::new(),
             api_key,
             base_url: base_url.unwrap_or_else(|| API_BASE.into()),
             model: model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+            language,
         }
     }
 
@@ -119,7 +124,8 @@ impl SttProvider for WhisperStt {
             .text("model", self.model.clone())
             .text("response_format", "verbose_json");
 
-        if let Some(language) = request.language {
+        // Request language overrides the configured language, otherwise fall back.
+        if let Some(language) = request.language.or_else(|| self.language.clone()) {
             form = form.text("language", language);
         }
 
@@ -251,16 +257,61 @@ mod tests {
             Some(Secret::new("key".into())),
             None,
             Some("whisper-large-v3".into()),
+            None,
         );
         assert_eq!(provider.model, "whisper-large-v3");
         assert_eq!(provider.base_url, API_BASE);
+        assert!(provider.language.is_none());
     }
 
     #[test]
     fn test_with_custom_base_url() {
-        let provider = WhisperStt::with_options(None, Some("http://10.1.2.30:8001".into()), None);
+        let provider =
+            WhisperStt::with_options(None, Some("http://10.1.2.30:8001".into()), None, None);
         assert!(provider.is_configured());
         assert_eq!(provider.base_url, "http://10.1.2.30:8001");
+    }
+
+    #[test]
+    fn test_with_options_sets_model_and_language() {
+        let provider = WhisperStt::with_options(
+            Some(Secret::new("key".into())),
+            None,
+            Some("whisper-large-v3".into()),
+            Some("ru".into()),
+        );
+        assert_eq!(provider.model, "whisper-large-v3");
+        assert_eq!(provider.language, Some("ru".into()));
+    }
+
+    #[test]
+    fn test_with_options_defaults() {
+        let provider =
+            WhisperStt::with_options(Some(Secret::new("key".into())), None, None, None);
+        assert_eq!(provider.model, DEFAULT_MODEL);
+        assert!(provider.language.is_none());
+    }
+
+    #[test]
+    fn test_new_delegates_to_with_options() {
+        let provider = WhisperStt::new(Some(Secret::new("key".into())));
+        assert_eq!(provider.model, DEFAULT_MODEL);
+        assert!(provider.language.is_none());
+    }
+
+    #[test]
+    fn test_debug_includes_language() {
+        let provider = WhisperStt::with_options(
+            Some(Secret::new("super-secret-key".into())),
+            None,
+            Some("whisper-large-v3".into()),
+            Some("ru".into()),
+        );
+        let debug_output = format!("{:?}", provider);
+        assert!(debug_output.contains("[REDACTED]"));
+        assert!(!debug_output.contains("super-secret-key"));
+        assert!(debug_output.contains("whisper-large-v3"));
+        assert!(debug_output.contains("ru"));
     }
 
     #[test]

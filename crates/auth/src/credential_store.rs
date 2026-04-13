@@ -9,7 +9,7 @@ use {
             PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
         },
     },
-    secrecy::ExposeSecret,
+    secrecy::{ExposeSecret, Secret},
     serde::{Deserialize, Serialize},
     sha2::{Digest, Sha256},
     sqlx::SqlitePool,
@@ -17,6 +17,12 @@ use {
 
 #[cfg(feature = "vault")]
 use moltis_vault::Vault;
+
+/// Pre-computed Argon2 hash used for constant-time dummy verification when no
+/// password is set. This prevents timing side channels that would reveal
+/// whether a password exists. The actual value doesn't matter — it will
+/// never match any real input.
+const DUMMY_ARGON2_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -33,6 +39,22 @@ pub enum AuthMethod {
 #[derive(Debug, Clone)]
 pub struct AuthIdentity {
     pub method: AuthMethod,
+    /// Scopes granted to this identity. Empty for full access (password,
+    /// passkey, loopback). Populated for API keys with scope restrictions.
+    pub scopes: Vec<String>,
+}
+
+impl AuthIdentity {
+    /// Returns `true` if this identity has the given scope, or has
+    /// unrestricted access (password/passkey/loopback or unscooped API key).
+    pub fn has_scope(&self, scope: &str) -> bool {
+        // Non-API-key methods always have full access.
+        if self.method != AuthMethod::ApiKey {
+            return true;
+        }
+        // API keys with empty scopes have full access (legacy behavior).
+        self.scopes.is_empty() || self.scopes.iter().any(|s| s == scope)
+    }
 }
 
 /// A registered passkey entry (for listing in the UI).
@@ -82,6 +104,70 @@ pub struct EnvVarEntry {
     pub encrypted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshAuthMode {
+    System,
+    Managed,
+}
+
+impl SshAuthMode {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Managed => "managed",
+        }
+    }
+
+    fn parse_db(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "system" => Ok(Self::System),
+            "managed" => Ok(Self::Managed),
+            _ => anyhow::bail!("unknown ssh auth mode '{value}'"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshKeyEntry {
+    pub id: i64,
+    pub name: String,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub encrypted: bool,
+    pub target_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SshTargetEntry {
+    pub id: i64,
+    pub label: String,
+    pub target: String,
+    pub port: Option<u16>,
+    pub known_host: Option<String>,
+    pub auth_mode: SshAuthMode,
+    pub key_id: Option<i64>,
+    pub key_name: Option<String>,
+    pub is_default: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SshResolvedTarget {
+    pub id: i64,
+    pub node_id: String,
+    pub label: String,
+    pub target: String,
+    pub port: Option<u16>,
+    pub known_host: Option<String>,
+    pub auth_mode: SshAuthMode,
+    pub key_id: Option<i64>,
+    pub key_name: Option<String>,
+}
+
 // ── Credential store ─────────────────────────────────────────────────────────
 
 /// Single-user credential store backed by SQLite.
@@ -97,6 +183,12 @@ pub struct CredentialStore {
 }
 
 impl CredentialStore {
+    // ── Sessions ─────────────────────────────────────────────────────────
+
+    /// Maximum number of concurrent active sessions. Oldest sessions are
+    /// evicted when the cap is reached.
+    const MAX_SESSIONS: i64 = 10;
+
     /// Open a database at the given path, reset all auth, and close it.
     pub async fn reset_from_db_path(db_path: &std::path::Path) -> anyhow::Result<()> {
         let db_url = format!("sqlite:{}", db_path.display());
@@ -212,7 +304,8 @@ impl CredentialStore {
                 key_prefix TEXT    NOT NULL,
                 created_at TEXT    NOT NULL DEFAULT (datetime('now')),
                 revoked_at TEXT,
-                scopes     TEXT
+                scopes     TEXT,
+                key_salt   TEXT
             )",
         )
         .execute(&self.pool)
@@ -229,6 +322,18 @@ impl CredentialStore {
         .await?;
 
         sqlx::query(
+            "CREATE TABLE IF NOT EXISTS auth_audit_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT    NOT NULL,
+                client_ip  TEXT,
+                detail     TEXT,
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS env_variables (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 key        TEXT    NOT NULL UNIQUE,
@@ -236,6 +341,39 @@ impl CredentialStore {
                 encrypted  INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT    NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ssh_keys (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT    NOT NULL UNIQUE,
+                private_key TEXT    NOT NULL,
+                public_key  TEXT    NOT NULL,
+                fingerprint TEXT    NOT NULL,
+                encrypted   INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS ssh_targets (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                label       TEXT    NOT NULL UNIQUE,
+                target      TEXT    NOT NULL,
+                port        INTEGER,
+                known_host  TEXT,
+                auth_mode   TEXT    NOT NULL DEFAULT 'system',
+                key_id      INTEGER,
+                is_default  INTEGER NOT NULL DEFAULT 0,
+                created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                updated_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY(key_id) REFERENCES ssh_keys(id)
             )",
         )
         .execute(&self.pool)
@@ -359,13 +497,22 @@ impl CredentialStore {
     }
 
     /// Verify a password against the stored hash.
+    ///
+    /// When no password is set, a dummy Argon2 verification is performed
+    /// to prevent timing side channels that would reveal whether a password
+    /// exists.
     pub async fn verify_password(&self, password: &str) -> anyhow::Result<bool> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT password_hash FROM auth_password WHERE id = 1")
                 .fetch_optional(&self.pool)
                 .await?;
-        let Some((hash,)) = row else {
-            return Ok(false);
+        let hash = match row {
+            Some((h,)) => h,
+            None => {
+                // Perform dummy verification to avoid timing leak.
+                let _ = verify_password(password, DUMMY_ARGON2_HASH);
+                return Ok(false);
+            },
         };
         Ok(verify_password(password, &hash))
     }
@@ -394,10 +541,30 @@ impl CredentialStore {
         Ok(())
     }
 
-    // ── Sessions ─────────────────────────────────────────────────────────
-
     /// Create a new session token (30-day expiry).
+    ///
+    /// Enforces a cap of [`MAX_SESSIONS`] active (non-expired) sessions.
+    /// When the cap is reached, the oldest sessions are deleted to make room.
     pub async fn create_session(&self) -> anyhow::Result<String> {
+        // Clean up expired sessions first.
+        sqlx::query("DELETE FROM auth_sessions WHERE expires_at <= datetime('now')")
+            .execute(&self.pool)
+            .await?;
+
+        // Evict oldest sessions if we're at the cap.
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM auth_sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        if count.0 >= Self::MAX_SESSIONS {
+            let to_delete = count.0 - Self::MAX_SESSIONS + 1;
+            sqlx::query(
+                "DELETE FROM auth_sessions WHERE token IN (SELECT token FROM auth_sessions ORDER BY created_at ASC LIMIT ?)",
+            )
+            .bind(to_delete)
+            .execute(&self.pool)
+            .await?;
+        }
+
         let token = generate_token();
         sqlx::query(
             "INSERT INTO auth_sessions (token, expires_at) VALUES (?, datetime('now', '+30 days'))",
@@ -439,7 +606,8 @@ impl CredentialStore {
     // ── API Keys ─────────────────────────────────────────────────────────
 
     /// Generate a new API key with optional scopes. Returns (id, raw_key).
-    /// The raw key is only shown once — we store only its SHA-256 hash.
+    /// The raw key is only shown once — we store its HMAC-SHA256 hash with
+    /// a per-key random salt.
     ///
     /// If `scopes` is None or empty, the key will have no access until scopes are set.
     pub async fn create_api_key(
@@ -449,7 +617,8 @@ impl CredentialStore {
     ) -> anyhow::Result<(i64, String)> {
         let raw_key = format!("mk_{}", generate_token());
         let prefix = &raw_key[..raw_key.len().min(11)]; // "mk_" + 8 chars
-        let hash = sha256_hex(&raw_key);
+        let salt = generate_token();
+        let hash = hmac_sha256_hex(&raw_key, &salt);
 
         // Store scopes as JSON array, or NULL for full access
         let scopes_json = scopes
@@ -457,12 +626,13 @@ impl CredentialStore {
             .map(|s| serde_json::to_string(s).unwrap_or_default());
 
         let result = sqlx::query(
-            "INSERT INTO api_keys (label, key_hash, key_prefix, scopes) VALUES (?, ?, ?, ?)",
+            "INSERT INTO api_keys (label, key_hash, key_prefix, scopes, key_salt) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(label)
         .bind(&hash)
         .bind(prefix)
         .bind(&scopes_json)
+        .bind(&salt)
         .execute(&self.pool)
         .await?;
         Ok((result.last_insert_rowid(), raw_key))
@@ -505,24 +675,36 @@ impl CredentialStore {
 
     /// Verify a raw API key. Returns `Some(ApiKeyVerification)` if valid,
     /// `None` if invalid or revoked.
+    ///
+    /// Supports both salted (HMAC-SHA256) and legacy unsalted (SHA-256) keys.
     pub async fn verify_api_key(
         &self,
         raw_key: &str,
     ) -> anyhow::Result<Option<ApiKeyVerification>> {
-        let hash = sha256_hex(raw_key);
-        let row: Option<(i64, Option<String>)> = sqlx::query_as(
-            "SELECT id, scopes FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+        // Fetch all active keys and verify against each.
+        // The key set is small (typically <10), so this is acceptable.
+        let rows: Vec<(i64, String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, key_hash, scopes, key_salt FROM api_keys WHERE revoked_at IS NULL",
         )
-        .bind(&hash)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
 
-        Ok(row.map(|(key_id, scopes_json)| {
-            let scopes = scopes_json
-                .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
-                .unwrap_or_default();
-            ApiKeyVerification { key_id, scopes }
-        }))
+        for (key_id, stored_hash, scopes_json, salt) in rows {
+            let matches = if let Some(ref s) = salt {
+                // Salted key: HMAC-SHA256.
+                hmac_sha256_hex(raw_key, s) == stored_hash
+            } else {
+                // Legacy unsalted key: plain SHA-256.
+                sha256_hex(raw_key) == stored_hash
+            };
+            if matches {
+                let scopes = scopes_json
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+                    .unwrap_or_default();
+                return Ok(Some(ApiKeyVerification { key_id, scopes }));
+            }
+        }
+        Ok(None)
     }
 
     // ── Environment Variables ─────────────────────────────────────────────
@@ -627,11 +809,509 @@ impl CredentialStore {
                 }
             };
             #[cfg(not(feature = "vault"))]
-            let plaintext = value;
+            let plaintext = {
+                let _ = encrypted;
+                value
+            };
 
             result.push((key, plaintext));
         }
         Ok(result)
+    }
+
+    // ── Managed SSH Keys / Targets ──────────────────────────────────────
+
+    pub async fn list_ssh_keys(&self) -> anyhow::Result<Vec<SshKeyEntry>> {
+        let rows: Vec<(i64, String, String, String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT
+                k.id,
+                k.name,
+                k.public_key,
+                k.fingerprint,
+                strftime('%Y-%m-%dT%H:%M:%SZ', k.created_at),
+                strftime('%Y-%m-%dT%H:%M:%SZ', k.updated_at),
+                COALESCE(k.encrypted, 0),
+                COUNT(t.id)
+            FROM ssh_keys k
+            LEFT JOIN ssh_targets t ON t.key_id = k.id
+            GROUP BY k.id, k.name, k.public_key, k.fingerprint, k.created_at, k.updated_at, k.encrypted
+            ORDER BY k.name ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    name,
+                    public_key,
+                    fingerprint,
+                    created_at,
+                    updated_at,
+                    encrypted,
+                    target_count,
+                )| SshKeyEntry {
+                    id,
+                    name,
+                    public_key,
+                    fingerprint,
+                    created_at,
+                    updated_at,
+                    encrypted: encrypted != 0,
+                    target_count,
+                },
+            )
+            .collect())
+    }
+
+    pub async fn create_ssh_key(
+        &self,
+        name: &str,
+        private_key: &str,
+        public_key: &str,
+        fingerprint: &str,
+    ) -> anyhow::Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("ssh key name is required");
+        }
+
+        #[cfg(feature = "vault")]
+        let (store_private_key, encrypted) = {
+            if let Some(ref vault) = self.vault {
+                if vault.is_unsealed().await {
+                    let aad = format!("ssh-key:{name}");
+                    let enc = vault.encrypt_string(private_key, &aad).await?;
+                    (enc, 1_i64)
+                } else {
+                    // Managed SSH keys created while the vault is locked are
+                    // stored transiently in plaintext and upgraded by the
+                    // vault migration on the next successful unseal.
+                    (private_key.to_owned(), 0_i64)
+                }
+            } else {
+                (private_key.to_owned(), 0_i64)
+            }
+        };
+        #[cfg(not(feature = "vault"))]
+        let (store_private_key, encrypted) = (private_key.to_owned(), 0_i64);
+
+        let result = sqlx::query(
+            "INSERT INTO ssh_keys (name, private_key, public_key, fingerprint, encrypted)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(name)
+        .bind(store_private_key)
+        .bind(public_key.trim())
+        .bind(fingerprint.trim())
+        .bind(encrypted)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn delete_ssh_key(&self, id: i64) -> anyhow::Result<()> {
+        let deleted = sqlx::query(
+            "DELETE FROM ssh_keys
+             WHERE id = ?
+               AND NOT EXISTS (SELECT 1 FROM ssh_targets WHERE key_id = ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        if deleted.rows_affected() == 0 {
+            let in_use: Option<(i64,)> =
+                sqlx::query_as("SELECT COUNT(1) FROM ssh_targets WHERE key_id = ?")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+            if in_use.is_some_and(|(count,)| count > 0) {
+                anyhow::bail!("ssh key is still assigned to one or more targets");
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn get_ssh_private_key(&self, key_id: i64) -> anyhow::Result<Option<Secret<String>>> {
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT name, private_key, COALESCE(encrypted, 0) FROM ssh_keys WHERE id = ?",
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((name, private_key, encrypted)) = row else {
+            return Ok(None);
+        };
+
+        #[cfg(feature = "vault")]
+        {
+            if encrypted != 0 {
+                let Some(ref vault) = self.vault else {
+                    anyhow::bail!("vault not available for encrypted ssh key");
+                };
+                let aad = format!("ssh-key:{name}");
+                let decrypted = vault.decrypt_string(&private_key, &aad).await?;
+                return Ok(Some(Secret::new(decrypted)));
+            }
+        }
+
+        let _ = name;
+        let _ = encrypted;
+        Ok(Some(Secret::new(private_key)))
+    }
+
+    pub async fn list_ssh_targets(&self) -> anyhow::Result<Vec<SshTargetEntry>> {
+        let rows: Vec<(
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+            i64,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT
+                t.id,
+                t.label,
+                t.target,
+                t.port,
+                t.known_host,
+                t.auth_mode,
+                t.key_id,
+                k.name,
+                COALESCE(t.is_default, 0),
+                strftime('%Y-%m-%dT%H:%M:%SZ', t.created_at),
+                strftime('%Y-%m-%dT%H:%M:%SZ', t.updated_at)
+            FROM ssh_targets t
+            LEFT JOIN ssh_keys k ON k.id = t.key_id
+            ORDER BY t.is_default DESC, t.label ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    label,
+                    target,
+                    port,
+                    known_host,
+                    auth_mode,
+                    key_id,
+                    key_name,
+                    is_default,
+                    created_at,
+                    updated_at,
+                )| {
+                    let port = port.and_then(|value| u16::try_from(value).ok());
+                    Ok(SshTargetEntry {
+                        id,
+                        label,
+                        target,
+                        port,
+                        known_host,
+                        auth_mode: SshAuthMode::parse_db(&auth_mode)?,
+                        key_id,
+                        key_name,
+                        is_default: is_default != 0,
+                        created_at,
+                        updated_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    pub async fn create_ssh_target(
+        &self,
+        label: &str,
+        target: &str,
+        port: Option<u16>,
+        known_host: Option<&str>,
+        auth_mode: SshAuthMode,
+        key_id: Option<i64>,
+        is_default: bool,
+    ) -> anyhow::Result<i64> {
+        let label = label.trim();
+        let target = target.trim();
+        let known_host = known_host
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if label.is_empty() {
+            anyhow::bail!("ssh target label is required");
+        }
+        if target.is_empty() {
+            anyhow::bail!("ssh target is required");
+        }
+
+        let key_id = match auth_mode {
+            SshAuthMode::System => None,
+            SshAuthMode::Managed => {
+                let Some(key_id) = key_id else {
+                    anyhow::bail!("managed ssh targets require a key");
+                };
+                let exists: Option<(i64,)> = sqlx::query_as("SELECT id FROM ssh_keys WHERE id = ?")
+                    .bind(key_id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if exists.is_none() {
+                    anyhow::bail!("selected ssh key does not exist");
+                }
+                Some(key_id)
+            },
+        };
+
+        let mut tx = self.pool.begin().await?;
+        let has_default: Option<(i64,)> =
+            sqlx::query_as("SELECT COUNT(1) FROM ssh_targets WHERE is_default = 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let should_be_default = is_default || has_default.unwrap_or((0,)).0 == 0;
+        if should_be_default {
+            sqlx::query("UPDATE ssh_targets SET is_default = 0")
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let result = sqlx::query(
+            "INSERT INTO ssh_targets (label, target, port, known_host, auth_mode, key_id, is_default)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(label)
+        .bind(target)
+        .bind(port.map(i64::from))
+        .bind(known_host)
+        .bind(auth_mode.as_db_str())
+        .bind(key_id)
+        .bind(if should_be_default {
+            1_i64
+        } else {
+            0_i64
+        })
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        Ok(result.last_insert_rowid())
+    }
+
+    pub async fn delete_ssh_target(&self, id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let was_default: Option<(i64,)> =
+            sqlx::query_as("SELECT COALESCE(is_default, 0) FROM ssh_targets WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        sqlx::query("DELETE FROM ssh_targets WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        if was_default.is_some_and(|(flag,)| flag != 0) {
+            let replacement: Option<(i64,)> = sqlx::query_as(
+                "SELECT id FROM ssh_targets ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some((replacement_id,)) = replacement {
+                sqlx::query(
+                    "UPDATE ssh_targets SET is_default = 1, updated_at = datetime('now') WHERE id = ?",
+                )
+                .bind(replacement_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn set_default_ssh_target(&self, id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE ssh_targets SET is_default = 0")
+            .execute(&mut *tx)
+            .await?;
+        let updated = sqlx::query(
+            "UPDATE ssh_targets SET is_default = 1, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            anyhow::bail!("ssh target not found");
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn update_ssh_target_known_host(
+        &self,
+        id: i64,
+        known_host: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let known_host = known_host
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let result = sqlx::query(
+            "UPDATE ssh_targets SET known_host = ?, updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(known_host)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("ssh target not found");
+        }
+        Ok(())
+    }
+
+    pub async fn ssh_target_count(&self) -> anyhow::Result<usize> {
+        let row: Option<(i64,)> = sqlx::query_as("SELECT COUNT(1) FROM ssh_targets")
+            .fetch_optional(&self.pool)
+            .await?;
+        let count = row.unwrap_or((0,)).0;
+        Ok(usize::try_from(count).unwrap_or_default())
+    }
+
+    pub async fn get_default_ssh_target(&self) -> anyhow::Result<Option<SshResolvedTarget>> {
+        let row: Option<(
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT
+                    t.id,
+                    t.label,
+                    t.target,
+                    t.port,
+                    t.known_host,
+                    t.auth_mode,
+                    t.key_id,
+                    k.name
+                 FROM ssh_targets t
+                 LEFT JOIN ssh_keys k ON k.id = t.key_id
+                 WHERE t.is_default = 1
+                 ORDER BY t.updated_at DESC
+                 LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((id, label, target, port, known_host, auth_mode, key_id, key_name)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(SshResolvedTarget {
+            id,
+            node_id: format!("ssh:target:{id}"),
+            label,
+            target,
+            port: port.and_then(|value| u16::try_from(value).ok()),
+            known_host,
+            auth_mode: SshAuthMode::parse_db(&auth_mode)?,
+            key_id,
+            key_name,
+        }))
+    }
+
+    pub async fn resolve_ssh_target(
+        &self,
+        node_ref: &str,
+    ) -> anyhow::Result<Option<SshResolvedTarget>> {
+        if let Some(id_str) = node_ref.strip_prefix("ssh:target:")
+            && let Ok(id) = id_str.parse::<i64>()
+        {
+            return self.resolve_ssh_target_by_id(id).await;
+        }
+
+        let entries = self.list_ssh_targets().await?;
+        let lower = node_ref.trim().to_lowercase();
+        let matched = entries
+            .into_iter()
+            .find(|entry| entry.label.to_lowercase() == lower || entry.target == node_ref);
+        let Some(entry) = matched else {
+            return Ok(None);
+        };
+
+        Ok(Some(SshResolvedTarget {
+            id: entry.id,
+            node_id: format!("ssh:target:{}", entry.id),
+            label: entry.label,
+            target: entry.target,
+            port: entry.port,
+            known_host: entry.known_host,
+            auth_mode: entry.auth_mode,
+            key_id: entry.key_id,
+            key_name: entry.key_name,
+        }))
+    }
+
+    pub async fn resolve_ssh_target_by_id(
+        &self,
+        id: i64,
+    ) -> anyhow::Result<Option<SshResolvedTarget>> {
+        let row: Option<(
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT
+                    t.id,
+                    t.label,
+                    t.target,
+                    t.port,
+                    t.known_host,
+                    t.auth_mode,
+                    t.key_id,
+                    k.name
+                 FROM ssh_targets t
+                 LEFT JOIN ssh_keys k ON k.id = t.key_id
+                 WHERE t.id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some((id, label, target, port, known_host, auth_mode, key_id, key_name)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(SshResolvedTarget {
+            id,
+            node_id: format!("ssh:target:{id}"),
+            label,
+            target,
+            port: port.and_then(|value| u16::try_from(value).ok()),
+            known_host,
+            auth_mode: SshAuthMode::parse_db(&auth_mode)?,
+            key_id,
+            key_name,
+        }))
     }
 
     // ── Reset (remove all auth) ─────────────────────────────────────────
@@ -650,6 +1330,12 @@ impl CredentialStore {
             .execute(&self.pool)
             .await?;
         sqlx::query("DELETE FROM api_keys")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM ssh_targets")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM ssh_keys")
             .execute(&self.pool)
             .await?;
         self.setup_complete.store(false, Ordering::Relaxed);
@@ -746,18 +1432,43 @@ impl CredentialStore {
             .await?;
         Ok(row.is_some())
     }
+
+    // ── Audit log ─────────────────────────────────────────────────────────
+
+    /// Record an authentication event for audit purposes.
+    pub async fn audit_log(&self, event_type: &str, client_ip: Option<&str>, detail: Option<&str>) {
+        let result = sqlx::query(
+            "INSERT INTO auth_audit_log (event_type, client_ip, detail) VALUES (?, ?, ?)",
+        )
+        .bind(event_type)
+        .bind(client_ip)
+        .bind(detail)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = result {
+            // Best-effort — never fail the auth flow because of logging.
+            tracing::debug!(error = %e, "failed to write audit log");
+        }
+
+        // Prune entries older than 90 days to prevent unbounded growth.
+        let _ = sqlx::query(
+            "DELETE FROM auth_audit_log WHERE created_at < datetime('now', '-90 days')",
+        )
+        .execute(&self.pool)
+        .await;
+    }
 }
 
 // ── EnvVarProvider impl ─────────────────────────────────────────────────────
 
 #[async_trait::async_trait]
 impl moltis_tools::exec::EnvVarProvider for CredentialStore {
-    async fn get_env_vars(&self) -> Vec<(String, secrecy::Secret<String>)> {
+    async fn get_env_vars(&self) -> Vec<(String, Secret<String>)> {
         self.get_all_env_values()
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|(k, v)| (k, secrecy::Secret::new(v)))
+            .map(|(k, v)| (k, Secret::new(v)))
             .collect()
     }
 }
@@ -798,6 +1509,17 @@ fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn hmac_sha256_hex(input: &str, salt: &str) -> String {
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+    // HMAC-SHA256 accepts any key length, so this never fails in practice.
+    let Ok(mut mac) = HmacSha256::new_from_slice(salt.as_bytes()) else {
+        return sha256_hex(input);
+    };
+    mac.update(input.as_bytes());
+    format!("{:x}", mac.finalize().into_bytes())
 }
 
 // ── Legacy compat ────────────────────────────────────────────────────────────
@@ -881,8 +1603,8 @@ pub fn authorize_connect(
 #[derive(Clone)]
 pub struct ResolvedAuth {
     pub mode: AuthMode,
-    pub token: Option<secrecy::Secret<String>>,
-    pub password: Option<secrecy::Secret<String>>,
+    pub token: Option<Secret<String>>,
+    pub password: Option<Secret<String>>,
 }
 
 impl std::fmt::Debug for ResolvedAuth {
@@ -911,8 +1633,8 @@ pub fn resolve_auth(token: Option<String>, password: Option<String>) -> Resolved
     };
     ResolvedAuth {
         mode,
-        token: token.map(secrecy::Secret::new),
-        password: password.map(secrecy::Secret::new),
+        token: token.map(Secret::new),
+        password: password.map(Secret::new),
     }
 }
 
@@ -1108,6 +1830,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reset_all_removes_managed_ssh_material() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = CredentialStore::new(pool).await.unwrap();
+
+        let key_id = store
+            .create_ssh_key(
+                "prod-key",
+                "PRIVATE KEY",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltis test@example",
+                "256 SHA256:test moltis:test (ED25519)",
+            )
+            .await
+            .unwrap();
+        store
+            .create_ssh_target(
+                "prod-box",
+                "deploy@example.com",
+                None,
+                None,
+                SshAuthMode::Managed,
+                Some(key_id),
+                true,
+            )
+            .await
+            .unwrap();
+
+        store.reset_all().await.unwrap();
+
+        assert!(store.list_ssh_keys().await.unwrap().is_empty());
+        assert!(store.list_ssh_targets().await.unwrap().is_empty());
+        assert!(store.get_ssh_private_key(key_id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn test_auth_disabled_persists_across_restart() {
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = CredentialStore::new(pool.clone()).await.unwrap();
@@ -1170,6 +1926,246 @@ mod tests {
         let vars = store.list_env_vars().await.unwrap();
         assert_eq!(vars.len(), 1);
         assert_eq!(vars[0].key, "OTHER");
+    }
+
+    #[tokio::test]
+    async fn test_credential_store_ssh_keys_and_targets() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = CredentialStore::new(pool).await.unwrap();
+
+        let key_id = store
+            .create_ssh_key(
+                "prod-key",
+                "PRIVATE KEY",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltis test@example",
+                "256 SHA256:test moltis:test (ED25519)",
+            )
+            .await
+            .unwrap();
+        let target_id = store
+            .create_ssh_target(
+                "prod-box",
+                "deploy@example.com",
+                Some(2222),
+                Some("|1|salt= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltisHostPin"),
+                SshAuthMode::Managed,
+                Some(key_id),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let keys = store.list_ssh_keys().await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].id, key_id);
+        assert_eq!(keys[0].target_count, 1);
+
+        let targets = store.list_ssh_targets().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, target_id);
+        assert_eq!(targets[0].label, "prod-box");
+        assert_eq!(targets[0].port, Some(2222));
+        assert_eq!(
+            targets[0].known_host.as_deref(),
+            Some("|1|salt= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltisHostPin")
+        );
+        assert_eq!(targets[0].auth_mode, SshAuthMode::Managed);
+        assert_eq!(targets[0].key_name.as_deref(), Some("prod-key"));
+        assert!(targets[0].is_default);
+
+        let resolved = store.resolve_ssh_target("prod-box").await.unwrap().unwrap();
+        assert_eq!(resolved.node_id, format!("ssh:target:{target_id}"));
+        assert_eq!(resolved.target, "deploy@example.com");
+        assert_eq!(
+            resolved.known_host.as_deref(),
+            Some("|1|salt= ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltisHostPin")
+        );
+
+        let default_target = store.get_default_ssh_target().await.unwrap().unwrap();
+        assert_eq!(default_target.id, target_id);
+
+        let private_key = store.get_ssh_private_key(key_id).await.unwrap().unwrap();
+        assert_eq!(private_key.expose_secret(), "PRIVATE KEY");
+
+        store.delete_ssh_target(target_id).await.unwrap();
+        assert!(
+            store
+                .resolve_ssh_target("prod-box")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.delete_ssh_key(key_id).await.unwrap();
+        assert!(store.list_ssh_keys().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_first_ssh_target_becomes_default_and_delete_promotes_replacement() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = CredentialStore::new(pool).await.unwrap();
+
+        let key_id = store
+            .create_ssh_key(
+                "prod-key",
+                "PRIVATE KEY",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltis test@example",
+                "256 SHA256:test moltis:test (ED25519)",
+            )
+            .await
+            .unwrap();
+        let first_target_id = store
+            .create_ssh_target(
+                "first-box",
+                "deploy@first.example.com",
+                None,
+                None,
+                SshAuthMode::Managed,
+                Some(key_id),
+                false,
+            )
+            .await
+            .unwrap();
+        let second_target_id = store
+            .create_ssh_target(
+                "second-box",
+                "deploy@second.example.com",
+                None,
+                None,
+                SshAuthMode::Managed,
+                Some(key_id),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let default_before_delete = store.get_default_ssh_target().await.unwrap().unwrap();
+        assert_eq!(default_before_delete.id, first_target_id);
+
+        store.delete_ssh_target(first_target_id).await.unwrap();
+
+        let default_after_delete = store.get_default_ssh_target().await.unwrap().unwrap();
+        assert_eq!(default_after_delete.id, second_target_id);
+    }
+
+    #[tokio::test]
+    async fn test_delete_ssh_key_rejects_in_use_key() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = CredentialStore::new(pool).await.unwrap();
+
+        let key_id = store
+            .create_ssh_key(
+                "prod-key",
+                "PRIVATE KEY",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltis test@example",
+                "256 SHA256:test moltis:test (ED25519)",
+            )
+            .await
+            .unwrap();
+        store
+            .create_ssh_target(
+                "prod-box",
+                "deploy@example.com",
+                None,
+                None,
+                SshAuthMode::Managed,
+                Some(key_id),
+                true,
+            )
+            .await
+            .unwrap();
+
+        let error = store.delete_ssh_key(key_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ssh key is still assigned to one or more targets")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_ssh_target_known_host_round_trips() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let store = CredentialStore::new(pool).await.unwrap();
+
+        let target_id = store
+            .create_ssh_target(
+                "prod-box",
+                "deploy@example.com",
+                None,
+                None,
+                SshAuthMode::System,
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+
+        store
+            .update_ssh_target_known_host(
+                target_id,
+                Some("prod.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltisHostPin"),
+            )
+            .await
+            .unwrap();
+        let pinned = store
+            .resolve_ssh_target_by_id(target_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            pinned.known_host.as_deref(),
+            Some("prod.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltisHostPin")
+        );
+
+        store
+            .update_ssh_target_known_host(target_id, None)
+            .await
+            .unwrap();
+        let cleared = store
+            .resolve_ssh_target_by_id(target_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(cleared.known_host.is_none());
+    }
+
+    #[cfg(feature = "vault")]
+    #[tokio::test]
+    async fn test_ssh_keys_encrypt_when_vault_is_unsealed() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        moltis_vault::run_migrations(&pool).await.unwrap();
+        let vault = Arc::new(Vault::new(pool.clone()).await.unwrap());
+        vault.initialize("vault-password").await.unwrap();
+        let store = CredentialStore::with_vault(
+            pool.clone(),
+            &moltis_config::AuthConfig::default(),
+            Some(Arc::clone(&vault)),
+        )
+        .await
+        .unwrap();
+
+        let key_id = store
+            .create_ssh_key(
+                "enc-key",
+                "TOP SECRET KEY",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMoltis enc@example",
+                "256 SHA256:enc moltis:enc (ED25519)",
+            )
+            .await
+            .unwrap();
+
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT private_key, encrypted FROM ssh_keys WHERE id = ?")
+                .bind(key_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        let (stored_value, encrypted) = row.unwrap();
+        assert_ne!(stored_value, "TOP SECRET KEY");
+        assert_eq!(encrypted, 1);
+
+        let private_key = store.get_ssh_private_key(key_id).await.unwrap().unwrap();
+        assert_eq!(private_key.expose_secret(), "TOP SECRET KEY");
     }
 
     #[tokio::test]

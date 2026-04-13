@@ -18,13 +18,17 @@ default-members = [
   "crates/gateway",
   "crates/graphql",
   "crates/httpd",
+  "crates/matrix",
   "crates/mcp",
+  "crates/mcp-agent-bridge",
   "crates/media",
   "crates/memory",
   "crates/metrics",
   "crates/msteams",
   "crates/network-filter",
   "crates/node-host",
+  "crates/node-exec-types",
+  "crates/nostr",
   "crates/oauth",
   "crates/onboarding",
   "crates/openclaw-import",
@@ -35,6 +39,7 @@ default-members = [
   "crates/providers",
   "crates/qmd",
   "crates/routing",
+  "crates/secret-store",
   "crates/service-traits",
   "crates/sessions",
   "crates/skills",
@@ -51,6 +56,7 @@ default-members = [
   "crates/wasm-tools/web-fetch",
   "crates/wasm-tools/web-search",
   "crates/web",
+  "crates/webhooks",
   "crates/whatsapp",
 ]
 members = [
@@ -71,12 +77,15 @@ members = [
   "crates/gateway",
   "crates/graphql",
   "crates/httpd",
+  "crates/matrix",
   "crates/mcp",
   "crates/media",
   "crates/memory",
   "crates/metrics",
   "crates/msteams",
   "crates/node-host",
+  "crates/node-exec-types",
+  "crates/nostr",
   "crates/oauth",
   "crates/onboarding",
   "crates/openclaw-import",
@@ -88,6 +97,7 @@ members = [
   "crates/qmd",
   "crates/routing",
   "crates/schema-export",
+  "crates/secret-store",
   "crates/service-traits",
   "crates/sessions",
   "crates/skills",
@@ -104,9 +114,17 @@ members = [
   "crates/wasm-tools/web-fetch",
   "crates/wasm-tools/web-search",
   "crates/web",
+  "crates/webhooks",
   "crates/whatsapp",
 ]
 resolver = "2"
+
+[patch.crates-io]
+# Widen libsqlite3-sys pin (0.30.1 → >=0.30.1,<0.36.0) so sqlx-sqlite 0.8.6
+# can coexist with matrix-sdk-sqlite's rusqlite 0.37 (libsqlite3-sys 0.35).
+# Remove once sqlx ≥ 0.9 ships stable.
+sqlx-core   = { git = "https://github.com/moltis-org/sqlx", rev = "33747ad2e2d0c7962c6450faf31591c4e0782c23" }
+sqlx-sqlite = { git = "https://github.com/moltis-org/sqlx", rev = "33747ad2e2d0c7962c6450faf31591c4e0782c23" }
 
 [workspace.lints.rust]
 unsafe_code           = "deny"
@@ -153,7 +171,7 @@ clap = { features = ["derive", "env"], version = "4" }
 # Database
 sqlx = { features = ["migrate", "runtime-tokio", "sqlite"], version = "0.8" }
 # HTTP client
-reqwest = { features = ["json", "multipart", "stream"], version = "0.12" }
+reqwest = { features = ["json", "multipart", "socks", "stream"], version = "0.12" }
 # UUID
 uuid = { features = ["v4"], version = "1" }
 # Async
@@ -183,9 +201,13 @@ genai        = "0.5"
 async-graphql      = "7"
 async-graphql-axum = "7"
 gix                = "0.78"
+hex                = "0.4"
 hmac               = "0.12"
+jsonwebtoken       = { features = ["aws_lc_rs"], version = "10" }
 llama-cpp-2        = "0.1"
+matrix-sdk         = { default-features = false, features = ["e2e-encryption", "markdown", "native-tls", "sqlite"], version = "0.16" }
 mockito            = "1.7"
+nostr-sdk          = { features = ["nip04", "nip44"], version = "0.44" }
 open               = "5.3"
 rand               = "0.9"
 regex              = "1"
@@ -227,11 +249,12 @@ hostname    = "0.4"
 http        = "1"
 hyper       = { features = ["client", "http1", "http2", "server"], version = "1" }
 hyper-util  = { features = ["client-legacy", "http1", "http2", "server-auto", "service", "tokio"], version = "0.1" }
+ngrok       = "0.18"
 tower       = "0.5"
 tower-http  = "0.6"
 url         = "2"
 urlencoding = "2"
-web-push    = "0.10"
+web-push    = "0.11"
 # Metrics
 metrics                     = "0.24"
 metrics-exporter-prometheus = "0.16"
@@ -239,9 +262,9 @@ metrics-tracing-context     = "0.16"
 # Content processing
 html2text      = "0.16"
 image          = { default-features = false, features = ["jpeg", "png", "webp"], version = "0.25" }
-mime_guess     = "2"
 ipnet          = "2"
 mdns-sd        = "0.18"
+mime_guess     = "2"
 pulldown-cmark = { default-features = false, version = "0.12" }
 # Code splitting (tree-sitter based)
 text-splitter          = { default-features = false, features = ["code"], version = "0.29" }
@@ -268,7 +291,13 @@ chrono-tz             = { features = ["serde"], version = "0.10" }
 cron                  = "0.13"
 dirs-next             = "2"
 flate2                = "1"
+globset               = "0.4"
+grep-matcher          = "0.1"
+grep-regex            = "0.1"
+grep-searcher         = "0.1"
+ignore                = "0.4"
 include_dir           = "0.7"
+pdf-extract           = "0.10"
 json5                 = "0.4"
 notify-debouncer-full = "0.7"
 portable-pty          = "0.9"
@@ -307,13 +336,17 @@ moltis-discord         = { path = "crates/discord" }
 moltis-gateway         = { default-features = false, path = "crates/gateway" }
 moltis-graphql         = { path = "crates/graphql" }
 moltis-httpd           = { default-features = false, path = "crates/httpd" }
+moltis-matrix          = { path = "crates/matrix" }
 moltis-mcp             = { path = "crates/mcp" }
+moltis-mcp-agent-bridge = { path = "crates/mcp-agent-bridge" }
 moltis-media           = { path = "crates/media" }
 moltis-memory          = { path = "crates/memory" }
 moltis-metrics         = { path = "crates/metrics" }
 moltis-msteams         = { path = "crates/msteams" }
 moltis-network-filter  = { default-features = false, path = "crates/network-filter" }
 moltis-node-host       = { path = "crates/node-host" }
+moltis-node-exec-types = { path = "crates/node-exec-types" }
+moltis-nostr           = { path = "crates/nostr" }
 moltis-oauth           = { path = "crates/oauth" }
 moltis-onboarding      = { path = "crates/onboarding" }
 moltis-openclaw-import = { path = "crates/openclaw-import" }
@@ -325,6 +358,7 @@ moltis-providers       = { features = ["provider-github-copilot", "provider-kimi
 moltis-qmd             = { path = "crates/qmd" }
 moltis-routing         = { path = "crates/routing" }
 moltis-schema-export   = { path = "crates/schema-export" }
+moltis-secret-store    = { default-features = false, path = "crates/secret-store" }
 moltis-service-traits  = { path = "crates/service-traits" }
 moltis-sessions        = { path = "crates/sessions" }
 moltis-skills          = { path = "crates/skills" }
@@ -337,6 +371,7 @@ moltis-tools           = { path = "crates/tools" }
 moltis-vault           = { path = "crates/vault" }
 moltis-voice           = { path = "crates/voice" }
 moltis-web             = { default-features = false, path = "crates/web" }
+moltis-webhooks        = { path = "crates/webhooks" }
 moltis-whatsapp        = { path = "crates/whatsapp" }
 
 [profile.release]

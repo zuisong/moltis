@@ -5,6 +5,8 @@
 
 use std::{collections::HashMap, path::Path};
 
+use secrecy::ExposeSecret;
+
 use crate::schema::MoltisConfig;
 
 /// Severity level for a diagnostic.
@@ -103,11 +105,19 @@ const KNOWN_PROVIDER_NAMES: &[&str] = &[
 ];
 
 /// Static metadata keys allowed directly under `[providers]`.
-const PROVIDERS_META_KEYS: &[&str] = &["offered"];
+const PROVIDERS_META_KEYS: &[&str] = &["offered", "show_legacy_models"];
 
 /// Build the full schema map mirroring every field in `schema.rs`.
 fn build_schema_map() -> KnownKeys {
     use KnownKeys::{Array, Leaf, Map, MapWithFields, Struct};
+
+    let tool_policy_entry = || {
+        Struct(HashMap::from([
+            ("allow", Leaf),
+            ("deny", Leaf),
+            ("profile", Leaf),
+        ]))
+    };
 
     let provider_entry = || {
         Struct(HashMap::from([
@@ -122,6 +132,7 @@ fn build_schema_map() -> KnownKeys {
             ("alias", Leaf),
             ("tool_mode", Leaf),
             ("cache_retention", Leaf),
+            ("policy", tool_policy_entry()),
         ]))
     };
 
@@ -162,6 +173,7 @@ fn build_schema_map() -> KnownKeys {
             ("wasm_fuel_limit", Leaf),
             ("wasm_epoch_interval_ms", Leaf),
             ("wasm_tool_limits", wasm_tool_limits()),
+            ("tools_policy", tool_policy_entry()),
         ]))
     };
 
@@ -198,6 +210,18 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let firecrawl = || {
+        Struct(HashMap::from([
+            ("enabled", Leaf),
+            ("api_key", Leaf),
+            ("base_url", Leaf),
+            ("only_main_content", Leaf),
+            ("timeout_seconds", Leaf),
+            ("cache_ttl_minutes", Leaf),
+            ("web_fetch_fallback", Leaf),
+        ]))
+    };
+
     let exec = || {
         Struct(HashMap::from([
             ("default_timeout_secs", Leaf),
@@ -208,6 +232,7 @@ fn build_schema_map() -> KnownKeys {
             ("sandbox", sandbox()),
             ("host", Leaf),
             ("node", Leaf),
+            ("ssh_target", Leaf),
         ]))
     };
 
@@ -232,6 +257,7 @@ fn build_schema_map() -> KnownKeys {
             ("persist_profile", Leaf),
             ("profile_dir", Leaf),
             ("container_host", Leaf),
+            ("browserless_api_version", Leaf),
         ]))
     };
 
@@ -252,13 +278,34 @@ fn build_schema_map() -> KnownKeys {
                 Struct(HashMap::from([
                     ("search", web_search()),
                     ("fetch", web_fetch()),
+                    ("firecrawl", firecrawl()),
                 ])),
             ),
             ("maps", Struct(HashMap::from([("provider", Leaf)]))),
+            (
+                "fs",
+                Struct(HashMap::from([
+                    ("workspace_root", Leaf),
+                    ("allow_paths", Array(Box::new(Leaf))),
+                    ("deny_paths", Array(Box::new(Leaf))),
+                    ("track_reads", Leaf),
+                    ("must_read_before_write", Leaf),
+                    ("require_approval", Leaf),
+                    ("max_read_bytes", Leaf),
+                    ("binary_policy", Leaf),
+                    ("respect_gitignore", Leaf),
+                    ("checkpoint_before_mutation", Leaf),
+                    ("context_window_tokens", Leaf),
+                ])),
+            ),
             ("agent_timeout_secs", Leaf),
             ("agent_max_iterations", Leaf),
+            ("agent_max_auto_continues", Leaf),
+            ("agent_auto_continue_min_tool_calls", Leaf),
             ("max_tool_result_bytes", Leaf),
             ("registry_mode", Leaf),
+            ("agent_loop_detector_window", Leaf),
+            ("agent_loop_detector_strip_tools_on_second_fire", Leaf),
         ]))
     };
 
@@ -362,18 +409,38 @@ fn build_schema_map() -> KnownKeys {
                 ("update_releases_url", Leaf),
                 ("db_pool_max_connections", Leaf),
                 ("shiki_cdn_url", Leaf),
+                ("terminal_enabled", Leaf),
             ])),
         ),
         ("providers", MapWithFields {
             value: Box::new(provider_entry()),
-            fields: HashMap::from([("offered", Array(Box::new(Leaf)))]),
+            fields: HashMap::from([
+                ("offered", Array(Box::new(Leaf))),
+                ("show_legacy_models", Leaf),
+            ]),
         }),
         (
             "chat",
             Struct(HashMap::from([
                 ("message_queue_mode", Leaf),
+                ("prompt_memory_mode", Leaf),
+                ("workspace_file_max_chars", Leaf),
                 ("priority_models", Leaf),
                 ("allowed_models", Leaf),
+                (
+                    "compaction",
+                    Struct(HashMap::from([
+                        ("mode", Leaf),
+                        ("threshold_percent", Leaf),
+                        ("protect_head", Leaf),
+                        ("protect_tail_min", Leaf),
+                        ("tail_budget_ratio", Leaf),
+                        ("tool_prune_char_threshold", Leaf),
+                        ("summary_model", Leaf),
+                        ("max_summary_tokens", Leaf),
+                        ("show_settings_hint", Leaf),
+                    ])),
+                ),
             ])),
         ),
         (
@@ -400,17 +467,35 @@ fn build_schema_map() -> KnownKeys {
                 ("servers", Map(Box::new(mcp_server_entry()))),
             ])),
         ),
-        ("channels", MapWithFields {
-            // Dynamic keys: extra channel types via #[serde(flatten)]
-            value: Box::new(Map(Box::new(Leaf))),
-            fields: HashMap::from([
-                ("offered", Array(Box::new(Leaf))),
-                ("telegram", Map(Box::new(Leaf))),
-                ("whatsapp", Map(Box::new(Leaf))),
-                ("msteams", Map(Box::new(Leaf))),
-                ("discord", Map(Box::new(Leaf))),
-                ("slack", Map(Box::new(Leaf))),
-            ]),
+        ("channels", {
+            // Channel accounts are stored as serde_json::Value but we
+            // recognise a `tools` sub-key with typed group/sender policy.
+            let group_policy = || {
+                Struct(HashMap::from([
+                    ("allow", Leaf),
+                    ("deny", Leaf),
+                    ("by_sender", Map(Box::new(tool_policy_entry()))),
+                ]))
+            };
+            let channel_tools =
+                || Struct(HashMap::from([("groups", Map(Box::new(group_policy())))]));
+            let channel_account = || MapWithFields {
+                value: Box::new(Leaf),
+                fields: HashMap::from([("tools", channel_tools())]),
+            };
+            MapWithFields {
+                // Dynamic keys: extra channel types via #[serde(flatten)]
+                value: Box::new(Map(Box::new(channel_account()))),
+                fields: HashMap::from([
+                    ("offered", Array(Box::new(Leaf))),
+                    ("telegram", Map(Box::new(channel_account()))),
+                    ("whatsapp", Map(Box::new(channel_account()))),
+                    ("msteams", Map(Box::new(channel_account()))),
+                    ("discord", Map(Box::new(channel_account()))),
+                    ("slack", Map(Box::new(channel_account()))),
+                    ("nostr", Map(Box::new(channel_account()))),
+                ]),
+            }
         }),
         (
             "tls",
@@ -456,6 +541,9 @@ fn build_schema_map() -> KnownKeys {
         (
             "memory",
             Struct(HashMap::from([
+                ("style", Leaf),
+                ("agent_write_mode", Leaf),
+                ("user_profile_write_mode", Leaf),
                 ("backend", Leaf),
                 ("provider", Leaf),
                 ("embedding_provider", Leaf),
@@ -472,6 +560,14 @@ fn build_schema_map() -> KnownKeys {
                 ("search_merge_strategy", Leaf),
                 ("session_export", Leaf),
                 ("qmd", qmd()),
+            ])),
+        ),
+        (
+            "ngrok",
+            Struct(HashMap::from([
+                ("enabled", Leaf),
+                ("authtoken", Leaf),
+                ("domain", Leaf),
             ])),
         ),
         (
@@ -506,9 +602,12 @@ fn build_schema_map() -> KnownKeys {
             Struct(HashMap::from([
                 ("rate_limit_max", Leaf),
                 ("rate_limit_window_secs", Leaf),
+                ("session_retention_days", Leaf),
+                ("auto_prune_cron_containers", Leaf),
             ])),
         ),
         ("env", Map(Box::new(Leaf))),
+        ("upstream_proxy", Leaf),
         (
             "caldav",
             Struct(HashMap::from([
@@ -1070,6 +1169,76 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
+    // tools.fs: must_read_before_write requires track_reads
+    if config.tools.fs.must_read_before_write && !config.tools.fs.track_reads {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "tools.fs".into(),
+            message: "must_read_before_write=true requires track_reads=true".into(),
+        });
+    }
+
+    // tools.fs.workspace_root must be absolute when set
+    if let Some(ref root) = config.tools.fs.workspace_root
+        && !Path::new(root).is_absolute()
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            category: "invalid-value",
+            path: "tools.fs.workspace_root".into(),
+            message: format!("workspace_root must be an absolute path (got '{root}')"),
+        });
+    }
+
+    // tools.fs.allow_paths / deny_paths entries should be absolute
+    for (idx, entry) in config.tools.fs.allow_paths.iter().enumerate() {
+        if !entry.starts_with('/') && !entry.starts_with("**") {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("tools.fs.allow_paths[{idx}]"),
+                message: format!(
+                    "allow_paths entries should be absolute path globs starting with '/' (got '{entry}')"
+                ),
+            });
+        }
+    }
+    for (idx, entry) in config.tools.fs.deny_paths.iter().enumerate() {
+        if !entry.starts_with('/') && !entry.starts_with("**") {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("tools.fs.deny_paths[{idx}]"),
+                message: format!(
+                    "deny_paths entries should be absolute path globs starting with '/' (got '{entry}')"
+                ),
+            });
+        }
+    }
+
+    // upstream_proxy: must be a valid URL with a supported scheme.
+    if let Some(ref proxy) = config.upstream_proxy {
+        let url = proxy.expose_secret();
+        let valid = url.starts_with("http://")
+            || url.starts_with("https://")
+            || url.starts_with("socks5://")
+            || url.starts_with("socks5h://");
+        if !valid {
+            // Extract only the scheme portion (before "://") to avoid leaking
+            // credentials that may be embedded in the URL.
+            let scheme = url.split("://").next().unwrap_or("<unknown>");
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                category: "invalid-value",
+                path: "upstream_proxy".into(),
+                message: format!(
+                    "upstream_proxy must use http://, https://, socks5://, or socks5h:// scheme (got \"{scheme}://\")"
+                ),
+            });
+        }
+    }
+
     // Loop limit must be positive to avoid immediate run failures.
     if config.tools.agent_max_iterations == 0 {
         diagnostics.push(Diagnostic {
@@ -1078,6 +1247,58 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             path: "tools.agent_max_iterations".into(),
             message: "tools.agent_max_iterations must be at least 1".into(),
         });
+    }
+
+    // A zero workspace file limit would silently drop all AGENTS.md / TOOLS.md content.
+    if config.chat.workspace_file_max_chars == 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "chat.workspace_file_max_chars".into(),
+            message: "chat.workspace_file_max_chars is 0 — AGENTS.md and TOOLS.md will be empty in the prompt".into(),
+        });
+    }
+
+    // Compaction config sanity.
+    let compaction = &config.chat.compaction;
+    if !(0.1..=0.95).contains(&compaction.threshold_percent) {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "chat.compaction.threshold_percent".into(),
+            message: format!(
+                "chat.compaction.threshold_percent = {} is outside the supported 0.1–0.95 range; the default (0.95) will be used",
+                compaction.threshold_percent
+            ),
+        });
+    }
+    if !(0.05..=0.80).contains(&compaction.tail_budget_ratio) {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "chat.compaction.tail_budget_ratio".into(),
+            message: format!(
+                "chat.compaction.tail_budget_ratio = {} is outside the supported 0.05–0.80 range; the default (0.20) will be used",
+                compaction.tail_budget_ratio
+            ),
+        });
+    }
+    if compaction.protect_head > 32 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "invalid-value",
+            path: "chat.compaction.protect_head".into(),
+            message: "chat.compaction.protect_head > 32 will leave little room for the compacted middle region on typical sessions".into(),
+        });
+    }
+    // All four CompactionMode variants are now implemented. Any future
+    // "not-implemented" markers would go here; leave the match explicit so
+    // adding a new variant forces a decision at compile time.
+    match compaction.mode {
+        crate::schema::CompactionMode::Deterministic
+        | crate::schema::CompactionMode::RecencyPreserving
+        | crate::schema::CompactionMode::Structured
+        | crate::schema::CompactionMode::LlmReplace => {},
     }
 
     if config.mcp.request_timeout_secs == 0 {
@@ -1098,6 +1319,41 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
                 message: "mcp server request_timeout_secs must be at least 1".into(),
             });
         }
+
+        if !server.transport.is_empty()
+            && !matches!(
+                server.transport.as_str(),
+                "stdio" | "sse" | "streamable-http" | "streamable_http" | "http"
+            )
+        {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                category: "invalid-value",
+                path: format!("mcp.servers.{name}.transport"),
+                message: format!(
+                    "unknown transport type \"{}\"; expected \"stdio\", \"sse\", or \"streamable-http\"",
+                    server.transport
+                ),
+            });
+        }
+    }
+
+    // Firecrawl as search provider requires an API key.  We cannot check
+    // the FIRECRAWL_API_KEY env var here (static validation), so only emit
+    // an Info-level hint when neither config path supplies a key.
+    if config.tools.web.search.provider == crate::schema::SearchProvider::Firecrawl
+        && config.tools.web.firecrawl.api_key.is_none()
+        && config.tools.web.search.api_key.is_none()
+        && !config.tools.web.search.duckduckgo_fallback
+    {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Info,
+            category: "unknown-provider",
+            path: "tools.web.search.provider".into(),
+            message: "search provider is 'firecrawl' but no API key found in config \
+                      (may be supplied at runtime via FIRECRAWL_API_KEY env var)"
+                .into(),
+        });
     }
 
     // agents.default_preset should reference an existing preset key.
@@ -1112,6 +1368,50 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
                 "default preset \"{default_preset}\" is not defined in agents.presets"
             ),
         });
+    }
+
+    // Silent-misconfiguration trap: `[agents.presets.*]` tool policies apply
+    // ONLY to sub-agents spawned via `spawn_agent`. They do NOT filter tools
+    // for the main agent session — that is controlled exclusively by
+    // `[tools.policy]`. Users hardening their deployment often put a deny
+    // list under a preset and expect it to apply to the main session; it
+    // silently doesn't. Warn when at least one preset declares
+    // `tools.allow`/`tools.deny` while `[tools.policy]` is entirely empty.
+    {
+        let main_policy_empty = config.tools.policy.allow.is_empty()
+            && config.tools.policy.deny.is_empty()
+            && config.tools.policy.profile.is_none();
+        if main_policy_empty {
+            let mut offending: Vec<&str> = config
+                .agents
+                .presets
+                .iter()
+                .filter(|(_, preset)| {
+                    !preset.tools.allow.is_empty() || !preset.tools.deny.is_empty()
+                })
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if !offending.is_empty() {
+                offending.sort_unstable();
+                let quoted: Vec<String> =
+                    offending.iter().map(|name| format!("\"{name}\"")).collect();
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    category: "security",
+                    path: "agents.presets".into(),
+                    message: format!(
+                        "preset(s) [{}] declare tools.allow/tools.deny, but \
+                         [tools.policy] is empty. Preset tool policies apply \
+                         ONLY to sub-agents spawned via the spawn_agent tool; \
+                         they do NOT filter tools for the main agent session. \
+                         To allow/deny tools for the main session, set \
+                         tools.policy.allow, tools.policy.deny, or \
+                         tools.policy.profile.",
+                        quoted.join(", ")
+                    ),
+                });
+            }
+        }
     }
 
     // agents.presets.*.reasoning_effort is now a typed enum (ReasoningEffort)
@@ -1179,6 +1479,15 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         });
     }
 
+    if config.ngrok.enabled && config.auth.disabled {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "security",
+            path: "ngrok.enabled".into(),
+            message: "ngrok is enabled while auth.disabled is true; remote visitors will be blocked with setup required until authentication is configured".into(),
+        });
+    }
+
     // Unknown sandbox backend
     let valid_sandbox_backends = [
         "auto",
@@ -1218,54 +1527,6 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
         }
     }
 
-    // Unknown memory backend
-    if let Some(ref backend) = config.memory.backend {
-        let valid_backends = ["builtin", "qmd"];
-        if !valid_backends.contains(&backend.as_str()) {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Warning,
-                category: "unknown-field",
-                path: "memory.backend".into(),
-                message: format!(
-                    "unknown memory backend \"{backend}\"; expected one of: {}",
-                    valid_backends.join(", ")
-                ),
-            });
-        }
-    }
-
-    // Unknown memory provider
-    if let Some(ref provider) = config.memory.provider {
-        let valid_providers = ["local", "ollama", "openai", "custom"];
-        if !valid_providers.contains(&provider.as_str()) {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Warning,
-                category: "unknown-field",
-                path: "memory.provider".into(),
-                message: format!(
-                    "unknown memory provider \"{provider}\"; expected one of: {}",
-                    valid_providers.join(", ")
-                ),
-            });
-        }
-    }
-
-    // Unknown search merge strategy
-    if let Some(ref strategy) = config.memory.search_merge_strategy {
-        let valid_strategies = ["rrf", "linear"];
-        if !valid_strategies.contains(&strategy.to_lowercase().as_str()) {
-            diagnostics.push(Diagnostic {
-                severity: Severity::Warning,
-                category: "unknown-field",
-                path: "memory.search_merge_strategy".into(),
-                message: format!(
-                    "unknown search merge strategy \"{strategy}\"; expected one of: {}",
-                    valid_strategies.join(", ")
-                ),
-            });
-        }
-    }
-
     // Unknown CalDAV provider
     let valid_caldav_providers = ["fastmail", "icloud", "generic"];
     for (name, account) in &config.caldav.accounts {
@@ -1285,7 +1546,7 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
     }
 
     // Unknown exec host
-    let valid_exec_hosts = ["local", "node"];
+    let valid_exec_hosts = ["local", "node", "ssh"];
     if !valid_exec_hosts.contains(&config.tools.exec.host.as_str()) {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
@@ -1306,6 +1567,17 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             category: "unknown-field",
             path: "tools.exec.node".into(),
             message: "tools.exec.host is \"node\" but no default node is specified; commands will fail unless a node connects".into(),
+        });
+    }
+
+    if config.tools.exec.host == "ssh" && config.tools.exec.ssh_target.is_none() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "unknown-field",
+            path: "tools.exec.ssh_target".into(),
+            message:
+                "tools.exec.host is \"ssh\" but no SSH target is specified; commands will fail"
+                    .into(),
         });
     }
 
@@ -1785,6 +2057,50 @@ mode = "tunnel"
     }
 
     #[test]
+    fn ngrok_fields_are_recognized() {
+        let toml = r#"
+[ngrok]
+enabled = true
+authtoken = "secret"
+domain = "team-gateway.ngrok.app"
+"#;
+        let result = validate_toml_str(toml);
+        let unknown = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "unknown-field" && d.path.starts_with("ngrok."));
+        assert!(
+            unknown.is_none(),
+            "ngrok fields should be recognized, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn ngrok_with_disabled_auth_warns() {
+        let toml = r#"
+[ngrok]
+enabled = true
+
+[auth]
+disabled = true
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "security" && d.path == "ngrok.enabled");
+        assert!(
+            warning.is_some(),
+            "expected security warning for ngrok.enabled with auth.disabled"
+        );
+        assert_eq!(
+            warning.unwrap().message,
+            "ngrok is enabled while auth.disabled is true; remote visitors will be blocked with setup required until authentication is configured"
+        );
+    }
+
+    #[test]
     fn sandbox_mode_off_warned() {
         let toml = r#"
 [tools.exec.sandbox]
@@ -1813,36 +2129,54 @@ port = 0
     }
 
     #[test]
-    fn unknown_memory_backend_warned() {
+    fn unknown_memory_backend_is_parse_error() {
         let toml = r#"
 [memory]
 backend = "postgres"
 "#;
         let result = validate_toml_str(toml);
-        let warning = result
-            .diagnostics
-            .iter()
-            .find(|d| d.path == "memory.backend");
         assert!(
-            warning.is_some(),
-            "expected warning for unknown memory backend"
+            result.has_errors(),
+            "expected parse error for unknown memory backend"
         );
     }
 
     #[test]
-    fn unknown_memory_provider_warned() {
+    fn unknown_memory_citations_mode_is_parse_error() {
+        let toml = r#"
+[memory]
+citations = "sometimes"
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            result.has_errors(),
+            "expected parse error for unknown memory citations mode"
+        );
+    }
+
+    #[test]
+    fn unknown_memory_search_merge_strategy_is_parse_error() {
+        let toml = r#"
+[memory]
+search_merge_strategy = "blend"
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            result.has_errors(),
+            "expected parse error for unknown memory search merge strategy"
+        );
+    }
+
+    #[test]
+    fn unknown_memory_provider_is_parse_error() {
         let toml = r#"
 [memory]
 provider = "pinecone"
 "#;
         let result = validate_toml_str(toml);
-        let warning = result
-            .diagnostics
-            .iter()
-            .find(|d| d.path == "memory.provider");
         assert!(
-            warning.is_some(),
-            "expected warning for unknown memory provider"
+            result.has_errors(),
+            "expected parse error for unknown memory provider"
         );
     }
 
@@ -1860,6 +2194,57 @@ disable_rag = true
         assert!(
             unknown.is_none(),
             "memory.disable_rag should be accepted as a known field"
+        );
+    }
+
+    #[test]
+    fn memory_style_is_valid_field() {
+        let toml = r#"
+[memory]
+style = "search-only"
+"#;
+        let result = validate_toml_str(toml);
+        let unknown = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "unknown-field" && d.path == "memory.style");
+        assert!(
+            unknown.is_none(),
+            "memory.style should be accepted as a known field"
+        );
+    }
+
+    #[test]
+    fn memory_agent_write_mode_is_valid_field() {
+        let toml = r#"
+[memory]
+agent_write_mode = "prompt-only"
+"#;
+        let result = validate_toml_str(toml);
+        let unknown = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "unknown-field" && d.path == "memory.agent_write_mode");
+        assert!(
+            unknown.is_none(),
+            "memory.agent_write_mode should be accepted as a known field"
+        );
+    }
+
+    #[test]
+    fn memory_user_profile_write_mode_is_valid_field() {
+        let toml = r#"
+[memory]
+user_profile_write_mode = "explicit-only"
+"#;
+        let result = validate_toml_str(toml);
+        let unknown = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "unknown-field" && d.path == "memory.user_profile_write_mode");
+        assert!(
+            unknown.is_none(),
+            "memory.user_profile_write_mode should be accepted as a known field"
         );
     }
 
@@ -2029,6 +2414,38 @@ security_level = "paranoid"
             warning.is_some(),
             "expected warning for unknown security level"
         );
+    }
+
+    #[test]
+    fn ssh_exec_host_accepted() {
+        let toml = r#"
+[tools.exec]
+host = "ssh"
+ssh_target = "deploy@example"
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "tools.exec.host");
+        assert!(
+            warning.is_none(),
+            "ssh should be accepted as a valid exec host"
+        );
+    }
+
+    #[test]
+    fn ssh_exec_host_without_target_warned() {
+        let toml = r#"
+[tools.exec]
+host = "ssh"
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "tools.exec.ssh_target");
+        assert!(warning.is_some(), "expected warning for missing ssh target");
     }
 
     #[test]
@@ -2485,6 +2902,24 @@ offered = ["telegram", "slack"]
     }
 
     #[test]
+    fn channels_offered_matrix_accepted() {
+        let toml = r#"
+[channels]
+offered = ["telegram", "matrix"]
+"#;
+        let result = validate_toml_str(toml);
+        let warning = result
+            .diagnostics
+            .iter()
+            .find(|d| d.path == "channels.offered[1]" && d.category == "unknown-field");
+        assert!(
+            warning.is_none(),
+            "matrix should be accepted, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
     fn channels_offered_dynamic_type_accepted() {
         let toml = r#"
 [channels]
@@ -2683,5 +3118,229 @@ cache_retention = "{mode}"
                 result.diagnostics
             );
         }
+    }
+
+    #[test]
+    fn upstream_proxy_not_flagged_as_unknown() {
+        let toml = r#"upstream_proxy = "http://127.0.0.1:8080""#;
+        let result = validate_toml_str(toml);
+        let unknown: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-field" && d.path.contains("upstream_proxy"))
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "upstream_proxy should be a known field: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_invalid_scheme_rejected() {
+        let toml = r#"upstream_proxy = "ftp://proxy.example.com""#;
+        let result = validate_toml_str(toml);
+        let errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error && d.path == "upstream_proxy")
+            .collect();
+        assert!(
+            !errors.is_empty(),
+            "upstream_proxy with ftp:// scheme should produce an error"
+        );
+    }
+
+    #[test]
+    fn upstream_proxy_valid_schemes_accepted() {
+        for scheme in ["http://", "https://", "socks5://", "socks5h://"] {
+            let toml = format!(r#"upstream_proxy = "{scheme}proxy.example.com:1080""#);
+            let result = validate_toml_str(&toml);
+            let errors: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|d| d.severity == Severity::Error && d.path == "upstream_proxy")
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "upstream_proxy with {scheme} should not produce errors: {errors:?}"
+            );
+        }
+    }
+
+    /// Helper: locate the silent-misconfiguration warning about preset tool
+    /// policies vs. empty `[tools.policy]`.
+    fn find_preset_silent_policy_warning(result: &ValidationResult) -> Option<&Diagnostic> {
+        result.diagnostics.iter().find(|d| {
+            d.category == "security"
+                && d.path == "agents.presets"
+                && d.message.contains("spawn_agent")
+        })
+    }
+
+    #[test]
+    fn preset_tools_deny_without_main_policy_warns() {
+        let toml = r#"
+[agents]
+default_preset = "full"
+
+[agents.presets.full]
+[agents.presets.full.tools]
+deny = ["browser", "web_fetch"]
+"#;
+        let result = validate_toml_str(toml);
+        let warning = find_preset_silent_policy_warning(&result).unwrap_or_else(|| {
+            panic!(
+                "expected silent-policy warning, got: {:?}",
+                result.diagnostics
+            )
+        });
+        assert_eq!(warning.severity, Severity::Warning);
+        assert!(
+            warning.message.contains("\"full\""),
+            "expected preset name in message: {}",
+            warning.message
+        );
+        assert!(
+            warning.message.contains("[tools.policy]"),
+            "expected pointer to [tools.policy] in message: {}",
+            warning.message
+        );
+    }
+
+    #[test]
+    fn preset_tools_allow_without_main_policy_also_warns() {
+        let toml = r#"
+[agents.presets.research]
+[agents.presets.research.tools]
+allow = ["web_search", "web_fetch"]
+"#;
+        let result = validate_toml_str(toml);
+        let warning = find_preset_silent_policy_warning(&result).unwrap_or_else(|| {
+            panic!(
+                "expected silent-policy warning, got: {:?}",
+                result.diagnostics
+            )
+        });
+        assert!(warning.message.contains("\"research\""));
+    }
+
+    #[test]
+    fn preset_tools_deny_with_main_policy_deny_does_not_warn() {
+        let toml = r#"
+[tools.policy]
+deny = ["exec"]
+
+[agents.presets.full]
+[agents.presets.full.tools]
+deny = ["browser"]
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            find_preset_silent_policy_warning(&result).is_none(),
+            "should not warn when [tools.policy] is non-empty, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn preset_tools_deny_with_main_policy_allow_does_not_warn() {
+        let toml = r#"
+[tools.policy]
+allow = ["web_search"]
+
+[agents.presets.full]
+[agents.presets.full.tools]
+deny = ["browser"]
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            find_preset_silent_policy_warning(&result).is_none(),
+            "should not warn when [tools.policy] has allow list, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn preset_tools_deny_with_main_policy_profile_does_not_warn() {
+        let toml = r#"
+[tools.policy]
+profile = "default"
+
+[agents.presets.full]
+[agents.presets.full.tools]
+deny = ["browser"]
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            find_preset_silent_policy_warning(&result).is_none(),
+            "should not warn when [tools.policy.profile] is set, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn empty_preset_tools_does_not_warn() {
+        let toml = r#"
+[agents]
+default_preset = "basic"
+
+[agents.presets.basic]
+model = "openai/gpt-5.2"
+"#;
+        let result = validate_toml_str(toml);
+        assert!(
+            find_preset_silent_policy_warning(&result).is_none(),
+            "should not warn when presets declare no tool policy, got: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn multiple_offending_presets_are_rolled_up() {
+        let toml = r#"
+[agents.presets.full]
+[agents.presets.full.tools]
+deny = ["browser"]
+
+[agents.presets.minimal]
+[agents.presets.minimal.tools]
+allow = ["web_search"]
+"#;
+        let result = validate_toml_str(toml);
+        let warning = find_preset_silent_policy_warning(&result).unwrap_or_else(|| {
+            panic!(
+                "expected silent-policy warning, got: {:?}",
+                result.diagnostics
+            )
+        });
+        assert!(
+            warning.message.contains("\"full\"") && warning.message.contains("\"minimal\""),
+            "expected both preset names in single rolled-up warning: {}",
+            warning.message
+        );
+        // And only one such diagnostic should be emitted.
+        let count = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "security" && d.path == "agents.presets")
+            .count();
+        assert_eq!(count, 1, "expected exactly one rolled-up warning");
+    }
+
+    #[test]
+    fn server_terminal_enabled_is_known_field() {
+        let toml = r#"
+[server]
+terminal_enabled = false
+"#;
+        let result = validate_toml_str(toml);
+        let unknown = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "unknown-field" && d.path.contains("terminal_enabled"));
+        assert!(
+            unknown.is_none(),
+            "terminal_enabled should be a known field, got: {unknown:?}"
+        );
     }
 }

@@ -7,6 +7,9 @@
 
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
+#[cfg(feature = "ngrok")]
+use std::sync::Weak;
+
 use {
     axum::{
         Router,
@@ -30,6 +33,12 @@ use {
 use {moltis_channels::ChannelPlugin, moltis_protocol::TICK_INTERVAL_MS};
 
 use moltis_sessions::session_events::{SessionEvent, SessionEventBus};
+
+#[cfg(feature = "ngrok")]
+use secrecy::ExposeSecret;
+
+#[cfg(feature = "ngrok")]
+use tokio_util::sync::CancellationToken;
 
 use moltis_gateway::{
     auth,
@@ -57,6 +66,153 @@ use moltis_tls::CertManager;
 pub struct TailscaleOpts {
     pub mode: String,
     pub reset_on_exit: bool,
+}
+
+#[cfg(feature = "ngrok")]
+#[derive(Clone, Debug)]
+pub struct NgrokRuntimeStatus {
+    pub public_url: String,
+    pub passkey_warning: Option<String>,
+}
+
+#[cfg(feature = "ngrok")]
+struct NgrokActiveTunnel {
+    session: ngrok::Session,
+    forwarder: ngrok::forwarder::Forwarder<ngrok::tunnel::HttpTunnel>,
+    loopback_shutdown: CancellationToken,
+    loopback_task: tokio::task::JoinHandle<()>,
+    status: NgrokRuntimeStatus,
+}
+
+#[cfg(feature = "ngrok")]
+struct NgrokControllerInner {
+    gateway: Arc<GatewayState>,
+    webauthn_registry: Option<SharedWebAuthnRegistry>,
+    runtime: Arc<tokio::sync::RwLock<Option<NgrokRuntimeStatus>>>,
+    app: tokio::sync::RwLock<Option<Router>>,
+    active_tunnel: tokio::sync::Mutex<Option<NgrokActiveTunnel>>,
+}
+
+#[cfg(feature = "ngrok")]
+#[derive(Clone)]
+pub struct NgrokController {
+    inner: Arc<NgrokControllerInner>,
+}
+
+#[cfg(feature = "ngrok")]
+impl NgrokController {
+    fn new(
+        gateway: Arc<GatewayState>,
+        webauthn_registry: Option<SharedWebAuthnRegistry>,
+        runtime: Arc<tokio::sync::RwLock<Option<NgrokRuntimeStatus>>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(NgrokControllerInner {
+                gateway,
+                webauthn_registry,
+                runtime,
+                app: tokio::sync::RwLock::new(None),
+                active_tunnel: tokio::sync::Mutex::new(None),
+            }),
+        }
+    }
+
+    pub async fn configure_app(&self, app: Router) {
+        let mut stored = self.inner.app.write().await;
+        *stored = Some(app);
+    }
+
+    pub async fn apply(
+        &self,
+        ngrok_config: &moltis_config::NgrokConfig,
+    ) -> anyhow::Result<Option<NgrokRuntimeStatus>> {
+        self.stop().await?;
+
+        if !ngrok_config.enabled {
+            info!("ngrok tunnel disabled");
+            return Ok(None);
+        }
+
+        let active_tunnel = self.start(ngrok_config).await?;
+        let status = active_tunnel.status.clone();
+        {
+            let mut runtime = self.inner.runtime.write().await;
+            *runtime = Some(status.clone());
+        }
+        {
+            let mut active = self.inner.active_tunnel.lock().await;
+            *active = Some(active_tunnel);
+        }
+        info!(url = %status.public_url, "ngrok tunnel started");
+        Ok(Some(status))
+    }
+
+    async fn start(
+        &self,
+        ngrok_config: &moltis_config::NgrokConfig,
+    ) -> anyhow::Result<NgrokActiveTunnel> {
+        let app = {
+            let stored = self.inner.app.read().await;
+            stored.clone().ok_or_else(|| {
+                anyhow::anyhow!("ngrok tunnel cannot start before the HTTP app is ready")
+            })?
+        };
+
+        start_ngrok_tunnel(
+            app,
+            Arc::clone(&self.inner.gateway),
+            self.inner.webauthn_registry.clone(),
+            ngrok_config,
+        )
+        .await
+    }
+
+    pub async fn stop(&self) -> anyhow::Result<()> {
+        use ngrok::prelude::TunnelCloser;
+
+        let active_tunnel = {
+            let mut active = self.inner.active_tunnel.lock().await;
+            active.take()
+        };
+
+        let Some(mut active_tunnel) = active_tunnel else {
+            let mut runtime = self.inner.runtime.write().await;
+            *runtime = None;
+            return Ok(());
+        };
+
+        let stopped_url = active_tunnel.status.public_url.clone();
+        active_tunnel.loopback_shutdown.cancel();
+
+        if let Err(error) = active_tunnel.forwarder.close().await {
+            warn!(url = %stopped_url, %error, "failed to close ngrok tunnel");
+        }
+        if let Err(error) = active_tunnel.session.close().await {
+            warn!(url = %stopped_url, %error, "failed to close ngrok session");
+        }
+
+        match active_tunnel.forwarder.join().await {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => {
+                warn!(url = %stopped_url, %error, "ngrok tunnel forwarder exited with error");
+            },
+            Err(error) => {
+                warn!(url = %stopped_url, %error, "ngrok tunnel join failed");
+            },
+        }
+
+        match active_tunnel.loopback_task.await {
+            Ok(()) => {},
+            Err(error) => {
+                warn!(url = %stopped_url, %error, "ngrok loopback server task join failed");
+            },
+        }
+
+        let mut runtime = self.inner.runtime.write().await;
+        *runtime = None;
+        info!(url = %stopped_url, "ngrok tunnel stopped");
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +269,12 @@ pub struct AppState {
     pub methods: Arc<MethodRegistry>,
     pub request_throttle: Arc<crate::request_throttle::RequestThrottle>,
     pub webauthn_registry: Option<SharedWebAuthnRegistry>,
+    #[cfg(feature = "ngrok")]
+    pub ngrok_controller_owner: Option<Arc<NgrokController>>,
+    #[cfg(feature = "ngrok")]
+    pub ngrok_controller: Weak<NgrokController>,
+    #[cfg(feature = "ngrok")]
+    pub ngrok_runtime: Arc<tokio::sync::RwLock<Option<NgrokRuntimeStatus>>>,
     #[cfg(feature = "push-notifications")]
     pub push_service: Option<Arc<moltis_gateway::push::PushService>>,
     #[cfg(feature = "graphql")]
@@ -121,6 +283,20 @@ pub struct AppState {
 
 /// Function signature for adding extra routes (e.g. web-UI) to the gateway.
 pub type RouteEnhancer = fn() -> Router<AppState>;
+
+#[cfg(feature = "ngrok")]
+type GatewayBase = (Router<AppState>, AppState, Arc<NgrokController>);
+
+#[cfg(not(feature = "ngrok"))]
+type GatewayBase = (Router<AppState>, AppState);
+
+#[cfg(feature = "ngrok")]
+fn attach_ngrok_controller_owner(
+    app_state: &mut AppState,
+    ngrok_controller: &Arc<NgrokController>,
+) {
+    app_state.ngrok_controller_owner = Some(Arc::clone(ngrok_controller));
+}
 
 // ── Server startup ───────────────────────────────────────────────────────────
 
@@ -197,6 +373,10 @@ where
             header::HeaderName::from_static("referrer-policy"),
             HeaderValue::from_static("strict-origin-when-cross-origin"),
         ))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(), microphone=(self), geolocation=(), payment=()"),
+        ))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(cors);
 
@@ -261,12 +441,12 @@ where
 /// or state consumption. Callers can merge additional routes (e.g. web-UI)
 /// before calling [`finalize_gateway_app`].
 #[cfg(feature = "push-notifications")]
-pub fn build_gateway_base(
+fn build_gateway_base_internal(
     state: Arc<GatewayState>,
     methods: Arc<MethodRegistry>,
     push_service: Option<Arc<moltis_gateway::push::PushService>>,
     webauthn_registry: Option<SharedWebAuthnRegistry>,
-) -> (Router<AppState>, AppState) {
+) -> GatewayBase {
     let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/ws/chat", get(ws_upgrade_handler))
@@ -278,24 +458,33 @@ pub fn build_gateway_base(
             credential_store: Arc::clone(cred_store),
             webauthn_registry: webauthn_registry.clone(),
             gateway_state: Arc::clone(&state),
+            login_guard: crate::login_guard::LoginGuard::new(),
         };
         router = router.nest("/api/auth", auth_router().with_state(auth_state));
     }
 
     #[cfg(feature = "graphql")]
-    let graphql_schema = {
-        let system_info = Arc::new(crate::graphql_routes::GatewaySystemInfoService {
-            state: Arc::clone(&state),
-        });
-        let services = state.services.to_services(system_info);
-        moltis_graphql::build_schema(services, state.graphql_broadcast.clone())
-    };
+    let graphql_schema = crate::graphql_routes::build_graphql_schema(Arc::clone(&state));
+    #[cfg(feature = "ngrok")]
+    let ngrok_runtime = Arc::new(tokio::sync::RwLock::new(None));
+    #[cfg(feature = "ngrok")]
+    let ngrok_controller = Arc::new(NgrokController::new(
+        Arc::clone(&state),
+        webauthn_registry.clone(),
+        Arc::clone(&ngrok_runtime),
+    ));
 
     let app_state = AppState {
         gateway: state,
         methods,
         request_throttle: Arc::new(crate::request_throttle::RequestThrottle::new()),
         webauthn_registry: webauthn_registry.clone(),
+        #[cfg(feature = "ngrok")]
+        ngrok_controller_owner: None,
+        #[cfg(feature = "ngrok")]
+        ngrok_controller: Arc::downgrade(&ngrok_controller),
+        #[cfg(feature = "ngrok")]
+        ngrok_runtime,
         push_service,
         #[cfg(feature = "graphql")]
         graphql_schema,
@@ -312,6 +501,34 @@ pub fn build_gateway_base(
         );
     }
 
+    #[cfg(feature = "ngrok")]
+    {
+        (router, app_state, ngrok_controller)
+    }
+    #[cfg(not(feature = "ngrok"))]
+    {
+        (router, app_state)
+    }
+}
+
+/// Build the gateway base router and `AppState` without throttle, middleware,
+/// or state consumption. Callers can merge additional routes (e.g. web-UI)
+/// before calling [`finalize_gateway_app`].
+#[cfg(feature = "push-notifications")]
+pub fn build_gateway_base(
+    state: Arc<GatewayState>,
+    methods: Arc<MethodRegistry>,
+    push_service: Option<Arc<moltis_gateway::push::PushService>>,
+    webauthn_registry: Option<SharedWebAuthnRegistry>,
+) -> (Router<AppState>, AppState) {
+    #[cfg(feature = "ngrok")]
+    let (router, mut app_state, ngrok_controller) =
+        build_gateway_base_internal(state, methods, push_service, webauthn_registry);
+    #[cfg(feature = "ngrok")]
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
+    #[cfg(not(feature = "ngrok"))]
+    let (router, app_state) =
+        build_gateway_base_internal(state, methods, push_service, webauthn_registry);
     (router, app_state)
 }
 
@@ -319,11 +536,11 @@ pub fn build_gateway_base(
 /// or state consumption. Callers can merge additional routes (e.g. web-UI)
 /// before calling [`finalize_gateway_app`].
 #[cfg(not(feature = "push-notifications"))]
-pub fn build_gateway_base(
+fn build_gateway_base_internal(
     state: Arc<GatewayState>,
     methods: Arc<MethodRegistry>,
     webauthn_registry: Option<SharedWebAuthnRegistry>,
-) -> (Router<AppState>, AppState) {
+) -> GatewayBase {
     let mut router = Router::new()
         .route("/health", get(health_handler))
         .route("/ws/chat", get(ws_upgrade_handler))
@@ -344,24 +561,33 @@ pub fn build_gateway_base(
             credential_store: Arc::clone(cred_store),
             webauthn_registry: webauthn_registry.clone(),
             gateway_state: Arc::clone(&state),
+            login_guard: crate::login_guard::LoginGuard::new(),
         };
         router = router.nest("/api/auth", auth_router().with_state(auth_state));
     }
 
     #[cfg(feature = "graphql")]
-    let graphql_schema = {
-        let system_info = Arc::new(crate::graphql_routes::GatewaySystemInfoService {
-            state: Arc::clone(&state),
-        });
-        let services = state.services.to_services(system_info);
-        moltis_graphql::build_schema(services, state.graphql_broadcast.clone())
-    };
+    let graphql_schema = crate::graphql_routes::build_graphql_schema(Arc::clone(&state));
+    #[cfg(feature = "ngrok")]
+    let ngrok_runtime = Arc::new(tokio::sync::RwLock::new(None));
+    #[cfg(feature = "ngrok")]
+    let ngrok_controller = Arc::new(NgrokController::new(
+        Arc::clone(&state),
+        webauthn_registry.clone(),
+        Arc::clone(&ngrok_runtime),
+    ));
 
     let app_state = AppState {
         gateway: state,
         methods,
         request_throttle: Arc::new(crate::request_throttle::RequestThrottle::new()),
         webauthn_registry: webauthn_registry.clone(),
+        #[cfg(feature = "ngrok")]
+        ngrok_controller_owner: None,
+        #[cfg(feature = "ngrok")]
+        ngrok_controller: Arc::downgrade(&ngrok_controller),
+        #[cfg(feature = "ngrok")]
+        ngrok_runtime,
         #[cfg(feature = "graphql")]
         graphql_schema,
     };
@@ -377,6 +603,32 @@ pub fn build_gateway_base(
         );
     }
 
+    #[cfg(feature = "ngrok")]
+    {
+        (router, app_state, ngrok_controller)
+    }
+    #[cfg(not(feature = "ngrok"))]
+    {
+        (router, app_state)
+    }
+}
+
+/// Build the gateway base router and `AppState` without throttle, middleware,
+/// or state consumption. Callers can merge additional routes (e.g. web-UI)
+/// before calling [`finalize_gateway_app`].
+#[cfg(not(feature = "push-notifications"))]
+pub fn build_gateway_base(
+    state: Arc<GatewayState>,
+    methods: Arc<MethodRegistry>,
+    webauthn_registry: Option<SharedWebAuthnRegistry>,
+) -> (Router<AppState>, AppState) {
+    #[cfg(feature = "ngrok")]
+    let (router, mut app_state, ngrok_controller) =
+        build_gateway_base_internal(state, methods, webauthn_registry);
+    #[cfg(feature = "ngrok")]
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
+    #[cfg(not(feature = "ngrok"))]
+    let (router, app_state) = build_gateway_base_internal(state, methods, webauthn_registry);
     (router, app_state)
 }
 
@@ -408,6 +660,16 @@ pub fn finalize_gateway_app(
         app_state.clone(),
         crate::request_throttle::throttle_gate,
     ));
+    // HSTS: instruct browsers to always use HTTPS once they've connected securely.
+    let router = if app_state.gateway.is_secure() {
+        use axum::http::{HeaderValue, header};
+        router.layer(SetResponseHeaderLayer::overriding(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+    } else {
+        router
+    };
     let router = apply_middleware_stack(router, cors, http_request_logs);
     router.with_state(app_state)
 }
@@ -472,6 +734,8 @@ pub struct BannerMeta {
     pub openclaw_status: String,
     pub setup_code_display: Option<String>,
     pub webauthn_registry: Option<SharedWebAuthnRegistry>,
+    #[cfg(feature = "ngrok")]
+    pub ngrok_controller: Arc<NgrokController>,
     pub browser_for_lifecycle: Arc<dyn moltis_gateway::services::BrowserService>,
     pub browser_tool_for_warmup: Option<Arc<dyn moltis_agents::tool_registry::AgentTool>>,
     pub config: moltis_config::schema::MoltisConfig,
@@ -565,6 +829,17 @@ pub async fn prepare_gateway(
     } = core;
 
     #[cfg(feature = "push-notifications")]
+    #[cfg(feature = "ngrok")]
+    let (router, mut app_state, ngrok_controller) = build_gateway_base_internal(
+        Arc::clone(&state),
+        Arc::clone(&methods),
+        push_service,
+        webauthn_registry.clone(),
+    );
+    #[cfg(feature = "push-notifications")]
+    #[cfg(feature = "ngrok")]
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
+    #[cfg(all(feature = "push-notifications", not(feature = "ngrok")))]
     let (router, app_state) = build_gateway_base(
         Arc::clone(&state),
         Arc::clone(&methods),
@@ -572,6 +847,16 @@ pub async fn prepare_gateway(
         webauthn_registry.clone(),
     );
     #[cfg(not(feature = "push-notifications"))]
+    #[cfg(feature = "ngrok")]
+    let (router, mut app_state, ngrok_controller) = build_gateway_base_internal(
+        Arc::clone(&state),
+        Arc::clone(&methods),
+        webauthn_registry.clone(),
+    );
+    #[cfg(not(feature = "push-notifications"))]
+    #[cfg(feature = "ngrok")]
+    attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
+    #[cfg(all(not(feature = "push-notifications"), not(feature = "ngrok")))]
     let (router, app_state) = build_gateway_base(
         Arc::clone(&state),
         Arc::clone(&methods),
@@ -600,6 +885,27 @@ pub async fn prepare_gateway(
                     let teams_plugin = Arc::clone(&teams_plugin_for_webhook);
                     let gw_state = Arc::clone(&state_for_teams_webhook);
                     async move {
+                        // JWT pre-validation: if a JWT validator is configured,
+                        // the Authorization header is mandatory and must be valid.
+                        // A missing header is treated as an auth failure (not skipped).
+                        let jwt_validator = {
+                            let plugin = teams_plugin.read().await;
+                            plugin.jwt_validator(&account_id)
+                        };
+                        if let Some(validator) = jwt_validator {
+                            let header_str = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
+                            if !validator.validate(header_str).await {
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    Json(serde_json::json!({ "ok": false, "error": "invalid JWT" })),
+                                )
+                                    .into_response();
+                            }
+                        }
+
                         // Get the verifier from the plugin.
                         let verifier = {
                             let plugin = teams_plugin.read().await;
@@ -641,7 +947,7 @@ pub async fn prepare_gateway(
                             )
                                 .into_response(),
                             Ok((verified, moltis_channels::ChannelWebhookDedupeResult::New)) => {
-                                // Parse verified body and dispatch.
+                                // Parse verified body.
                                 let payload: serde_json::Value =
                                     match serde_json::from_slice(&verified.body) {
                                         Ok(v) => v,
@@ -653,35 +959,30 @@ pub async fn prepare_gateway(
                                                 .into_response();
                                         },
                                     };
-                                let result = {
-                                    let plugin = teams_plugin.read().await;
-                                    plugin
-                                        .ingest_verified_activity(&account_id, payload)
+
+                                // Spawn processing asynchronously and return 202
+                                // immediately. This prevents Teams from retrying
+                                // when LLM processing takes longer than ~15 seconds.
+                                let account_id_owned = account_id.clone();
+                                let teams_plugin_for_spawn = Arc::clone(&teams_plugin);
+                                tokio::spawn(async move {
+                                    let plugin = teams_plugin_for_spawn.read().await;
+                                    if let Err(e) = plugin
+                                        .ingest_verified_activity(&account_id_owned, payload)
                                         .await
-                                };
-                                match result {
-                                    Ok(()) => (
-                                        StatusCode::OK,
-                                        Json(serde_json::json!({ "ok": true })),
-                                    )
-                                        .into_response(),
-                                    Err(e) => {
-                                        let msg = e.to_string();
-                                        if msg.contains("unknown Teams account") {
-                                            (
-                                                StatusCode::NOT_FOUND,
-                                                Json(serde_json::json!({ "ok": false, "error": msg })),
-                                            )
-                                                .into_response()
-                                        } else {
-                                            (
-                                                StatusCode::BAD_REQUEST,
-                                                Json(serde_json::json!({ "ok": false, "error": msg })),
-                                            )
-                                                .into_response()
-                                        }
-                                    },
-                                }
+                                    {
+                                        tracing::warn!(
+                                            account_id = account_id_owned,
+                                            "Teams webhook processing failed: {e}"
+                                        );
+                                    }
+                                });
+
+                                (
+                                    StatusCode::ACCEPTED,
+                                    Json(serde_json::json!({ "ok": true })),
+                                )
+                                    .into_response()
                             },
                         }
                     }
@@ -689,7 +990,6 @@ pub async fn prepare_gateway(
             ),
         );
     }
-
     #[cfg(feature = "slack")]
     {
         // Slack Events API webhook — receives event callbacks.
@@ -852,6 +1152,347 @@ pub async fn prepare_gateway(
         );
     }
 
+    // ── Generic webhook ingress ────────────────────────────────────────────
+    {
+        fn webhook_cors_headers(mut resp: axum::response::Response) -> axum::response::Response {
+            use axum::http::HeaderValue;
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            );
+            h.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("POST, OPTIONS"),
+            );
+            h.insert(axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, Authorization, X-Hub-Signature-256, X-GitHub-Event, X-GitHub-Delivery, X-Gitlab-Token, X-Gitlab-Event, Stripe-Signature, X-Webhook-Secret, X-Event-Type, X-Delivery-Id, Idempotency-Key, Linear-Signature, X-PagerDuty-Signature, Sentry-Hook-Signature"));
+            h.insert(
+                axum::http::header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("86400"),
+            );
+            resp
+        }
+
+        // OPTIONS preflight handler.
+        app = app.route(
+            "/api/webhooks/ingest/{public_id}",
+            axum::routing::options(move |_: axum::extract::Path<String>| async move {
+                webhook_cors_headers(StatusCode::NO_CONTENT.into_response())
+            }),
+        );
+
+        let state_for_webhook_ingest = Arc::clone(&state);
+        app = app.route(
+            "/api/webhooks/ingest/{public_id}",
+            axum::routing::post(
+                move |axum::extract::Path(public_id): axum::extract::Path<String>,
+                      ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                      headers: axum::http::HeaderMap,
+                      body: axum::body::Bytes| {
+                    let gw = Arc::clone(&state_for_webhook_ingest);
+                    async move {
+                        // Extract remote IP. Behind a proxy, trust forwarded
+                        // headers; otherwise use the real TCP peer address.
+                        let remote_ip = if gw.behind_proxy {
+                            headers
+                                .get("x-forwarded-for")
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|v| v.split(',').next())
+                                .map(|s| s.trim().to_string())
+                                .or_else(|| {
+                                    headers
+                                        .get("x-real-ip")
+                                        .and_then(|v| v.to_str().ok())
+                                        .map(|s| s.trim().to_string())
+                                })
+                                .or_else(|| Some(peer.ip().to_string()))
+                        } else {
+                            Some(peer.ip().to_string())
+                        };
+
+                        let resp = async {
+                            let Some(store) = gw.webhook_store.get() else {
+                                return (
+                                    StatusCode::NOT_FOUND,
+                                    Json(serde_json::json!({ "error": "webhooks not configured" })),
+                                )
+                                    .into_response();
+                            };
+
+                            // Look up webhook by public_id.
+                            let webhook = match store.get_webhook_by_public_id(&public_id).await {
+                                Ok(w) if w.enabled => w,
+                                Ok(_) => {
+                                    return (
+                                        StatusCode::NOT_FOUND,
+                                        Json(serde_json::json!({ "error": "webhook not found" })),
+                                    )
+                                        .into_response();
+                                },
+                                Err(_) => {
+                                    return (
+                                        StatusCode::NOT_FOUND,
+                                        Json(serde_json::json!({ "error": "webhook not found" })),
+                                    )
+                                        .into_response();
+                                },
+                            };
+
+                            #[allow(unused_mut)]
+                            // Secret decryption mutates the webhook only when the vault feature is enabled.
+                            let mut webhook = webhook;
+
+                            #[cfg(feature = "vault")]
+                            if let Err(error) = moltis_gateway::webhooks::decrypt_webhook_secrets(
+                                &mut webhook,
+                                gw.vault.as_ref(),
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    public_id = %webhook.public_id,
+                                    error = %error,
+                                    "webhook secrets unavailable for runtime verification"
+                                );
+                                return (
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    Json(serde_json::json!({
+                                        "error": "webhook secrets unavailable",
+                                    })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Check CIDR allowlist (before auth to avoid timing side-channels).
+                            if !webhook.allowed_cidrs.is_empty() {
+                                let allowed = match &remote_ip {
+                                    Some(ip) => {
+                                        if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                                            webhook.allowed_cidrs.iter().any(|cidr| {
+                                                cidr.parse::<ipnet::IpNet>()
+                                                    .map(|net| net.contains(&addr))
+                                                    .unwrap_or_else(|_| {
+                                                        // Fall back to exact string match.
+                                                        cidr == ip
+                                                    })
+                                            })
+                                        } else {
+                                            // IP couldn't be parsed — no match.
+                                            false
+                                        }
+                                    },
+                                    None => false, // No IP available — can't match allowlist.
+                                };
+                                if !allowed {
+                                    return (
+                                        StatusCode::FORBIDDEN,
+                                        Json(serde_json::json!({ "error": "IP not in allowlist" })),
+                                    )
+                                        .into_response();
+                                }
+                            }
+
+                            // Check body size limit.
+                            if body.len() > webhook.max_body_bytes {
+                                return (
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    Json(serde_json::json!({
+                                        "error": "payload too large",
+                                        "maxBytes": webhook.max_body_bytes,
+                                    })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Verify authentication.
+                            if let Err(e) = moltis_webhooks::auth::verify(
+                                &webhook.auth_mode,
+                                webhook.auth_config.as_ref(),
+                                &headers,
+                                &body,
+                            ) {
+                                tracing::warn!(
+                                    webhook_id = webhook.id,
+                                    public_id = %webhook.public_id,
+                                    error = %e,
+                                    "webhook auth verification failed"
+                                );
+                                return (
+                                    StatusCode::UNAUTHORIZED,
+                                    Json(serde_json::json!({ "error": "authentication failed" })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Parse event type and delivery key from source profile.
+                            let profile_registry =
+                                moltis_webhooks::profiles::ProfileRegistry::new();
+                            let profile = profile_registry.get(&webhook.source_profile);
+                            let event_type =
+                                profile.and_then(|p| p.parse_event_type(&headers, &body));
+                            let delivery_key =
+                                profile.and_then(|p| p.parse_delivery_key(&headers, &body));
+
+                            // Check event filter.
+                            if let Some(ref et) = event_type
+                                && !webhook.event_filter.accepts(et)
+                            {
+                                return (
+                                    StatusCode::OK,
+                                    Json(serde_json::json!({
+                                        "status": "filtered",
+                                        "eventType": et,
+                                    })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Check rate limit.
+                            if !gw
+                                .webhook_rate_limiter
+                                .check(webhook.id, webhook.rate_limit_per_minute)
+                            {
+                                return (
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    Json(serde_json::json!({ "error": "rate limited" })),
+                                )
+                                    .into_response();
+                            }
+
+                            // Dedup check.
+                            if let Some(ref dk) = delivery_key {
+                                match moltis_webhooks::dedup::check_duplicate(
+                                    store.as_ref(),
+                                    webhook.id,
+                                    Some(dk.as_str()),
+                                )
+                                .await
+                                {
+                                    Ok(Some(existing_id)) => {
+                                        return (
+                                            StatusCode::OK,
+                                            Json(serde_json::json!({
+                                                "status": "deduplicated",
+                                                "existingDeliveryId": existing_id,
+                                            })),
+                                        )
+                                            .into_response();
+                                    },
+                                    Ok(None) => { /* new delivery, continue */ },
+                                    Err(e) => {
+                                        tracing::error!(
+                                            webhook_id = webhook.id,
+                                            error = %e,
+                                            "dedup check failed"
+                                        );
+                                        // Continue despite dedup error — better to
+                                        // accept a potential duplicate than reject.
+                                    },
+                                }
+                            }
+
+                            // Build timestamp.
+                            let received_at = time::OffsetDateTime::now_utc()
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into());
+
+                            // Extract entity key.
+                            let entity_key = if let (Some(p), Some(et)) = (profile, &event_type) {
+                                let body_val: serde_json::Value =
+                                    serde_json::from_slice(&body).unwrap_or_default();
+                                p.entity_key(et, &body_val)
+                            } else {
+                                None
+                            };
+
+                            // Extract safe headers for audit logging.
+                            let safe_headers =
+                                moltis_webhooks::normalize::extract_safe_headers(&headers);
+                            let headers_json = serde_json::to_string(&safe_headers).ok();
+
+                            let content_type = headers
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .map(String::from);
+
+                            // Persist delivery.
+                            let delivery = moltis_webhooks::store::NewDelivery {
+                                webhook_id: webhook.id,
+                                received_at: received_at.clone(),
+                                status: moltis_webhooks::types::DeliveryStatus::Queued,
+                                event_type: event_type.clone(),
+                                entity_key,
+                                delivery_key,
+                                http_method: Some("POST".into()),
+                                content_type,
+                                remote_ip: remote_ip.clone(),
+                                headers_json,
+                                body_size: body.len(),
+                                body_blob: Some(body.to_vec()),
+                                rejection_reason: None,
+                            };
+
+                            let delivery_id = match store.insert_delivery(&delivery).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    tracing::error!(
+                                        webhook_id = webhook.id,
+                                        error = %e,
+                                        "failed to persist webhook delivery"
+                                    );
+                                    return (
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        Json(serde_json::json!({
+                                            "error": "failed to persist delivery"
+                                        })),
+                                    )
+                                        .into_response();
+                                },
+                            };
+
+                            // Update denormalized delivery count.
+                            if let Err(e) = store
+                                .increment_delivery_count(webhook.id, &received_at)
+                                .await
+                            {
+                                tracing::warn!(
+                                    webhook_id = webhook.id,
+                                    error = %e,
+                                    "failed to increment delivery count"
+                                );
+                            }
+
+                            // Queue for async processing.
+                            if let Some(tx) = gw.webhook_worker_tx.get()
+                                && let Err(e) = tx.send(delivery_id).await
+                            {
+                                tracing::error!(
+                                    delivery_id,
+                                    error = %e,
+                                    "failed to queue webhook delivery for processing"
+                                );
+                            }
+
+                            (
+                                StatusCode::ACCEPTED,
+                                Json(serde_json::json!({
+                                    "deliveryId": delivery_id,
+                                    "status": "queued",
+                                    "webhookId": webhook.public_id,
+                                    "eventType": event_type,
+                                    "receivedAt": received_at,
+                                })),
+                            )
+                                .into_response()
+                        }
+                        .await;
+                        webhook_cors_headers(resp)
+                    }
+                },
+            ),
+        );
+    }
+
     // Resolve TLS configuration (only when compiled with the `tls` feature).
     #[cfg_attr(not(feature = "tls"), allow(unused_variables))]
     let tls_active = tls_enabled_for_gateway;
@@ -870,7 +1511,8 @@ pub async fn prepare_gateway(
         } else if tls_config.auto_generate {
             // Auto-generate certificates.
             let mgr = moltis_tls::FsCertManager::new()?;
-            let (ca, cert, key) = mgr.ensure_certs()?;
+            let runtime_sans = tls_runtime_sans(bind);
+            let (ca, cert, key) = mgr.ensure_certs(&runtime_sans)?;
             (Some(ca), cert, key)
         } else {
             anyhow::bail!(
@@ -1000,6 +1642,7 @@ pub async fn prepare_gateway(
                                             target.channel_type.as_str(),
                                             &target.account_id,
                                             &target.chat_id,
+                                            target.thread_id.as_deref(),
                                         )
                                         .await
                                         .map(|key| key == entry.key)
@@ -1497,6 +2140,7 @@ pub async fn prepare_gateway(
                     sandbox: Some(moltis_cron::types::CronSandboxConfig {
                         enabled: hb.sandbox_enabled,
                         image: hb.sandbox_image.clone(),
+                        auto_prune_container: None,
                     }),
                     ..Default::default()
                 };
@@ -1528,6 +2172,7 @@ pub async fn prepare_gateway(
                     sandbox: moltis_cron::types::CronSandboxConfig {
                         enabled: hb.sandbox_enabled,
                         image: hb.sandbox_image.clone(),
+                        auto_prune_container: None,
                     },
                     wake_mode: moltis_cron::types::CronWakeMode::default(),
                 };
@@ -1549,6 +2194,9 @@ pub async fn prepare_gateway(
         }
     }
 
+    #[cfg(feature = "ngrok")]
+    ngrok_controller.configure_app(app.clone()).await;
+
     Ok(PreparedGateway {
         app,
         state: Arc::clone(&state),
@@ -1562,6 +2210,8 @@ pub async fn prepare_gateway(
             openclaw_status: openclaw_startup_status,
             setup_code_display,
             webauthn_registry,
+            #[cfg(feature = "ngrok")]
+            ngrok_controller,
             browser_for_lifecycle,
             browser_tool_for_warmup,
             config,
@@ -1617,6 +2267,120 @@ pub use prepare_gateway_embedded as prepare_httpd_embedded;
 
 /// Re-export `openclaw_detected_for_ui` from gateway for web-UI templates.
 pub use moltis_gateway::server::openclaw_detected_for_ui;
+
+#[cfg(feature = "ngrok")]
+fn ngrok_loopback_has_proxy_headers(headers: &axum::http::HeaderMap) -> bool {
+    moltis_auth::locality::has_proxy_headers(headers)
+}
+
+#[cfg(feature = "ngrok")]
+async fn require_ngrok_proxy_headers(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !ngrok_loopback_has_proxy_headers(request.headers()) {
+        warn!("rejecting ngrok loopback request without proxy headers");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    next.run(request).await
+}
+
+#[cfg(feature = "ngrok")]
+async fn start_ngrok_tunnel(
+    app: Router,
+    gateway: Arc<GatewayState>,
+    webauthn_registry: Option<SharedWebAuthnRegistry>,
+    ngrok_config: &moltis_config::NgrokConfig,
+) -> anyhow::Result<NgrokActiveTunnel> {
+    use ngrok::prelude::{EndpointInfo, ForwarderBuilder};
+
+    let internal_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let internal_addr = internal_listener.local_addr()?;
+    let internal_app = app
+        .clone()
+        .layer(axum::middleware::from_fn(require_ngrok_proxy_headers));
+    let loopback_shutdown = CancellationToken::new();
+    let loopback_cancel = loopback_shutdown.clone();
+    let loopback_task = tokio::spawn(async move {
+        let server = axum::serve(
+            internal_listener,
+            internal_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            loopback_cancel.cancelled().await;
+        });
+
+        if let Err(error) = server.await {
+            warn!(%error, "ngrok loopback forward server exited");
+        }
+    });
+
+    let forward_to = format!("http://{internal_addr}")
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid ngrok forward target: {error}"))?;
+
+    let mut session_builder = ngrok::Session::builder();
+    if let Some(authtoken) = ngrok_config.authtoken.as_ref() {
+        session_builder.authtoken(authtoken.expose_secret());
+    } else {
+        session_builder.authtoken_from_env();
+    }
+    let mut session = match session_builder.connect().await {
+        Ok(session) => session,
+        Err(error) => {
+            loopback_shutdown.cancel();
+            if let Err(join_error) = loopback_task.await {
+                warn!(%join_error, "ngrok loopback server task join failed during startup");
+            }
+            return Err(error.into());
+        },
+    };
+
+    let mut endpoint = session.http_endpoint();
+    if let Some(domain) = ngrok_config.domain.as_deref() {
+        endpoint.domain(domain);
+    }
+    endpoint.forwards_to(format!("moltis://{internal_addr}"));
+    let forwarder = match endpoint.listen_and_forward(forward_to).await {
+        Ok(forwarder) => forwarder,
+        Err(error) => {
+            if let Err(close_error) = session.close().await {
+                warn!(%close_error, "failed to close ngrok session after startup error");
+            }
+            loopback_shutdown.cancel();
+            if let Err(join_error) = loopback_task.await {
+                warn!(%join_error, "ngrok loopback server task join failed during startup");
+            }
+            return Err(error.into());
+        },
+    };
+    let public_url = forwarder.url().to_string();
+    let public_host = url::Url::parse(&public_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string));
+
+    let passkey_warning = moltis_gateway::server::sync_runtime_webauthn_host_and_notice(
+        &gateway,
+        webauthn_registry.as_ref(),
+        public_host.as_deref(),
+        Some(&public_url),
+        "ngrok tunnel",
+    )
+    .await;
+    let status = NgrokRuntimeStatus {
+        public_url,
+        passkey_warning,
+    };
+
+    Ok(NgrokActiveTunnel {
+        session,
+        forwarder,
+        loopback_shutdown,
+        loopback_task,
+        status,
+    })
+}
 
 /// Start the gateway HTTP + WebSocket server.
 ///
@@ -1698,6 +2462,15 @@ pub async fn start_gateway(
     let app = prepared.app;
     let browser_for_warmup = Arc::clone(&banner.browser_for_lifecycle);
     let browser_tool_for_warmup = banner.browser_tool_for_warmup.clone();
+    #[cfg(feature = "ngrok")]
+    let (ngrok_status, ngrok_startup_error) =
+        match banner.ngrok_controller.apply(&config.ngrok).await {
+            Ok(status) => (status, None),
+            Err(error) => {
+                warn!(%error, "ngrok tunnel failed to start; gateway will continue without it");
+                (None, Some(error.to_string()))
+            },
+        };
 
     #[cfg(feature = "tls")]
     if tls_active {
@@ -1713,7 +2486,8 @@ pub async fn start_gateway(
         } else if tls_config.auto_generate {
             // Auto-generate certificates.
             let mgr = moltis_tls::FsCertManager::new()?;
-            let (ca, cert, key) = mgr.ensure_certs()?;
+            let runtime_sans = tls_runtime_sans(bind);
+            let (ca, cert, key) = mgr.ensure_certs(&runtime_sans)?;
             (Some(ca), cert, key)
         } else {
             anyhow::bail!(
@@ -1817,6 +2591,21 @@ pub async fn start_gateway(
         format!("openclaw: {}", banner.openclaw_status),
     ];
     lines.extend(startup_passkey_origin_lines(&passkey_origins));
+    #[cfg(feature = "ngrok")]
+    if let Some(status) = ngrok_status.as_ref() {
+        lines.push(format!("ngrok: {}", status.public_url));
+        if let Some(passkey_warning) = status.passkey_warning.as_ref() {
+            lines.push(format!("ngrok note: {passkey_warning}"));
+        }
+    } else if let Some(error) = ngrok_startup_error.as_deref() {
+        lines.push(format!("ngrok: failed to start ({error})"));
+    }
+    #[cfg(not(feature = "ngrok"))]
+    if config.ngrok.enabled {
+        lines.push(
+            "ngrok: enabled in config but this build does not include the ngrok feature".into(),
+        );
+    }
     // Hint about Apple Container on macOS when using Docker or Podman.
     #[cfg(target_os = "macos")]
     if banner.sandbox_backend_name == "docker" || banner.sandbox_backend_name == "podman" {
@@ -1827,6 +2616,12 @@ pub async fn start_gateway(
     // Warn when no sandbox backend is available.
     if banner.sandbox_backend_name == "none" {
         lines.push("⚠ no container runtime found; commands run on host".into());
+    }
+    // Warn when TLS is off and the server is not localhost-only.
+    if !tls_active && !is_localhost {
+        lines.push(
+            "⚠ TLS is disabled on a non-localhost bind address; session cookies will be sent over unencrypted HTTP".into(),
+        );
     }
     // Display setup code if one was generated.
     if let Some(ref code) = banner.setup_code_display {
@@ -2046,8 +2841,8 @@ async fn ws_upgrade_handler(
     let remote_ip = extract_ws_client_ip(&headers, addr).filter(|ip| is_public_ip(ip));
 
     let is_local = is_local_connection(&headers, addr, state.gateway.behind_proxy);
-    let header_authenticated =
-        websocket_header_authenticated(&headers, state.gateway.credential_store.as_ref(), is_local)
+    let header_identity =
+        websocket_header_authenticate(&headers, state.gateway.credential_store.as_ref(), is_local)
             .await;
     ws.on_upgrade(move |socket| {
         handle_connection(
@@ -2057,7 +2852,7 @@ async fn ws_upgrade_handler(
             addr,
             accept_language,
             remote_ip,
-            header_authenticated,
+            header_identity,
             is_local,
         )
     })
@@ -2150,19 +2945,17 @@ fn is_public_ip(ip: &str) -> bool {
 
 pub(crate) use moltis_auth::locality::is_local_connection;
 
-async fn websocket_header_authenticated(
+async fn websocket_header_authenticate(
     headers: &axum::http::HeaderMap,
     credential_store: Option<&Arc<auth::CredentialStore>>,
     is_local: bool,
-) -> bool {
-    let Some(store) = credential_store else {
-        return false;
-    };
+) -> Option<auth::AuthIdentity> {
+    let store = credential_store?;
 
-    matches!(
-        crate::auth_middleware::check_auth(store, headers, is_local).await,
-        crate::auth_middleware::AuthResult::Allowed(_)
-    )
+    match crate::auth_middleware::check_auth(store, headers, is_local).await {
+        crate::auth_middleware::AuthResult::Allowed(identity) => Some(identity),
+        _ => None,
+    }
 }
 
 /// Resolve the machine's primary outbound IP address.
@@ -2180,6 +2973,39 @@ fn resolve_outbound_ip(ipv6: bool) -> Option<std::net::IpAddr> {
     let socket = UdpSocket::bind(bind).ok()?;
     socket.connect(target).ok()?;
     Some(socket.local_addr().ok()?.ip())
+}
+
+#[cfg(feature = "tls")]
+fn tls_runtime_sans(bind: &str) -> Vec<moltis_tls::ServerSan> {
+    let normalized = bind.trim().trim_end_matches('.');
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    if let Ok(ip) = normalized.parse::<std::net::IpAddr>() {
+        if ip.is_unspecified() {
+            // For wildcard binds we can only infer one "best" reachable IP
+            // from the current routing table, which fixes the common single-LAN
+            // case but still cannot cover every interface on multi-homed hosts.
+            return resolve_outbound_ip(ip.is_ipv6())
+                .filter(|resolved| !resolved.is_loopback() && !resolved.is_unspecified())
+                .map(moltis_tls::ServerSan::Ip)
+                .into_iter()
+                .collect();
+        }
+
+        if !ip.is_loopback() {
+            return vec![moltis_tls::ServerSan::Ip(ip)];
+        }
+
+        return Vec::new();
+    }
+
+    if matches!(normalized, "localhost") || normalized.ends_with(".localhost") {
+        Vec::new()
+    } else {
+        vec![moltis_tls::ServerSan::Dns(normalized.to_ascii_lowercase())]
+    }
 }
 
 fn startup_bind_line(addr: SocketAddr) -> String {
@@ -2417,6 +3243,80 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_uses_dns_for_non_localhost_names() {
+        assert_eq!(tls_runtime_sans("gateway.local"), vec![
+            moltis_tls::ServerSan::Dns("gateway.local".to_string())
+        ]);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_uses_ip_for_concrete_non_loopback_bind() {
+        assert_eq!(tls_runtime_sans("192.168.1.9"), vec![
+            moltis_tls::ServerSan::Ip("192.168.1.9".parse().unwrap())
+        ]);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_uses_ip_for_concrete_non_loopback_ipv6_bind() {
+        assert_eq!(tls_runtime_sans("2001:db8::42"), vec![
+            moltis_tls::ServerSan::Ip("2001:db8::42".parse().unwrap())
+        ]);
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_skips_loopback_hosts() {
+        assert!(tls_runtime_sans("127.0.0.1").is_empty());
+        assert!(tls_runtime_sans("::1").is_empty());
+        assert!(tls_runtime_sans("localhost").is_empty());
+        assert!(tls_runtime_sans("moltis.localhost").is_empty());
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_wildcard_bind_uses_resolved_outbound_ip_when_available() {
+        let sans = tls_runtime_sans("0.0.0.0");
+        if let Some(ip) =
+            resolve_outbound_ip(false).filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        {
+            assert_eq!(sans, vec![moltis_tls::ServerSan::Ip(ip)]);
+        } else {
+            assert!(sans.is_empty());
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_runtime_sans_ipv6_wildcard_bind_uses_resolved_outbound_ip_when_available() {
+        let sans = tls_runtime_sans("::");
+        if let Some(ip) =
+            resolve_outbound_ip(true).filter(|ip| !ip.is_loopback() && !ip.is_unspecified())
+        {
+            assert_eq!(sans, vec![moltis_tls::ServerSan::Ip(ip)]);
+        } else {
+            assert!(sans.is_empty());
+        }
+    }
+
+    #[cfg(feature = "ngrok")]
+    #[test]
+    fn ngrok_loopback_guard_rejects_requests_without_proxy_headers() {
+        let headers = axum::http::HeaderMap::new();
+        assert!(!ngrok_loopback_has_proxy_headers(&headers));
+    }
+
+    #[cfg(feature = "ngrok")]
+    #[test]
+    fn ngrok_loopback_guard_allows_requests_with_proxy_headers() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.50".parse().unwrap());
+        assert!(ngrok_loopback_has_proxy_headers(&headers));
+    }
+
     #[test]
     fn ipv6_bind_addresses_parse_correctly() {
         // Regression test for GitHub issue #447 — binding to "::" crashed
@@ -2474,5 +3374,70 @@ mod tests {
             "enter this code to set your password or register a passkey",
             "",
         ]);
+    }
+
+    #[cfg(feature = "ngrok")]
+    #[test]
+    fn public_build_gateway_base_keeps_ngrok_controller_alive() {
+        let state = GatewayState::new(
+            auth::resolve_auth(None, None),
+            moltis_gateway::services::GatewayServices::noop(),
+        );
+        let methods = Arc::new(MethodRegistry::new());
+        #[cfg(feature = "push-notifications")]
+        let (_router, app_state) = build_gateway_base(state, methods, None, None);
+        #[cfg(not(feature = "push-notifications"))]
+        let (_router, app_state) = build_gateway_base(state, methods, None);
+
+        assert!(app_state.ngrok_controller_owner.is_some());
+        assert!(app_state.ngrok_controller.upgrade().is_some());
+    }
+
+    #[cfg(feature = "ngrok")]
+    #[test]
+    fn attaching_owner_keeps_internal_ngrok_controller_alive_after_local_arc_drop() {
+        let state = GatewayState::new(
+            auth::resolve_auth(None, None),
+            moltis_gateway::services::GatewayServices::noop(),
+        );
+        let methods = Arc::new(MethodRegistry::new());
+        #[cfg(feature = "push-notifications")]
+        let (_router, app_state, ngrok_controller) =
+            build_gateway_base_internal(state, methods, None, None);
+        #[cfg(not(feature = "push-notifications"))]
+        let (_router, mut app_state, ngrok_controller) =
+            build_gateway_base_internal(state, methods, None);
+
+        assert!(app_state.ngrok_controller.upgrade().is_some());
+
+        let weak = app_state.ngrok_controller.clone();
+        drop(ngrok_controller);
+        assert!(weak.upgrade().is_none());
+
+        #[cfg(feature = "push-notifications")]
+        let (_router, mut app_state, ngrok_controller) = build_gateway_base_internal(
+            GatewayState::new(
+                auth::resolve_auth(None, None),
+                moltis_gateway::services::GatewayServices::noop(),
+            ),
+            Arc::new(MethodRegistry::new()),
+            None,
+            None,
+        );
+        #[cfg(not(feature = "push-notifications"))]
+        let (_router, mut app_state, ngrok_controller) = build_gateway_base_internal(
+            GatewayState::new(
+                auth::resolve_auth(None, None),
+                moltis_gateway::services::GatewayServices::noop(),
+            ),
+            Arc::new(MethodRegistry::new()),
+            None,
+        );
+
+        attach_ngrok_controller_owner(&mut app_state, &ngrok_controller);
+        let weak = app_state.ngrok_controller.clone();
+        drop(ngrok_controller);
+        assert!(weak.upgrade().is_some());
+        assert!(app_state.ngrok_controller_owner.is_some());
     }
 }

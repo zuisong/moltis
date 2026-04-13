@@ -2,6 +2,7 @@ use {
     crate::tool_registry::ToolRegistry,
     moltis_config::{AgentIdentity, DEFAULT_SOUL, UserProfile},
     moltis_skills::types::SkillMetadata,
+    serde::Serialize,
 };
 
 // ── Model family detection ──────────────────────────────────────────────────
@@ -68,6 +69,8 @@ pub struct PromptHostRuntimeContext {
     pub channel_chat_id: Option<String>,
     /// Best-effort channel chat type (for example `private`, `group`, `channel`).
     pub channel_chat_type: Option<String>,
+    /// Platform-specific sender/peer ID for the current channel message.
+    pub channel_sender_id: Option<String>,
     /// Persistent Moltis workspace root (`data_dir`), e.g. `~/.moltis`
     /// or `/home/moltis/.moltis` in containerized deploys.
     pub data_dir: Option<String>,
@@ -131,6 +134,47 @@ pub struct PromptRuntimeContext {
     pub nodes: Option<PromptNodesRuntimeContext>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PromptBuildLimits {
+    pub workspace_file_max_chars: usize,
+}
+
+impl Default for PromptBuildLimits {
+    fn default() -> Self {
+        Self {
+            workspace_file_max_chars: DEFAULT_WORKSPACE_FILE_MAX_CHARS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceFilePromptStatus {
+    pub name: String,
+    pub original_chars: usize,
+    pub included_chars: usize,
+    pub limit_chars: usize,
+    pub truncated_chars: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PromptBuildMetadata {
+    pub workspace_files: Vec<WorkspaceFilePromptStatus>,
+}
+
+impl PromptBuildMetadata {
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.workspace_files.iter().any(|file| file.truncated)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PromptBuildOutput {
+    pub prompt: String,
+    pub metadata: PromptBuildMetadata,
+}
+
 /// Suffix appended to the system prompt when the user's reply medium is voice.
 ///
 /// Instructs the LLM to produce speech-friendly output: no raw URLs, no markdown
@@ -175,6 +219,7 @@ pub fn build_system_prompt(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -187,11 +232,46 @@ pub fn build_system_prompt_with_session_runtime(
     identity: Option<&AgentIdentity>,
     user: Option<&UserProfile>,
     soul_text: Option<&str>,
+    boot_text: Option<&str>,
     agents_text: Option<&str>,
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
 ) -> String {
+    build_system_prompt_with_session_runtime_details(
+        tools,
+        native_tools,
+        project_context,
+        skills,
+        identity,
+        user,
+        soul_text,
+        boot_text,
+        agents_text,
+        tools_text,
+        runtime_context,
+        memory_text,
+        PromptBuildLimits::default(),
+    )
+    .prompt
+}
+
+/// Build the system prompt with explicit runtime context and metadata.
+pub fn build_system_prompt_with_session_runtime_details(
+    tools: &ToolRegistry,
+    native_tools: bool,
+    project_context: Option<&str>,
+    skills: &[SkillMetadata],
+    identity: Option<&AgentIdentity>,
+    user: Option<&UserProfile>,
+    soul_text: Option<&str>,
+    boot_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    runtime_context: Option<&PromptRuntimeContext>,
+    memory_text: Option<&str>,
+    limits: PromptBuildLimits,
+) -> PromptBuildOutput {
     build_system_prompt_full(
         tools,
         native_tools,
@@ -200,11 +280,13 @@ pub fn build_system_prompt_with_session_runtime(
         identity,
         user,
         soul_text,
+        boot_text,
         agents_text,
         tools_text,
         runtime_context,
         true, // include_tools
         memory_text,
+        limits,
     )
 }
 
@@ -214,11 +296,40 @@ pub fn build_system_prompt_minimal_runtime(
     identity: Option<&AgentIdentity>,
     user: Option<&UserProfile>,
     soul_text: Option<&str>,
+    boot_text: Option<&str>,
     agents_text: Option<&str>,
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     memory_text: Option<&str>,
 ) -> String {
+    build_system_prompt_minimal_runtime_details(
+        project_context,
+        identity,
+        user,
+        soul_text,
+        boot_text,
+        agents_text,
+        tools_text,
+        runtime_context,
+        memory_text,
+        PromptBuildLimits::default(),
+    )
+    .prompt
+}
+
+/// Build a minimal system prompt with explicit runtime context and metadata.
+pub fn build_system_prompt_minimal_runtime_details(
+    project_context: Option<&str>,
+    identity: Option<&AgentIdentity>,
+    user: Option<&UserProfile>,
+    soul_text: Option<&str>,
+    boot_text: Option<&str>,
+    agents_text: Option<&str>,
+    tools_text: Option<&str>,
+    runtime_context: Option<&PromptRuntimeContext>,
+    memory_text: Option<&str>,
+    limits: PromptBuildLimits,
+) -> PromptBuildOutput {
     build_system_prompt_full(
         &ToolRegistry::new(),
         true,
@@ -227,11 +338,13 @@ pub fn build_system_prompt_minimal_runtime(
         identity,
         user,
         soul_text,
+        boot_text,
         agents_text,
         tools_text,
         runtime_context,
         false, // include_tools
         memory_text,
+        limits,
     )
 }
 
@@ -268,12 +381,14 @@ const MEMORY_BOOTSTRAP_MAX_CHARS: usize = 8_000;
 const PROJECT_CONTEXT_MAX_CHARS: usize = 8_000;
 /// Maximum number of characters from each workspace file (`AGENTS.md`,
 /// `TOOLS.md`) injected into the prompt.
-const WORKSPACE_FILE_MAX_CHARS: usize = 6_000;
+pub const DEFAULT_WORKSPACE_FILE_MAX_CHARS: usize = 32_000;
 const EXEC_ROUTING_GUIDANCE_SANDBOX: &str = "Execution routing:\n\
 - `exec` runs inside sandbox when `Sandbox(exec): enabled=true`.\n\
 - When sandbox is disabled, `exec` runs on the host and may require approval.\n\
 - In sandbox mode, `~` and relative paths resolve under `Sandbox(exec): home=...` (usually `/home/sandbox`).\n\
-- Persistent workspace files live under `Host: data_dir=...`; when mounted, the same path appears as `Sandbox(exec): workspace_path=...`.\n";
+- Persistent workspace files live under `Host: data_dir=...`; when mounted, the same path appears as `Sandbox(exec): workspace_path=...`.\n\
+- With `workspace_mount=ro`, sandbox commands may read mounted files but cannot modify them.\n\
+- For durable long-term memory writes, prefer `memory_save` over shell writes to `MEMORY.md` or `memory/*.md`.\n";
 const EXEC_ROUTING_SANDBOX_CLOSING: &str = "- Sandbox/host routing changes are expected runtime behavior. Do not frame them as surprising or anomalous.\n";
 const EXEC_ROUTING_GUIDANCE_HOST_ONLY: &str = "Execution routing:\n\
 - `exec` runs on the host and may require approval.\n";
@@ -383,12 +498,14 @@ fn build_system_prompt_full(
     identity: Option<&AgentIdentity>,
     user: Option<&UserProfile>,
     soul_text: Option<&str>,
+    boot_text: Option<&str>,
     agents_text: Option<&str>,
     tools_text: Option<&str>,
     runtime_context: Option<&PromptRuntimeContext>,
     include_tools: bool,
     memory_text: Option<&str>,
-) -> String {
+    limits: PromptBuildLimits,
+) -> PromptBuildOutput {
     let tool_schemas = if include_tools {
         tools.list_schemas()
     } else {
@@ -401,17 +518,22 @@ fn build_system_prompt_full(
     });
 
     append_identity_and_user_sections(&mut prompt, identity, user, soul_text);
+    append_boot_section(&mut prompt, boot_text);
     append_project_context(&mut prompt, project_context);
     append_runtime_section(&mut prompt, runtime_context, include_tools);
     append_skills_section(&mut prompt, include_tools, skills);
-    append_workspace_files_section(&mut prompt, agents_text, tools_text);
+    let workspace_files =
+        append_workspace_files_section(&mut prompt, agents_text, tools_text, limits);
     append_memory_section(&mut prompt, memory_text, &tool_schemas);
     let model_id = runtime_context.and_then(|ctx| ctx.host.model.as_deref());
     append_available_tools_section(&mut prompt, native_tools, &tool_schemas);
     append_tool_call_guidance(&mut prompt, native_tools, &tool_schemas, model_id);
     append_guidelines_section(&mut prompt, include_tools);
 
-    prompt
+    PromptBuildOutput {
+        prompt,
+        metadata: PromptBuildMetadata { workspace_files },
+    }
 }
 
 fn append_identity_and_user_sections(
@@ -447,10 +569,26 @@ fn append_identity_and_user_sections(
     }
 }
 
+fn append_boot_section(prompt: &mut String, boot_text: Option<&str>) {
+    let Some(text) = boot_text else {
+        return;
+    };
+    prompt.push_str("## Startup Context (BOOT.md)\n\n");
+    append_truncated_text_block(
+        prompt,
+        "BOOT.md",
+        text,
+        DEFAULT_WORKSPACE_FILE_MAX_CHARS,
+        "\n*(BOOT.md truncated for prompt size.)*\n",
+    );
+    prompt.push_str("\n\n");
+}
+
 fn append_project_context(prompt: &mut String, project_context: Option<&str>) {
     if let Some(context) = project_context {
-        append_truncated_text_block(
+        let _ = append_truncated_text_block(
             prompt,
+            "project_context",
             context,
             PROJECT_CONTEXT_MAX_CHARS,
             "\n*(Project context truncated for prompt size; use tools/files for full details.)*\n",
@@ -571,32 +709,38 @@ fn append_workspace_files_section(
     prompt: &mut String,
     agents_text: Option<&str>,
     tools_text: Option<&str>,
-) {
+    limits: PromptBuildLimits,
+) -> Vec<WorkspaceFilePromptStatus> {
     if agents_text.is_none() && tools_text.is_none() {
-        return;
+        return Vec::new();
     }
 
+    let mut statuses = Vec::new();
     prompt.push_str("## Workspace Files\n\n");
-    if let Some(agents_md) = agents_text {
-        prompt.push_str("### AGENTS.md (workspace)\n\n");
-        append_truncated_text_block(
-            prompt,
-            agents_md,
-            WORKSPACE_FILE_MAX_CHARS,
-            "\n*(AGENTS.md truncated for prompt size.)*\n",
-        );
-        prompt.push_str("\n\n");
+    for (label, text) in [("AGENTS.md", agents_text), ("TOOLS.md", tools_text)] {
+        if let Some(md) = text {
+            prompt.push_str(&format!("### {label} (workspace)\n\n"));
+            let status = append_truncated_text_block(
+                prompt,
+                label,
+                md,
+                limits.workspace_file_max_chars,
+                &format!("\n*({label} truncated for prompt size.)*\n"),
+            );
+            if status.truncated {
+                tracing::warn!(
+                    file = label,
+                    original_chars = status.original_chars,
+                    limit = status.limit_chars,
+                    "workspace file truncated for prompt size"
+                );
+            }
+            statuses.push(status);
+            prompt.push_str("\n\n");
+        }
     }
-    if let Some(tools_md) = tools_text {
-        prompt.push_str("### TOOLS.md (workspace)\n\n");
-        append_truncated_text_block(
-            prompt,
-            tools_md,
-            WORKSPACE_FILE_MAX_CHARS,
-            "\n*(TOOLS.md truncated for prompt size.)*\n",
-        );
-        prompt.push_str("\n\n");
-    }
+
+    statuses
 }
 
 fn append_memory_section(
@@ -614,8 +758,9 @@ fn append_memory_section(
 
     prompt.push_str("## Long-Term Memory\n\n");
     if let Some(text) = memory_content {
-        append_truncated_text_block(
+        let _ = append_truncated_text_block(
             prompt,
+            "MEMORY.md",
             text,
             MEMORY_BOOTSTRAP_MAX_CHARS,
             "\n\n*(MEMORY.md truncated — use `memory_search` for full content)*\n",
@@ -764,28 +909,66 @@ fn format_host_runtime_line(host: &PromptHostRuntimeContext) -> Option<String> {
 }
 
 fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
+    truncate_prompt_text_details(text, max_chars).text
+}
+
+struct TruncatedPromptText {
+    text: String,
+    original_chars: usize,
+    included_chars: usize,
+    truncated: bool,
+}
+
+fn truncate_prompt_text_details(text: &str, max_chars: usize) -> TruncatedPromptText {
+    let original_chars = text.chars().count();
     if text.is_empty() || max_chars == 0 {
-        return String::new();
+        return TruncatedPromptText {
+            text: String::new(),
+            original_chars,
+            included_chars: 0,
+            truncated: original_chars > 0,
+        };
     }
     let mut iter = text.chars();
     let taken: String = iter.by_ref().take(max_chars).collect();
-    if iter.next().is_some() {
+    let included_chars = taken.chars().count();
+    let truncated = iter.next().is_some();
+    let text = if truncated {
         format!("{taken}...")
     } else {
         taken
+    };
+
+    TruncatedPromptText {
+        text,
+        original_chars,
+        included_chars,
+        truncated,
     }
 }
 
 fn append_truncated_text_block(
     prompt: &mut String,
+    name: &str,
     text: &str,
     max_chars: usize,
     truncated_notice: &str,
-) {
-    let truncated = truncate_prompt_text(text, max_chars);
-    prompt.push_str(&truncated);
-    if text.chars().count() > max_chars {
+) -> WorkspaceFilePromptStatus {
+    let truncated = truncate_prompt_text_details(text, max_chars);
+    prompt.push_str(&truncated.text);
+    if truncated.truncated {
         prompt.push_str(truncated_notice);
+    }
+
+    WorkspaceFilePromptStatus {
+        name: name.to_string(),
+        original_chars: truncated.original_chars,
+        included_chars: truncated.included_chars,
+        limit_chars: max_chars,
+        truncated_chars: truncated
+            .original_chars
+            .saturating_sub(truncated.included_chars),
+        truncated: truncated.truncated,
     }
 }
 
@@ -898,10 +1081,21 @@ mod tests {
             ..Default::default()
         }];
         let prompt = build_system_prompt_with_session_runtime(
-            &tools, true, None, &skills, None, None, None, None, None, None, None,
+            &tools, true, None, &skills, None, None, None, None, None, None, None, None,
         );
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("commit"));
+        // The activation instruction must name the read_skill tool so the
+        // model doesn't try to use an external filesystem MCP server.
+        assert!(
+            prompt.contains("read_skill"),
+            "skills prompt must mention the read_skill tool: {prompt}"
+        );
+        // It must not leak the absolute path of the skill on disk.
+        assert!(
+            !prompt.contains("/skills/commit"),
+            "skills prompt must not include absolute skill paths: {prompt}"
+        );
     }
 
     #[test]
@@ -912,6 +1106,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -948,6 +1143,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(prompt.contains("Your name is Momo 🦜."));
         assert!(prompt.contains("Your theme: cheerful parrot."));
@@ -976,6 +1172,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(prompt.contains("## Soul"));
         assert!(prompt.contains("loyal companion who loves fetch"));
@@ -990,6 +1187,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1014,6 +1212,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some("Follow workspace agent instructions."),
             Some("Prefer read-only tools first."),
             None,
@@ -1024,6 +1223,43 @@ mod tests {
         assert!(prompt.contains("Follow workspace agent instructions."));
         assert!(prompt.contains("### TOOLS.md (workspace)"));
         assert!(prompt.contains("Prefer read-only tools first."));
+    }
+
+    #[test]
+    fn test_workspace_file_metadata_marks_truncation() {
+        let tools = ToolRegistry::new();
+        let output = build_system_prompt_with_session_runtime_details(
+            &tools,
+            true,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some("abcdefghijklmnopqrstuvwxyz"),
+            None,
+            None,
+            None,
+            PromptBuildLimits {
+                workspace_file_max_chars: 10,
+            },
+        );
+
+        assert!(output.metadata.truncated());
+        assert_eq!(output.metadata.workspace_files.len(), 1);
+        let status = &output.metadata.workspace_files[0];
+        assert_eq!(status.name, "AGENTS.md");
+        assert_eq!(status.original_chars, 26);
+        assert_eq!(status.included_chars, 10);
+        assert_eq!(status.limit_chars, 10);
+        assert_eq!(status.truncated_chars, 16);
+        assert!(status.truncated);
+        assert!(
+            output
+                .prompt
+                .contains("AGENTS.md truncated for prompt size")
+        );
     }
 
     #[test]
@@ -1046,6 +1282,7 @@ mod tests {
                 channel_account_id: None,
                 channel_chat_id: None,
                 channel_chat_type: None,
+                channel_sender_id: None,
                 data_dir: Some("/home/moltis/.moltis".into()),
                 sudo_non_interactive: Some(true),
                 sudo_status: Some("passwordless".into()),
@@ -1074,6 +1311,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1139,6 +1377,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&runtime),
             None,
         );
@@ -1169,6 +1408,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1215,6 +1455,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&runtime),
             None,
         );
@@ -1242,6 +1483,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1282,6 +1524,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&runtime),
             None,
         );
@@ -1317,6 +1560,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&runtime),
             None,
         );
@@ -1336,6 +1580,7 @@ mod tests {
         };
 
         let prompt = build_system_prompt_minimal_runtime(
+            None,
             None,
             None,
             None,
@@ -1367,8 +1612,9 @@ mod tests {
 
     #[test]
     fn test_silent_replies_not_in_minimal_prompt() {
-        let prompt =
-            build_system_prompt_minimal_runtime(None, None, None, None, None, None, None, None);
+        let prompt = build_system_prompt_minimal_runtime(
+            None, None, None, None, None, None, None, None, None,
+        );
         assert!(!prompt.contains("## Silent Replies"));
     }
 
@@ -1387,6 +1633,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(memory),
         );
         assert!(prompt.contains("## Long-Term Memory"));
@@ -1395,6 +1642,29 @@ mod tests {
         // Memory content should include the "already know" hint so models
         // don't ignore it when tool searches return empty.
         assert!(prompt.contains("information above is what you already know"));
+    }
+
+    #[test]
+    fn test_boot_text_injected_into_prompt() {
+        let tools = ToolRegistry::new();
+        let boot = "Run health check on startup.\n- Verify API key configured";
+        let prompt = build_system_prompt_with_session_runtime(
+            &tools,
+            true,
+            None,
+            &[],
+            None,
+            None,
+            None,
+            Some(boot),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(prompt.contains("## Startup Context (BOOT.md)"));
+        assert!(prompt.contains("Run health check on startup."));
+        assert!(prompt.contains("Verify API key configured"));
     }
 
     #[test]
@@ -1407,6 +1677,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1436,6 +1707,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!prompt.contains("## Long-Term Memory"));
     }
@@ -1444,6 +1716,7 @@ mod tests {
     fn test_memory_text_in_minimal_prompt() {
         let memory = "## Notes\n- Important fact";
         let prompt = build_system_prompt_minimal_runtime(
+            None,
             None,
             None,
             None,
@@ -1502,6 +1775,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(prompt.contains("## Long-Term Memory"));
         assert!(prompt.contains("MUST call `memory_save`"));
@@ -1522,6 +1796,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!prompt.contains("memory_save"));
     }
@@ -1535,6 +1810,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,
@@ -1567,6 +1843,7 @@ mod tests {
             true,
             None,
             &[],
+            None,
             None,
             None,
             None,

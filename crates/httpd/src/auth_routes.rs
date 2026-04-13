@@ -19,6 +19,7 @@ use moltis_gateway::{
 
 use crate::{
     auth_middleware::{AuthResult, AuthSession, SESSION_COOKIE, check_auth},
+    login_guard::LoginGuard,
     server::is_local_connection,
 };
 
@@ -28,6 +29,7 @@ pub struct AuthState {
     pub credential_store: Arc<CredentialStore>,
     pub webauthn_registry: Option<SharedWebAuthnRegistry>,
     pub gateway_state: Arc<GatewayState>,
+    pub login_guard: LoginGuard,
 }
 
 impl axum::extract::FromRef<AuthState> for Arc<CredentialStore> {
@@ -95,6 +97,37 @@ fn vault_routes() -> axum::Router<AuthState> {
 #[cfg(not(feature = "vault"))]
 fn vault_routes() -> axum::Router<AuthState> {
     axum::Router::new()
+}
+
+// ── Brute-force block response ────────────────────────────────────────────────
+
+fn blocked_response(reason: crate::login_guard::BlockReason) -> axum::response::Response {
+    use crate::login_guard::BlockReason;
+    let (message, retry_after) = match reason {
+        BlockReason::IpBanned { retry_after } => (
+            "too many failed attempts from this address — try again later",
+            retry_after,
+        ),
+        BlockReason::AccountLocked { retry_after } => (
+            "account temporarily locked due to suspicious activity — try again later",
+            retry_after,
+        ),
+    };
+    let retry_secs = retry_after.as_secs().max(1);
+    let mut resp = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "code": "LOGIN_BLOCKED",
+            "error": message,
+            "retry_after_seconds": retry_secs,
+        })),
+    )
+        .into_response();
+    if let Ok(val) = retry_secs.to_string().parse() {
+        resp.headers_mut()
+            .insert(axum::http::header::RETRY_AFTER, val);
+    }
+    resp
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
@@ -173,13 +206,35 @@ async fn setup_handler(
         return (StatusCode::FORBIDDEN, "setup already completed").into_response();
     }
 
+    let client_ip = crate::request_throttle::resolve_client_ip(
+        &headers,
+        addr,
+        state.gateway_state.behind_proxy,
+    );
+    const SETUP_ACCOUNT: &str = "__setup__";
+
+    if let Some(block) = state.login_guard.check(client_ip, SETUP_ACCOUNT) {
+        return blocked_response(block);
+    }
+
     // Validate setup code if one was generated at startup.
     {
         let inner = state.gateway_state.inner.read().await;
-        if let Some(ref expected) = inner.setup_code
-            && body.setup_code.as_deref() != Some(expected.expose_secret().as_str())
-        {
-            return (StatusCode::FORBIDDEN, "invalid or missing setup code").into_response();
+        if let Some(ref expected) = inner.setup_code {
+            // Expire setup code after 30 minutes.
+            if let Some(created_at) = inner.setup_code_created_at
+                && created_at.elapsed() > std::time::Duration::from_secs(30 * 60)
+            {
+                return (
+                    StatusCode::GONE,
+                    "setup code has expired — restart the server to generate a new one",
+                )
+                    .into_response();
+            }
+            if body.setup_code.as_deref() != Some(expected.expose_secret().as_str()) {
+                state.login_guard.record_failure(client_ip, SETUP_ACCOUNT);
+                return (StatusCode::FORBIDDEN, "invalid or missing setup code").into_response();
+            }
         }
     }
 
@@ -196,10 +251,10 @@ async fn setup_handler(
                 .into_response();
         }
     } else {
-        if password.len() < 8 {
+        if password.len() < 12 {
             return (
                 StatusCode::BAD_REQUEST,
-                "password must be at least 8 characters",
+                "password must be at least 12 characters",
             )
                 .into_response();
         }
@@ -220,6 +275,7 @@ async fn setup_handler(
                 Ok(rk) => {
                     tracing::info!("vault initialized");
                     run_vault_env_migration(&state).await;
+                    start_stored_channels_on_vault_unseal(&state).await;
                     Some(rk.phrase().to_owned())
                 },
                 Err(moltis_vault::VaultError::AlreadyInitialized) => {
@@ -285,11 +341,29 @@ struct LoginRequest {
 
 async fn login_handler(
     State(state): State<AuthState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
+    let client_ip = crate::request_throttle::resolve_client_ip(
+        &headers,
+        addr,
+        state.gateway_state.behind_proxy,
+    );
+    const PASSWORD_ACCOUNT: &str = "__password__";
+
+    if let Some(block) = state.login_guard.check(client_ip, PASSWORD_ACCOUNT) {
+        return blocked_response(block);
+    }
+
+    let ip_str = client_ip.to_string();
     match state.credential_store.verify_password(&body.password).await {
         Ok(true) => {
+            state.login_guard.record_success(client_ip);
+            state
+                .credential_store
+                .audit_log("login_success", Some(&ip_str), None)
+                .await;
             // Best-effort vault unseal on successful login.
             #[cfg(feature = "vault")]
             if let Some(ref vault) = state.gateway_state.vault {
@@ -297,6 +371,7 @@ async fn login_handler(
                     Ok(()) => {
                         tracing::info!("vault unsealed on login");
                         run_vault_env_migration(&state).await;
+                        start_stored_channels_on_vault_unseal(&state).await;
                     },
                     Err(e) => {
                         tracing::debug!(error = %e, "vault unseal on login skipped");
@@ -315,7 +390,16 @@ async fn login_handler(
                     .into_response(),
             }
         },
-        Ok(false) => (StatusCode::UNAUTHORIZED, "invalid password").into_response(),
+        Ok(false) => {
+            state
+                .login_guard
+                .record_failure(client_ip, PASSWORD_ACCOUNT);
+            state
+                .credential_store
+                .audit_log("login_failure", Some(&ip_str), None)
+                .await;
+            (StatusCode::UNAUTHORIZED, "invalid password").into_response()
+        },
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("auth error: {e}"),
@@ -353,7 +437,11 @@ async fn reset_auth_handler(
                 .await;
             let code = moltis_gateway::auth::generate_setup_code();
             tracing::info!("setup code: {code} (enter this in the browser to set your password)");
-            state.gateway_state.inner.write().await.setup_code = Some(secrecy::Secret::new(code));
+            {
+                let mut inner = state.gateway_state.inner.write().await;
+                inner.setup_code = Some(secrecy::Secret::new(code));
+                inner.setup_code_created_at = Some(std::time::Instant::now());
+            }
             let bp = state.gateway_state.behind_proxy;
             clear_session_response(&headers, bp, state.gateway_state.tls_active || bp)
         },
@@ -372,12 +460,14 @@ struct ChangePasswordRequest {
 async fn change_password_handler(
     _session: AuthSession,
     State(state): State<AuthState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<ChangePasswordRequest>,
 ) -> impl IntoResponse {
-    if body.new_password.len() < 8 {
+    if body.new_password.len() < 12 {
         return (
             StatusCode::BAD_REQUEST,
-            "new password must be at least 8 characters",
+            "new password must be at least 12 characters",
         )
             .into_response();
     }
@@ -399,6 +489,7 @@ async fn change_password_handler(
                         Ok(rk) => {
                             tracing::info!("vault initialized on first password set");
                             run_vault_env_migration(&state).await;
+                            start_stored_channels_on_vault_unseal(&state).await;
                             Some(rk.phrase().to_owned())
                         },
                         Err(moltis_vault::VaultError::AlreadyInitialized) => {
@@ -429,6 +520,17 @@ async fn change_password_handler(
         };
     }
 
+    let client_ip = crate::request_throttle::resolve_client_ip(
+        &headers,
+        addr,
+        state.gateway_state.behind_proxy,
+    );
+    const PASSWORD_CHANGE_ACCOUNT: &str = "__password_change__";
+
+    if let Some(block) = state.login_guard.check(client_ip, PASSWORD_CHANGE_ACCOUNT) {
+        return blocked_response(block);
+    }
+
     let current_password = body.current_password.unwrap_or_default();
     match state
         .credential_store
@@ -436,6 +538,7 @@ async fn change_password_handler(
         .await
     {
         Ok(()) => {
+            state.login_guard.record_success(client_ip);
             // Best-effort vault password rotation.
             #[cfg(feature = "vault")]
             if let Some(ref vault) = state.gateway_state.vault {
@@ -456,6 +559,9 @@ async fn change_password_handler(
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("incorrect") {
+                state
+                    .login_guard
+                    .record_failure(client_ip, PASSWORD_CHANGE_ACCOUNT);
                 (StatusCode::FORBIDDEN, msg).into_response()
             } else {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response()
@@ -507,7 +613,17 @@ async fn create_api_key_handler(
         .create_api_key(body.label.trim(), body.scopes.as_deref())
         .await
     {
-        Ok((id, key)) => Json(serde_json::json!({ "id": id, "key": key })).into_response(),
+        Ok((id, key)) => {
+            state
+                .credential_store
+                .audit_log(
+                    "key_created",
+                    None,
+                    Some(&format!("id={id}, label={}", body.label.trim())),
+                )
+                .await;
+            Json(serde_json::json!({ "id": id, "key": key })).into_response()
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -518,7 +634,13 @@ async fn revoke_api_key_handler(
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
     match state.credential_store.revoke_api_key(id).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(()) => {
+            state
+                .credential_store
+                .audit_log("key_revoked", None, Some(&format!("id={id}")))
+                .await;
+            Json(serde_json::json!({ "ok": true })).into_response()
+        },
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -802,10 +924,22 @@ struct PasskeyAuthFinishRequest {
 
 async fn passkey_auth_finish_handler(
     State(state): State<AuthState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Host(host): Host,
     headers: axum::http::HeaderMap,
     Json(body): Json<PasskeyAuthFinishRequest>,
 ) -> impl IntoResponse {
+    let client_ip = crate::request_throttle::resolve_client_ip(
+        &headers,
+        addr,
+        state.gateway_state.behind_proxy,
+    );
+    const PASSKEY_ACCOUNT: &str = "__passkey__";
+
+    if let Some(block) = state.login_guard.check(client_ip, PASSKEY_ACCOUNT) {
+        return blocked_response(block);
+    }
+
     let Some(ref registry) = state.webauthn_registry else {
         return (StatusCode::NOT_IMPLEMENTED, "passkeys not configured").into_response();
     };
@@ -818,14 +952,20 @@ async fn passkey_auth_finish_handler(
     };
 
     match wa.finish_authentication(&body.challenge_id, &body.credential) {
-        Ok(_result) => match state.credential_store.create_session().await {
-            Ok(token) => {
-                let bp = state.gateway_state.behind_proxy;
-                session_response(token, &headers, bp, state.gateway_state.tls_active || bp)
-            },
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(_result) => {
+            state.login_guard.record_success(client_ip);
+            match state.credential_store.create_session().await {
+                Ok(token) => {
+                    let bp = state.gateway_state.behind_proxy;
+                    session_response(token, &headers, bp, state.gateway_state.tls_active || bp)
+                },
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
         },
-        Err(e) => (StatusCode::UNAUTHORIZED, e.to_string()).into_response(),
+        Err(e) => {
+            state.login_guard.record_failure(client_ip, PASSKEY_ACCOUNT);
+            (StatusCode::UNAUTHORIZED, e.to_string()).into_response()
+        },
     }
 }
 
@@ -1024,6 +1164,7 @@ async fn vault_unlock_handler(
     match vault.unseal(&body.password).await {
         Ok(()) => {
             run_vault_env_migration(&state).await;
+            start_stored_channels_on_vault_unseal(&state).await;
             Json(serde_json::json!({ "ok": true })).into_response()
         },
         Err(moltis_vault::VaultError::BadCredential) => {
@@ -1050,6 +1191,7 @@ async fn vault_recovery_handler(
     match vault.unseal_with_recovery(&body.recovery_key).await {
         Ok(()) => {
             run_vault_env_migration(&state).await;
+            start_stored_channels_on_vault_unseal(&state).await;
             Json(serde_json::json!({ "ok": true })).into_response()
         },
         Err(moltis_vault::VaultError::BadCredential) => {
@@ -1059,7 +1201,7 @@ async fn vault_recovery_handler(
     }
 }
 
-/// Migrate unencrypted env vars to encrypted after vault unseal.
+/// Migrate plaintext secrets to encrypted storage after vault unseal.
 #[cfg(feature = "vault")]
 async fn run_vault_env_migration(state: &AuthState) {
     if let Some(vault) = state.credential_store.vault() {
@@ -1072,6 +1214,82 @@ async fn run_vault_env_migration(state: &AuthState) {
             Err(e) => {
                 tracing::warn!(error = %e, "env var migration failed");
             },
+        }
+        match moltis_vault::migration::migrate_ssh_keys(vault, pool).await {
+            Ok(n) if n > 0 => {
+                tracing::info!(count = n, "migrated ssh keys to encrypted");
+            },
+            Ok(_) => {},
+            Err(e) => {
+                tracing::warn!(error = %e, "ssh key migration failed");
+            },
+        }
+    }
+}
+
+/// Start stored channel accounts after vault unseal.
+///
+/// When the vault is unsealed, previously encrypted channel configs become
+/// decryptable. This function reads all stored channels and starts any that
+/// aren't already running in the channel registry. This is the counterpart to
+/// the startup-time channel loading in `server.rs` — it handles the case where
+/// the vault was sealed at startup and channels couldn't be started then.
+#[cfg(feature = "vault")]
+#[tracing::instrument(skip(state))]
+async fn start_stored_channels_on_vault_unseal(state: &AuthState) {
+    let Some(registry) = state.gateway_state.services.channel_registry.as_ref() else {
+        tracing::debug!("no channel registry available, skipping channel startup on vault unseal");
+        return;
+    };
+    let Some(store) = state.gateway_state.services.channel_store.as_ref() else {
+        tracing::debug!("no channel store available, skipping channel startup on vault unseal");
+        return;
+    };
+
+    let stored = match store.list().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to list stored channels on vault unseal");
+            return;
+        },
+    };
+
+    if stored.is_empty() {
+        return;
+    }
+
+    for ch in stored {
+        // Skip channel types with no registered plugin.
+        if registry.get(&ch.channel_type).is_none() {
+            tracing::debug!(
+                account_id = ch.account_id,
+                channel_type = ch.channel_type,
+                "unsupported channel type on vault unseal, skipping stored account"
+            );
+            continue;
+        }
+
+        // Skip accounts that are already running.
+        if registry.resolve_channel_type(&ch.account_id).is_some() {
+            continue;
+        }
+
+        tracing::info!(
+            account_id = ch.account_id,
+            channel_type = ch.channel_type,
+            "starting stored channel on vault unseal"
+        );
+
+        if let Err(e) = registry
+            .start_account(&ch.channel_type, &ch.account_id, ch.config)
+            .await
+        {
+            tracing::warn!(
+                account_id = ch.account_id,
+                channel_type = ch.channel_type,
+                error = %e,
+                "failed to start stored channel on vault unseal"
+            );
         }
     }
 }
@@ -1257,5 +1475,527 @@ mod tests {
             cookie.contains("; Secure"),
             "cookie should include Secure in proxy mode (proxy implies TLS), got: {cookie}"
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "vault")]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod vault_unseal_tests {
+    use {
+        super::*,
+        async_trait::async_trait,
+        moltis_channels::{
+            ChannelRegistry,
+            config_view::ChannelConfigView,
+            plugin::{ChannelOutbound, ChannelPlugin, ChannelStreamOutbound, StreamEvent},
+            store::{ChannelStore, StoredChannel},
+        },
+    };
+
+    use {
+        moltis_channels::plugin::ChannelStatus, moltis_common::types::ReplyPayload,
+        std::sync::Mutex, tokio::sync::RwLock,
+    };
+
+    /// Helper to build a minimal AuthState with the given services.
+    async fn build_auth_state(services: moltis_gateway::services::GatewayServices) -> AuthState {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let auth_config = moltis_config::AuthConfig::default();
+        let cred_store = Arc::new(
+            CredentialStore::with_config(pool, &auth_config)
+                .await
+                .unwrap(),
+        );
+        let gateway_state =
+            GatewayState::new(moltis_gateway::auth::resolve_auth(None, None), services);
+        AuthState {
+            credential_store: cred_store,
+            webauthn_registry: None,
+            gateway_state,
+            login_guard: LoginGuard::new(),
+        }
+    }
+
+    // ── Mock implementations ─────────────────────────────────────────────
+
+    struct MockChannelStore {
+        channels: Vec<StoredChannel>,
+        should_fail: bool,
+    }
+
+    impl MockChannelStore {
+        fn new(channels: Vec<StoredChannel>) -> Self {
+            Self {
+                channels,
+                should_fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                channels: vec![],
+                should_fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChannelStore for MockChannelStore {
+        async fn list(&self) -> moltis_channels::Result<Vec<StoredChannel>> {
+            if self.should_fail {
+                return Err(moltis_channels::Error::unavailable("store error"));
+            }
+            Ok(self.channels.clone())
+        }
+
+        async fn get(
+            &self,
+            _channel_type: &str,
+            _account_id: &str,
+        ) -> moltis_channels::Result<Option<StoredChannel>> {
+            Ok(None)
+        }
+
+        async fn upsert(&self, _channel: StoredChannel) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+
+        async fn delete(
+            &self,
+            _channel_type: &str,
+            _account_id: &str,
+        ) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Null outbound that does nothing.
+    struct NullOutbound;
+
+    #[async_trait]
+    impl ChannelOutbound for NullOutbound {
+        async fn send_text(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+
+        async fn send_media(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ReplyPayload,
+            _: Option<&str>,
+        ) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Null stream outbound.
+    struct NullStreamOutbound;
+
+    #[async_trait]
+    impl ChannelStreamOutbound for NullStreamOutbound {
+        async fn send_stream(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            mut stream: moltis_channels::plugin::StreamReceiver,
+        ) -> moltis_channels::Result<()> {
+            while let Some(event) = stream.recv().await {
+                if matches!(event, StreamEvent::Done | StreamEvent::Error(_)) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Test plugin that records start_account calls.
+    struct RecordingPlugin {
+        id: String,
+        started_accounts: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+        should_fail_start: bool,
+    }
+
+    impl RecordingPlugin {
+        fn new(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                started_accounts: Arc::new(Mutex::new(Vec::new())),
+                should_fail_start: false,
+            }
+        }
+
+        fn failing(id: &str) -> Self {
+            Self {
+                id: id.to_string(),
+                started_accounts: Arc::new(Mutex::new(Vec::new())),
+                should_fail_start: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ChannelPlugin for RecordingPlugin {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+
+        async fn start_account(
+            &mut self,
+            account_id: &str,
+            config: serde_json::Value,
+        ) -> moltis_channels::Result<()> {
+            if self.should_fail_start {
+                return Err(moltis_channels::Error::unavailable("start failed"));
+            }
+            self.started_accounts
+                .lock()
+                .unwrap()
+                .push((account_id.to_string(), config));
+            Ok(())
+        }
+
+        async fn stop_account(&mut self, _account_id: &str) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+
+        fn outbound(&self) -> Option<&dyn ChannelOutbound> {
+            None
+        }
+
+        fn status(&self) -> Option<&dyn ChannelStatus> {
+            None
+        }
+
+        fn has_account(&self, _account_id: &str) -> bool {
+            false
+        }
+
+        fn account_ids(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn account_config(&self, _account_id: &str) -> Option<Box<dyn ChannelConfigView>> {
+            None
+        }
+
+        fn update_account_config(
+            &self,
+            _account_id: &str,
+            _config: serde_json::Value,
+        ) -> moltis_channels::Result<()> {
+            Ok(())
+        }
+
+        fn shared_outbound(&self) -> Arc<dyn ChannelOutbound> {
+            Arc::new(NullOutbound)
+        }
+
+        fn shared_stream_outbound(&self) -> Arc<dyn ChannelStreamOutbound> {
+            Arc::new(NullStreamOutbound)
+        }
+    }
+
+    // ── Tests ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn returns_early_when_channel_registry_is_none() {
+        let services = moltis_gateway::services::GatewayServices::noop();
+        let state = build_auth_state(services).await;
+        // noop() has no channel_registry — should return without panicking
+        start_stored_channels_on_vault_unseal(&state).await;
+    }
+
+    #[tokio::test]
+    async fn returns_early_when_channel_store_is_none() {
+        let registry = Arc::new(ChannelRegistry::new());
+        let services =
+            moltis_gateway::services::GatewayServices::noop().with_channel_registry(registry);
+        // No channel_store set — should return without panicking
+        let state = build_auth_state(services).await;
+        start_stored_channels_on_vault_unseal(&state).await;
+    }
+
+    #[tokio::test]
+    async fn logs_warning_when_store_list_fails() {
+        let registry = Arc::new(ChannelRegistry::new());
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::failing());
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+        // Should log a warning but not panic
+        start_stored_channels_on_vault_unseal(&state).await;
+    }
+
+    #[tokio::test]
+    async fn returns_when_store_is_empty() {
+        let registry = Arc::new(ChannelRegistry::new());
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::new(vec![]));
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+        start_stored_channels_on_vault_unseal(&state).await;
+    }
+
+    #[tokio::test]
+    async fn skips_channels_with_unsupported_type() {
+        let registry = Arc::new(ChannelRegistry::new());
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::new(vec![StoredChannel {
+            account_id: "acct1".to_string(),
+            channel_type: "unknown_type".to_string(),
+            config: serde_json::json!({}),
+            created_at: 0,
+            updated_at: 0,
+        }]));
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+        // Should not panic — logs a warning about unsupported type
+        start_stored_channels_on_vault_unseal(&state).await;
+    }
+
+    #[tokio::test]
+    async fn skips_channels_already_running() {
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let plugin = RecordingPlugin::new("telegram");
+        let started_clone = Arc::clone(&started);
+        let plugin_with_tracking = RecordingPluginWithTracking {
+            inner: plugin,
+            started_accounts: started_clone,
+        };
+
+        let mut registry = ChannelRegistry::new();
+        registry
+            .register(Arc::new(RwLock::new(plugin_with_tracking)))
+            .await;
+
+        // Pre-start an account so it's already running
+        registry
+            .start_account("telegram", "acct1", serde_json::json!({"token": "x"}))
+            .await
+            .unwrap();
+
+        let registry = Arc::new(registry);
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::new(vec![StoredChannel {
+            account_id: "acct1".to_string(),
+            channel_type: "telegram".to_string(),
+            config: serde_json::json!({"token": "new"}),
+            created_at: 0,
+            updated_at: 0,
+        }]));
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+
+        start_stored_channels_on_vault_unseal(&state).await;
+
+        // The account was already running, so start_account should NOT have been
+        // called again (resolve_channel_type returned Some, so it was skipped).
+        // Only the pre-start call should be recorded.
+        let calls = started.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "should not re-start already running account"
+        );
+        assert_eq!(calls[0].0, "acct1");
+    }
+
+    #[tokio::test]
+    async fn starts_channels_successfully() {
+        let plugin = RecordingPlugin::new("telegram");
+        let started_accounts = Arc::clone(&plugin.started_accounts);
+
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(RwLock::new(plugin))).await;
+
+        let registry = Arc::new(registry);
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::new(vec![
+            StoredChannel {
+                account_id: "bot1".to_string(),
+                channel_type: "telegram".to_string(),
+                config: serde_json::json!({"token": "abc123"}),
+                created_at: 1000,
+                updated_at: 2000,
+            },
+            StoredChannel {
+                account_id: "bot2".to_string(),
+                channel_type: "telegram".to_string(),
+                config: serde_json::json!({"token": "def456"}),
+                created_at: 1001,
+                updated_at: 2001,
+            },
+        ]));
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+
+        start_stored_channels_on_vault_unseal(&state).await;
+
+        let calls = started_accounts.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "bot1");
+        assert_eq!(calls[1].0, "bot2");
+        assert_eq!(calls[0].1["token"], "abc123");
+        assert_eq!(calls[1].1["token"], "def456");
+    }
+
+    #[tokio::test]
+    async fn logs_warning_and_continues_when_start_account_fails() {
+        let plugin = RecordingPlugin::failing("telegram");
+        let started_accounts = Arc::clone(&plugin.started_accounts);
+
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(RwLock::new(plugin))).await;
+
+        let registry = Arc::new(registry);
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::new(vec![StoredChannel {
+            account_id: "bot1".to_string(),
+            channel_type: "telegram".to_string(),
+            config: serde_json::json!({"token": "bad"}),
+            created_at: 0,
+            updated_at: 0,
+        }]));
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+
+        // Should not panic — logs a warning about failed start
+        start_stored_channels_on_vault_unseal(&state).await;
+
+        // The plugin should have attempted the start (and recorded it before failing)
+        let calls = started_accounts.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            0,
+            "failing plugin should not record successful starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_channels_skips_unsupported_and_starts_supported() {
+        let plugin = RecordingPlugin::new("telegram");
+        let started_accounts = Arc::clone(&plugin.started_accounts);
+
+        let mut registry = ChannelRegistry::new();
+        registry.register(Arc::new(RwLock::new(plugin))).await;
+
+        let registry = Arc::new(registry);
+        let store: Arc<dyn ChannelStore> = Arc::new(MockChannelStore::new(vec![
+            StoredChannel {
+                account_id: "unsupported_acct".to_string(),
+                channel_type: "unsupported_type".to_string(),
+                config: serde_json::json!({}),
+                created_at: 0,
+                updated_at: 0,
+            },
+            StoredChannel {
+                account_id: "tg_bot".to_string(),
+                channel_type: "telegram".to_string(),
+                config: serde_json::json!({"token": "xyz"}),
+                created_at: 0,
+                updated_at: 0,
+            },
+        ]));
+        let services = moltis_gateway::services::GatewayServices::noop()
+            .with_channel_registry(registry)
+            .with_channel_store(store);
+        let state = build_auth_state(services).await;
+
+        start_stored_channels_on_vault_unseal(&state).await;
+
+        let calls = started_accounts.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "tg_bot");
+    }
+
+    // ── Helper wrapper for the "already running" test ───────────────────
+
+    /// Wrapper that tracks start_account calls through the registry path
+    /// (which calls the plugin directly).
+    struct RecordingPluginWithTracking {
+        inner: RecordingPlugin,
+        started_accounts: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    #[async_trait]
+    impl ChannelPlugin for RecordingPluginWithTracking {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        async fn start_account(
+            &mut self,
+            account_id: &str,
+            config: serde_json::Value,
+        ) -> moltis_channels::Result<()> {
+            self.started_accounts
+                .lock()
+                .unwrap()
+                .push((account_id.to_string(), config.clone()));
+            self.inner.start_account(account_id, config).await
+        }
+
+        async fn stop_account(&mut self, account_id: &str) -> moltis_channels::Result<()> {
+            self.inner.stop_account(account_id).await
+        }
+
+        fn outbound(&self) -> Option<&dyn ChannelOutbound> {
+            self.inner.outbound()
+        }
+
+        fn status(&self) -> Option<&dyn ChannelStatus> {
+            self.inner.status()
+        }
+
+        fn has_account(&self, account_id: &str) -> bool {
+            self.inner.has_account(account_id)
+        }
+
+        fn account_ids(&self) -> Vec<String> {
+            self.inner.account_ids()
+        }
+
+        fn account_config(&self, account_id: &str) -> Option<Box<dyn ChannelConfigView>> {
+            self.inner.account_config(account_id)
+        }
+
+        fn update_account_config(
+            &self,
+            account_id: &str,
+            config: serde_json::Value,
+        ) -> moltis_channels::Result<()> {
+            self.inner.update_account_config(account_id, config)
+        }
+
+        fn shared_outbound(&self) -> Arc<dyn ChannelOutbound> {
+            self.inner.shared_outbound()
+        }
+
+        fn shared_stream_outbound(&self) -> Arc<dyn ChannelStreamOutbound> {
+            self.inner.shared_stream_outbound()
+        }
     }
 }

@@ -810,6 +810,8 @@ fn build_local_provider_entry(
         provider: LOCAL_LLM_PROVIDER_NAME.into(),
         display_name: entry.display_name(),
         created_at: None,
+        recommended: false,
+        capabilities: moltis_providers::ModelCapabilities::infer(&entry.model_id),
     };
     Ok((info, provider))
 }
@@ -1721,8 +1723,6 @@ struct HfModelInfo {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, OnceLock};
-
     use super::*;
 
     fn sample_system_info() -> local_gguf::system_info::SystemInfo {
@@ -1737,11 +1737,6 @@ mod tests {
         }
     }
 
-    fn local_model_config_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
     struct LocalModelConfigTestGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
     }
@@ -1749,7 +1744,7 @@ mod tests {
     impl LocalModelConfigTestGuard {
         fn new() -> Self {
             Self {
-                _lock: local_model_config_test_lock(),
+                _lock: crate::config_override_test_lock(),
             }
         }
     }
@@ -2300,6 +2295,8 @@ mod tests {
                 provider: "openai".into(),
                 display_name: "Shared Remote Model".into(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             remote_provider,
         );
@@ -2374,6 +2371,8 @@ mod tests {
                 provider: "openai".into(),
                 display_name: "Remote Stale Alias".into(),
                 created_at: None,
+                recommended: false,
+                capabilities: moltis_providers::ModelCapabilities::default(),
             },
             remote_provider,
         );

@@ -42,7 +42,12 @@ const MAX_SANDBOX_RECOVERY_RETRIES: usize = 1;
 /// Broadcaster that notifies connected clients about pending approval requests.
 #[async_trait]
 pub trait ApprovalBroadcaster: Send + Sync {
-    async fn broadcast_request(&self, request_id: &str, command: &str) -> Result<()>;
+    async fn broadcast_request(
+        &self,
+        request_id: &str,
+        command: &str,
+        session_key: Option<&str>,
+    ) -> Result<()>;
 }
 
 /// Provider of environment variables to inject into sandbox execution.
@@ -74,6 +79,9 @@ pub trait NodeExecProvider: Send + Sync {
     /// Whether any nodes are currently connected.  This is called from the
     /// sync `parameters_schema()` path so it must not block.
     fn has_connected_nodes(&self) -> bool;
+
+    /// Return the current default remote target, if one exists.
+    async fn default_node_ref(&self) -> Option<String>;
 }
 
 /// Result of a shell command execution.
@@ -261,6 +269,18 @@ impl ExecTool {
         self
     }
 
+    /// Override the default command timeout.
+    pub fn with_default_timeout(mut self, timeout: Duration) -> Self {
+        self.default_timeout = timeout;
+        self
+    }
+
+    /// Override the maximum output bytes per command.
+    pub fn with_max_output_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_output_bytes = max_bytes;
+        self
+    }
+
     /// Route command execution to a remote node instead of local/sandbox.
     pub fn with_node_provider(
         mut self,
@@ -303,6 +323,7 @@ impl AgentTool for ExecTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        let timeout_default = self.default_timeout.as_secs();
         let mut properties = serde_json::json!({
             "command": {
                 "type": "string",
@@ -310,7 +331,7 @@ impl AgentTool for ExecTool {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Timeout in seconds (default 30, max 1800)"
+                "description": format!("Timeout in seconds (default {timeout_default}, max 1800)")
             },
             "working_dir": {
                 "type": "string",
@@ -371,7 +392,10 @@ impl AgentTool for ExecTool {
         //   the intended remote host is unavailable.
         let node_ref = if let Some(provider) = &self.node_provider {
             if provider.has_connected_nodes() {
-                model_node.or_else(|| self.default_node.clone())
+                match model_node.or_else(|| self.default_node.clone()) {
+                    Some(node_ref) => Some(node_ref),
+                    None => provider.default_node_ref().await,
+                }
             } else if let Some(ref dn) = self.default_node {
                 return Err(Error::message(format!(
                     "default node '{dn}' is configured but no nodes are currently connected"
@@ -519,11 +543,11 @@ impl AgentTool for ExecTool {
             let action = mgr.check_command(command).await?;
             if action == ApprovalAction::NeedsApproval {
                 info!(command, "command needs approval, waiting...");
-                let (req_id, rx) = mgr.create_request(command).await;
+                let (req_id, rx) = mgr.create_request(command, session_key).await;
 
                 // Broadcast to connected clients.
                 if let Some(ref bc) = self.broadcaster
-                    && let Err(e) = bc.broadcast_request(&req_id, command).await
+                    && let Err(e) = bc.broadcast_request(&req_id, command, session_key).await
                 {
                     warn!(error = %e, "failed to broadcast approval request");
                 }
@@ -812,12 +836,14 @@ mod tests {
 
     struct TestBroadcaster {
         called: AtomicBool,
+        session_key: std::sync::Mutex<Option<String>>,
     }
 
     impl TestBroadcaster {
         fn new() -> Self {
             Self {
                 called: AtomicBool::new(false),
+                session_key: std::sync::Mutex::new(None),
             }
         }
     }
@@ -832,8 +858,14 @@ mod tests {
 
     #[async_trait]
     impl ApprovalBroadcaster for TestBroadcaster {
-        async fn broadcast_request(&self, _request_id: &str, _command: &str) -> Result<()> {
+        async fn broadcast_request(
+            &self,
+            _request_id: &str,
+            _command: &str,
+            session_key: Option<&str>,
+        ) -> Result<()> {
             self.called.store(true, Ordering::SeqCst);
+            *self.session_key.lock().unwrap() = session_key.map(ToOwned::to_owned);
             Ok(())
         }
     }
@@ -940,10 +972,17 @@ mod tests {
         });
 
         let result = tool
-            .execute(serde_json::json!({ "command": "curl http://example.com" }))
+            .execute(serde_json::json!({
+                "command": "curl http://example.com",
+                "_session_key": "session:abc"
+            }))
             .await;
         handle.await.unwrap();
         assert!(bc.called.load(Ordering::SeqCst));
+        assert_eq!(
+            bc.session_key.lock().unwrap().as_deref(),
+            Some("session:abc")
+        );
         let _ = result;
     }
 
@@ -1530,6 +1569,10 @@ mod tests {
         fn has_connected_nodes(&self) -> bool {
             false
         }
+
+        async fn default_node_ref(&self) -> Option<String> {
+            None
+        }
     }
 
     #[tokio::test]
@@ -1632,6 +1675,80 @@ mod tests {
         assert!(
             msg.contains("no nodes are currently connected"),
             "error should explain no nodes are connected, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_with_default_timeout() {
+        let tool = ExecTool::default().with_default_timeout(Duration::from_secs(120));
+        assert_eq!(tool.default_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_with_max_output_bytes() {
+        let tool = ExecTool::default().with_max_output_bytes(1024 * 1024);
+        assert_eq!(tool.max_output_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_schema_timeout_reflects_configured_default() {
+        let tool = ExecTool::default().with_default_timeout(Duration::from_secs(300));
+        let schema = tool.parameters_schema();
+        let desc = schema["properties"]["timeout"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(
+            desc.contains("default 300"),
+            "schema should reflect configured timeout, got: {desc}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_custom_timeout_causes_timeout() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut tool = ExecTool::default().with_default_timeout(Duration::from_millis(200));
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+
+        // sleep 60 should be killed well before 60s by the 200ms timeout
+        let result = tool
+            .execute(serde_json::json!({ "command": "sleep 60" }))
+            .await;
+        match result {
+            Err(ref e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("timed out") || msg.contains("timeout"),
+                    "expected timeout error, got: {msg}"
+                );
+            },
+            Ok(ref val) => {
+                // Some platforms return an exit code instead of an error
+                let exit_code = val["exit_code"].as_i64().unwrap_or(0);
+                assert_ne!(
+                    exit_code, 0,
+                    "command should not succeed under short timeout"
+                );
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_max_output_bytes_truncates() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut tool = ExecTool::default().with_max_output_bytes(50);
+        tool.working_dir = Some(temp_dir.path().to_path_buf());
+
+        let result = tool
+            .execute(serde_json::json!({
+                "command": "python3 -c \"print('A' * 500)\" 2>/dev/null || printf '%0.sA' $(seq 1 500)"
+            }))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap_or("");
+        assert!(
+            stdout.contains("[truncated") || stdout.len() <= 100,
+            "output should be truncated with 50-byte limit, got {} bytes: {stdout}",
+            stdout.len()
         );
     }
 }
