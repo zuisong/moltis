@@ -1,4 +1,7 @@
-use {super::*, crate::methods::voice};
+use super::*;
+
+#[cfg(feature = "voice")]
+use crate::methods::voice;
 
 pub(super) fn register(reg: &mut MethodRegistry) {
     // Update

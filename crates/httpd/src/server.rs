@@ -60,6 +60,9 @@ mod runtime;
 
 use {handlers::*, runtime::*};
 
+pub(crate) use handlers::is_local_connection;
+pub use runtime::{prepare_httpd_embedded, start_gateway};
+
 #[cfg(feature = "tailscale")]
 use moltis_gateway::tailscale::{CliTailscaleManager, TailscaleManager, TailscaleMode};
 

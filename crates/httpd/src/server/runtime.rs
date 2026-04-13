@@ -884,9 +884,6 @@ pub async fn prepare_gateway_embedded(
 /// Alias for [`prepare_gateway_embedded`] used by swift-bridge consumers.
 pub use prepare_gateway_embedded as prepare_httpd_embedded;
 
-/// Re-export `openclaw_detected_for_ui` from gateway for web-UI templates.
-pub use moltis_gateway::server::openclaw_detected_for_ui;
-
 #[cfg(feature = "ngrok")]
 pub(super) fn ngrok_loopback_has_proxy_headers(headers: &axum::http::HeaderMap) -> bool {
     moltis_auth::locality::has_proxy_headers(headers)

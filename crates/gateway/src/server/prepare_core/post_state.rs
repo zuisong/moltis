@@ -5,9 +5,12 @@ use std::{
 
 use {
     async_trait::async_trait,
-    secrecy::{ExposeSecret, Secret},
+    secrecy::Secret,
     tracing::{debug, info, warn},
 };
+
+#[cfg(feature = "wasm")]
+use secrecy::ExposeSecret;
 
 use {
     moltis_providers::{PendingDiscoveries, ProviderRegistry},
@@ -31,13 +34,19 @@ use crate::{
 use crate::tailscale::{TailscaleMode, validate_tailscale_config};
 
 use crate::server::{
-    helpers::{
-        StartupMemProbe, env_flag_enabled, env_value_with_overrides, fs_tools_host_warning_message,
-        instance_slug, restore_saved_local_llm_models, start_skill_hot_reload_watcher,
-    },
+    helpers::{StartupMemProbe, env_flag_enabled, instance_slug, restore_saved_local_llm_models},
     prepared::PreparedGatewayCore,
     startup::deferred_openclaw_status,
 };
+
+#[cfg(feature = "wasm")]
+use crate::server::helpers::env_value_with_overrides;
+
+#[cfg(feature = "fs-tools")]
+use crate::server::helpers::fs_tools_host_warning_message;
+
+#[cfg(feature = "file-watcher")]
+use crate::server::helpers::start_skill_hot_reload_watcher;
 
 pub(super) struct PostStateInputs {
     pub bind: String,

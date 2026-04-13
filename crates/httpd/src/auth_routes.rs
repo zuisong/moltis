@@ -13,15 +13,20 @@ use {
     axum_extra::extract::Host,
 };
 
-use moltis_gateway::{
-    auth::CredentialStore, auth_webauthn::SharedWebAuthnRegistry, state::GatewayState,
+use {
+    moltis_auth::locality::is_local_connection,
+    moltis_gateway::{
+        auth::CredentialStore, auth_webauthn::SharedWebAuthnRegistry, state::GatewayState,
+    },
 };
 
 use crate::{
     auth_middleware::{AuthResult, AuthSession, SESSION_COOKIE, check_auth},
     login_guard::LoginGuard,
-    server::is_local_connection,
 };
+
+#[cfg(feature = "vault")]
+use crate::auth_routes::vault::{run_vault_env_migration, start_stored_channels_on_vault_unseal};
 
 /// Auth-related application state.
 #[derive(Clone)]

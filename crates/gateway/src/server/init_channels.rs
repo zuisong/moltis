@@ -29,6 +29,9 @@ pub(crate) async fn init_channels(
     deferred_state: Arc<tokio::sync::OnceCell<Arc<crate::state::GatewayState>>>,
     data_dir: &std::path::Path,
 ) -> ChannelInitResult {
+    #[cfg(not(feature = "whatsapp"))]
+    let _ = data_dir;
+
     use moltis_channels::{
         registry::{ChannelRegistry, RegistryOutboundRouter},
         store::ChannelStore,
