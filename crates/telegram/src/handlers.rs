@@ -1914,13 +1914,13 @@ fn is_supported_document_type(media_type: &str) -> bool {
         || is_pdf_document_type(media_type)
 }
 
-fn truncate_inline_document_text(text: &str) -> Option<String> {
+fn truncate_inline_document_text(text: &str, was_truncated: bool) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
     }
 
-    let mut truncated = false;
+    let mut truncated = was_truncated;
 
     // Char-limit: find the byte offset of the Nth char boundary in one pass.
     let mut text =
@@ -1958,7 +1958,7 @@ fn extract_text_document_content(data: &[u8], media_type: &str) -> Option<String
 
     // Lossy-convert for files with stray invalid bytes in the middle.
     let lossy = String::from_utf8_lossy(bounded);
-    truncate_inline_document_text(&lossy)
+    truncate_inline_document_text(&lossy, data.len() > MAX_INLINE_DOCUMENT_BYTES)
 }
 
 async fn extract_pdf_document_content(data: Vec<u8>) -> Option<String> {
@@ -1971,7 +1971,7 @@ async fn extract_pdf_document_content(data: Vec<u8>) -> Option<String> {
     })
     .await
     .ok()??;
-    truncate_inline_document_text(&extracted)
+    truncate_inline_document_text(&extracted, false)
 }
 
 async fn save_inbound_document(
