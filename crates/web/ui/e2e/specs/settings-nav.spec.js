@@ -40,10 +40,14 @@ function isRetryableNavigationError(error) {
 }
 
 async function mockChannelsStatus(page, { channels, senders = [], allowRetryOwnership = false, label }) {
+	const firstMarker = channels
+		.map((channel) => String(channel.name || channel.account_id || channel.details || "").trim())
+		.find(Boolean);
 	let lastError = null;
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
 			await expect.poll(() => new URL(page.url()).pathname).toBe("/settings/channels");
+			await expect(page.getByRole("heading", { name: "Channels", exact: true })).toBeVisible();
 			await page.waitForFunction(() => !!document.querySelector('script[type="module"][src*="js/app.js"]'));
 			await page.evaluate(
 				async ({ channels, senders, allowRetryOwnership, label }) => {
@@ -91,6 +95,26 @@ async function mockChannelsStatus(page, { channels, senders = [], allowRetryOwne
 				},
 				{ channels, senders, allowRetryOwnership, label },
 			);
+			if (channels.length === 0) {
+				await expect(page.getByText("No channels connected.", { exact: false })).toBeVisible();
+			} else {
+				await expect
+					.poll(
+						async () => {
+							const cardCount = await page
+								.locator(".provider-card")
+								.count()
+								.catch(() => 0);
+							const pageText = await page
+								.locator("#pageContent")
+								.innerText()
+								.catch(() => "");
+							return cardCount >= channels.length && (!firstMarker || pageText.includes(firstMarker));
+						},
+						{ timeout: 10_000 },
+					)
+					.toBe(true);
+			}
 			return;
 		} catch (error) {
 			lastError = error;
