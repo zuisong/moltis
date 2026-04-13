@@ -457,6 +457,11 @@ impl SessionService for LiveSessionService {
             .get(key)
             .await
             .ok_or_else(|| format!("session '{key}' not found"))?;
+        if p.archived.is_some() && !is_archivable_entry(&entry) {
+            return Err(ServiceError::message(format!(
+                "session '{key}' cannot be archived"
+            )));
+        }
         if p.label.is_some() {
             let _ = self.metadata.upsert(key, p.label).await;
         }
@@ -464,11 +469,6 @@ impl SessionService for LiveSessionService {
             self.metadata.set_model(key, p.model).await;
         }
         if let Some(archived) = p.archived {
-            if !is_archivable_entry(&entry) {
-                return Err(ServiceError::message(format!(
-                    "session '{key}' cannot be archived"
-                )));
-            }
             self.metadata.set_archived(key, archived).await;
         }
         if let Some(project_id_opt) = p.project_id {

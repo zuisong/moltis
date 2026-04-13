@@ -583,7 +583,7 @@ impl SqliteSessionMetadata {
 
     pub async fn set_archived(&self, key: &str, archived: bool) {
         let now = now_ms() as i64;
-        let archived = if archived {
+        let val = if archived {
             1
         } else {
             0
@@ -591,7 +591,7 @@ impl SqliteSessionMetadata {
         sqlx::query(
             "UPDATE sessions SET archived = ?, updated_at = ?, version = version + 1 WHERE key = ?",
         )
-        .bind(archived)
+        .bind(val)
         .bind(now)
         .bind(key)
         .execute(&self.pool)

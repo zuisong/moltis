@@ -653,36 +653,39 @@ async fn test_version_increments_on_mutation() {
     meta.set_project_id("main", Some("proj1".to_string())).await;
     assert_eq!(meta.get("main").await.unwrap().version, 3);
 
-    meta.set_sandbox_enabled("main", Some(true)).await;
+    meta.set_archived("main", true).await;
     assert_eq!(meta.get("main").await.unwrap().version, 4);
+
+    meta.set_sandbox_enabled("main", Some(true)).await;
+    assert_eq!(meta.get("main").await.unwrap().version, 5);
 
     meta.set_sandbox_image("main", Some("img:1".to_string()))
         .await;
-    assert_eq!(meta.get("main").await.unwrap().version, 5);
+    assert_eq!(meta.get("main").await.unwrap().version, 6);
 
     meta.set_worktree_branch("main", Some("branch".to_string()))
         .await;
-    assert_eq!(meta.get("main").await.unwrap().version, 6);
+    assert_eq!(meta.get("main").await.unwrap().version, 7);
 
     meta.set_mcp_disabled("main", Some(true)).await;
-    assert_eq!(meta.get("main").await.unwrap().version, 7);
+    assert_eq!(meta.get("main").await.unwrap().version, 8);
 
     meta.set_channel_binding("main", Some("{}".to_string()))
         .await;
-    assert_eq!(meta.get("main").await.unwrap().version, 8);
+    assert_eq!(meta.get("main").await.unwrap().version, 9);
 
     meta.set_parent("main", Some("parent".to_string()), Some(0))
         .await;
-    assert_eq!(meta.get("main").await.unwrap().version, 9);
-
-    meta.mark_seen("main").await;
     assert_eq!(meta.get("main").await.unwrap().version, 10);
 
-    meta.set_preview("main", Some("hello")).await;
+    meta.mark_seen("main").await;
     assert_eq!(meta.get("main").await.unwrap().version, 11);
 
-    meta.set_agent_id("main", Some("agent-1")).await.unwrap();
+    meta.set_preview("main", Some("hello")).await;
     assert_eq!(meta.get("main").await.unwrap().version, 12);
+
+    meta.set_agent_id("main", Some("agent-1")).await.unwrap();
+    assert_eq!(meta.get("main").await.unwrap().version, 13);
 }
 
 #[tokio::test]
