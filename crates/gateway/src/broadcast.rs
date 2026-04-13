@@ -22,6 +22,12 @@ pub struct Broadcaster {
     pub graphql_broadcast: tokio::sync::broadcast::Sender<(String, serde_json::Value)>,
 }
 
+impl Default for Broadcaster {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Broadcaster {
     /// Create a new Broadcaster with sequence starting at 0.
     pub fn new() -> Self {
