@@ -239,7 +239,7 @@ navigation_timeout_ms = 30000  # Page load timeout
 # chrome_args = ["--disable-extensions"]  # Extra args
 
 # Sandbox image (browser sandbox mode follows session sandbox mode)
-sandbox_image = "browserless/chrome"  # Container image for sandboxed sessions
+sandbox_image = "docker.io/browserless/chrome"  # Container image for sandboxed sessions
 # allowed_domains = ["example.com", "*.trusted.org"]  # Restrict navigation
 
 # Container connectivity (for Moltis-in-Docker setups)
@@ -437,7 +437,7 @@ to the host network and filesystem.</p>
 <li><strong>Readiness detection</strong>: Waits for Chrome to be fully ready before connecting</li>
 </ul>
 <pre><code class="language-toml">[tools.browser]
-sandbox_image = "browserless/chrome"  # Container image for sandboxed sessions
+sandbox_image = "docker.io/browserless/chrome"  # Container image for sandboxed sessions
 </code></pre>
 <p>Requirements:</p>
 <ul>
