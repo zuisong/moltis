@@ -16,7 +16,7 @@ use {
 use {
     moltis_agents::{
         ChatMessage, UserContent,
-        model::{StreamEvent, values_to_chat_messages},
+        model::{StreamEvent, push_capped_provider_raw_event, values_to_chat_messages},
         prompt::{PromptRuntimeContext, build_system_prompt_minimal_runtime_details},
     },
     moltis_sessions::store::SessionStore,
@@ -225,9 +225,7 @@ pub(crate) async fn run_streaming(
                     .await;
                 },
                 StreamEvent::ProviderRaw(raw) => {
-                    if raw_llm_responses.len() < 256 {
-                        raw_llm_responses.push(raw);
-                    }
+                    push_capped_provider_raw_event(&mut raw_llm_responses, raw);
                 },
                 StreamEvent::Done(usage) => {
                     clear_unsupported_model(state, model_store, model_id).await;
@@ -367,9 +365,8 @@ pub(crate) async fn run_streaming(
                         accumulated.clone(),
                         provider.id().to_string(),
                         provider_name.to_string(),
-                        usage.clone(),
+                        UsageSnapshot::new(usage.clone(), Some(usage.clone())),
                         run_started.elapsed().as_millis() as u64,
-                        Some(usage.clone()),
                         assistant_message_index,
                         desired_reply_medium,
                         None,
@@ -404,9 +401,8 @@ pub(crate) async fn run_streaming(
                         (!raw_llm_responses.is_empty()).then_some(Value::Array(raw_llm_responses));
                     return Some(build_assistant_turn_output(
                         accumulated,
-                        usage.clone(),
+                        UsageSnapshot::new(usage.clone(), Some(usage)),
                         run_started.elapsed().as_millis() as u64,
-                        usage,
                         audio_path,
                         reasoning,
                         llm_api_response,

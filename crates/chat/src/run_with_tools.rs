@@ -1028,9 +1028,8 @@ pub(crate) async fn run_with_tools(
                 display_text.clone(),
                 provider_ref.id().to_string(),
                 provider_name.to_string(),
-                usage.clone(),
+                UsageSnapshot::new(usage.clone(), Some(request_usage.clone())),
                 run_started.elapsed().as_millis() as u64,
-                Some(request_usage.clone()),
                 assistant_message_index,
                 desired_reply_medium,
                 Some(iterations),
@@ -1063,9 +1062,8 @@ pub(crate) async fn run_with_tools(
             }
             Some(build_assistant_turn_output(
                 display_text,
-                usage,
+                UsageSnapshot::new(usage, Some(request_usage)),
                 run_started.elapsed().as_millis() as u64,
-                request_usage,
                 audio_path,
                 reasoning,
                 llm_api_response,

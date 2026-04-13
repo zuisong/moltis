@@ -59,6 +59,50 @@ pub(crate) enum InputMediumParam {
     Voice,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UsageSnapshot {
+    total: Usage,
+    request: Option<Usage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageFields {
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+}
+
+impl From<&Usage> for UsageFields {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_write_tokens: usage.cache_write_tokens,
+        }
+    }
+}
+
+impl UsageSnapshot {
+    #[must_use]
+    pub(crate) fn new(total: Usage, request: Option<Usage>) -> Self {
+        Self { total, request }
+    }
+
+    fn total_fields(&self) -> UsageFields {
+        UsageFields::from(&self.total)
+    }
+
+    fn request_fields(&self) -> Option<UsageFields> {
+        self.request.as_ref().map(UsageFields::from)
+    }
+
+    fn request_or_total_fields(&self) -> UsageFields {
+        self.request_fields().unwrap_or_else(|| self.total_fields())
+    }
+}
+
 /// Typed broadcast payload for the "final" chat event.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,9 +178,8 @@ pub(crate) fn build_chat_final_broadcast(
     text: String,
     model: String,
     provider: String,
-    usage: Usage,
+    usage: UsageSnapshot,
     duration_ms: u64,
-    request_usage: Option<Usage>,
     message_index: usize,
     reply_medium: ReplyMedium,
     iterations: Option<usize>,
@@ -146,6 +189,8 @@ pub(crate) fn build_chat_final_broadcast(
     reasoning: Option<String>,
     seq: Option<u64>,
 ) -> ChatFinalBroadcast {
+    let total = usage.total_fields();
+    let request = usage.request_fields();
     ChatFinalBroadcast {
         run_id: run_id.to_string(),
         session_key: session_key.to_string(),
@@ -153,15 +198,15 @@ pub(crate) fn build_chat_final_broadcast(
         text,
         model,
         provider,
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_write_tokens: usage.cache_write_tokens,
+        input_tokens: total.input_tokens,
+        output_tokens: total.output_tokens,
+        cache_read_tokens: total.cache_read_tokens,
+        cache_write_tokens: total.cache_write_tokens,
         duration_ms,
-        request_input_tokens: request_usage.as_ref().map(|usage| usage.input_tokens),
-        request_output_tokens: request_usage.as_ref().map(|usage| usage.output_tokens),
-        request_cache_read_tokens: request_usage.as_ref().map(|usage| usage.cache_read_tokens),
-        request_cache_write_tokens: request_usage.as_ref().map(|usage| usage.cache_write_tokens),
+        request_input_tokens: request.map(|usage| usage.input_tokens),
+        request_output_tokens: request.map(|usage| usage.output_tokens),
+        request_cache_read_tokens: request.map(|usage| usage.cache_read_tokens),
+        request_cache_write_tokens: request.map(|usage| usage.cache_write_tokens),
         message_index,
         reply_medium,
         iterations,
@@ -175,24 +220,25 @@ pub(crate) fn build_chat_final_broadcast(
 
 pub(crate) fn build_assistant_turn_output(
     text: String,
-    usage: Usage,
+    usage: UsageSnapshot,
     duration_ms: u64,
-    request_usage: Usage,
     audio_path: Option<String>,
     reasoning: Option<String>,
     llm_api_response: Option<Value>,
 ) -> AssistantTurnOutput {
+    let total = usage.total_fields();
+    let request = usage.request_or_total_fields();
     AssistantTurnOutput {
         text,
-        input_tokens: usage.input_tokens,
-        output_tokens: usage.output_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_write_tokens: usage.cache_write_tokens,
+        input_tokens: total.input_tokens,
+        output_tokens: total.output_tokens,
+        cache_read_tokens: total.cache_read_tokens,
+        cache_write_tokens: total.cache_write_tokens,
         duration_ms,
-        request_input_tokens: request_usage.input_tokens,
-        request_output_tokens: request_usage.output_tokens,
-        request_cache_read_tokens: request_usage.cache_read_tokens,
-        request_cache_write_tokens: request_usage.cache_write_tokens,
+        request_input_tokens: request.input_tokens,
+        request_output_tokens: request.output_tokens,
+        request_cache_read_tokens: request.cache_read_tokens,
+        request_cache_write_tokens: request.cache_write_tokens,
         audio_path,
         reasoning,
         llm_api_response,
@@ -279,7 +325,7 @@ pub(crate) fn session_token_usage_from_messages(messages: &[Value]) -> SessionTo
 mod tests {
     use {
         super::{
-            ReplyMedium, build_assistant_turn_output, build_chat_final_broadcast,
+            ReplyMedium, UsageSnapshot, build_assistant_turn_output, build_chat_final_broadcast,
             session_token_usage_from_messages,
         },
         moltis_agents::model::Usage,
@@ -345,9 +391,8 @@ mod tests {
             "hello".to_string(),
             "gpt-4.1".to_string(),
             "openai".to_string(),
-            usage,
+            UsageSnapshot::new(usage, Some(request_usage)),
             250,
-            Some(request_usage),
             7,
             ReplyMedium::Text,
             Some(2),
@@ -370,19 +415,21 @@ mod tests {
     fn build_assistant_turn_output_copies_cache_usage() {
         let output = build_assistant_turn_output(
             "hello".to_string(),
-            Usage {
-                input_tokens: 1200,
-                output_tokens: 80,
-                cache_read_tokens: 1050,
-                cache_write_tokens: 4,
-            },
+            UsageSnapshot::new(
+                Usage {
+                    input_tokens: 1200,
+                    output_tokens: 80,
+                    cache_read_tokens: 1050,
+                    cache_write_tokens: 4,
+                },
+                Some(Usage {
+                    input_tokens: 900,
+                    output_tokens: 60,
+                    cache_read_tokens: 850,
+                    cache_write_tokens: 2,
+                }),
+            ),
             250,
-            Usage {
-                input_tokens: 900,
-                output_tokens: 60,
-                cache_read_tokens: 850,
-                cache_write_tokens: 2,
-            },
             None,
             Some("thinking".to_string()),
             None,
