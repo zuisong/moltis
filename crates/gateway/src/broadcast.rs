@@ -16,7 +16,7 @@ use crate::state::GatewayState;
 /// to preserve atomic compound operations.
 pub struct Broadcaster {
     /// Monotonically increasing sequence counter for broadcast events.
-    pub seq: std::sync::atomic::AtomicU64,
+    seq: std::sync::atomic::AtomicU64,
     /// Broadcast channel for GraphQL subscriptions. Events are `(event_name, payload)`.
     #[cfg(feature = "graphql")]
     pub graphql_broadcast: tokio::sync::broadcast::Sender<(String, serde_json::Value)>,
@@ -36,6 +36,7 @@ impl Broadcaster {
     }
 
     /// Return the next sequence number.
+    #[must_use]
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
     }
@@ -231,5 +232,28 @@ mod tests {
             payload.get("localLlamaCpp").and_then(|v| v.as_u64()),
             Some(4)
         );
+    }
+}
+
+#[cfg(test)]
+mod broadcaster_tests {
+    use super::Broadcaster;
+
+    #[test]
+    fn new_starts_at_zero() {
+        let b = Broadcaster::new();
+        assert_eq!(b.next_seq(), 1);
+    }
+
+    #[test]
+    fn next_seq_is_strictly_monotonic() {
+        let b = Broadcaster::new();
+        let mut prev = 0;
+        for _ in 0..100 {
+            let seq = b.next_seq();
+            assert!(seq > prev, "seq {seq} is not > prev {prev}");
+            prev = seq;
+        }
+        assert_eq!(prev, 100);
     }
 }
