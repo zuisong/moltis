@@ -3462,9 +3462,9 @@ function WhatsAppForm({ onConnected, error, setError }) {
 			<div class="text-xs text-[var(--muted)] text-center">
 				Scan the QR code from your terminal, or open WhatsApp > Settings > Linked Devices > Link a Device.
 			</div>
-ttt<div class="text-xs text-[var(--muted)] text-center">
-ttttOnly new messages will be processed. Past conversations are not synced.
-ttt</div>
+			<div class="text-xs text-[var(--muted)] text-center italic">
+				Only new messages will be processed. Past conversations are not synced.
+			</div>
 		</div>`;
 	}
 
@@ -3475,8 +3475,8 @@ ttt</div>
 			<span>2. Click "Start Pairing" to generate a QR code</span>
 			<span>3. Open WhatsApp > Settings > Linked Devices > Link a Device</span>
 			<span>4. Scan the QR code to connect</span>
+			<span class="mt-1 italic">Only new messages will be processed — past conversations are not synced.</span>
 		</div>
-ttt<span class="mt-1">Only new messages will be processed — past conversations are not synced.</span>
 		<div>
 			<label class="text-xs text-[var(--muted)] mb-1 block">Account ID</label>
 			<input type="text" class="provider-key-input w-full"
