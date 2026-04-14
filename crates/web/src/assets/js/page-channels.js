@@ -1784,21 +1784,28 @@ function AddWhatsAppModal() {
 			saving.value = false;
 			if (res?.ok) {
 				pairingStarted.value = true;
-				// Poll channels.status as fallback if WebSocket QR event is missed.
+				// Poll channels.status as fallback for QR display and connection detection.
 				if (qrPollRef.current) clearInterval(qrPollRef.current);
 				qrPollRef.current = setInterval(async () => {
-					if (waQrData.value) {
-						clearInterval(qrPollRef.current);
-						qrPollRef.current = null;
-						return;
-					}
 					try {
 						var st = await sendRpc("channels.status");
 						if (!st?.ok) return;
 						var ch = (st.payload?.channels || []).find(
 							(c) => c.type === "whatsapp" && c.account_id === accountId,
 						);
-						if (ch?.extra?.qr_data && !waQrData.value) {
+						if (!ch) return;
+						if (ch.status === "connected") {
+							clearInterval(qrPollRef.current);
+							qrPollRef.current = null;
+							showToast("WhatsApp connected!");
+							showAddWhatsApp.value = false;
+							waPairingAccountId.value = null;
+							waQrData.value = null;
+							waQrSvg.value = null;
+							loadChannels();
+							return;
+						}
+						if (ch.extra?.qr_data && !waQrData.value) {
 							waQrData.value = ch.extra.qr_data;
 							if (ch.extra.qr_svg) waQrSvg.value = ch.extra.qr_svg;
 						}

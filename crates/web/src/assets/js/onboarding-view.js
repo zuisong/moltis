@@ -3342,9 +3342,10 @@ function WhatsAppForm({ onConnected, error, setError }) {
 		};
 	}, []);
 
-	// Poll channels.status as a fallback in case the WebSocket QR event was missed.
+	// Poll channels.status as a fallback for both QR code display and
+	// connection detection (WebSocket events may be missed).
 	useEffect(() => {
-		if (!pairingStarted || qrData) return undefined;
+		if (!pairingStarted) return undefined;
 		var id = accountId.trim();
 		var timer = setInterval(async () => {
 			try {
@@ -3353,7 +3354,12 @@ function WhatsAppForm({ onConnected, error, setError }) {
 				var ch = (res.payload?.channels || []).find(
 					(c) => c.type === "whatsapp" && c.account_id === id,
 				);
-				if (ch?.extra?.qr_data && !qrData) {
+				if (!ch) return;
+				if (ch.status === "connected") {
+					onConnected(id, "whatsapp");
+					return;
+				}
+				if (ch.extra?.qr_data && !qrData) {
 					setQrData(ch.extra.qr_data);
 					if (ch.extra.qr_svg) setQrSvg(ch.extra.qr_svg);
 				}
