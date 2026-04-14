@@ -1800,6 +1800,7 @@ function AddWhatsAppModal() {
 						);
 						if (ch?.extra?.qr_data && !waQrData.value) {
 							waQrData.value = ch.extra.qr_data;
+							if (ch.extra.qr_svg) waQrSvg.value = ch.extra.qr_svg;
 						}
 					} catch (_e) {
 						/* ignore */

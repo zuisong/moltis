@@ -3355,6 +3355,7 @@ function WhatsAppForm({ onConnected, error, setError }) {
 				);
 				if (ch?.extra?.qr_data && !qrData) {
 					setQrData(ch.extra.qr_data);
+					if (ch.extra.qr_svg) setQrSvg(ch.extra.qr_svg);
 				}
 			} catch (_e) {
 				/* ignore */

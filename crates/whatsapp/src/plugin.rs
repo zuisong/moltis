@@ -331,7 +331,18 @@ impl ChannelStatus for WhatsAppPlugin {
                         .read()
                         .ok()
                         .and_then(|q| q.clone())
-                        .map(|qr| serde_json::json!({ "qr_data": qr }));
+                        .map(|qr| {
+                            let mut obj = serde_json::json!({ "qr_data": &qr });
+                            if let Ok(code) = qrcode::QrCode::new(&qr) {
+                                let svg = code
+                                    .render::<qrcode::render::svg::Color>()
+                                    .min_dimensions(200, 200)
+                                    .quiet_zone(true)
+                                    .build();
+                                obj["qr_svg"] = serde_json::Value::String(svg);
+                            }
+                            obj
+                        });
                     ChannelHealthSnapshot {
                         connected,
                         account_id: account_id.to_string(),

@@ -8421,6 +8421,7 @@ dependencies = [
  "moltis-media",
  "moltis-metrics",
  "postcard",
+ "qrcode",
  "rand 0.10.0",
  "serde",
  "serde_json",
