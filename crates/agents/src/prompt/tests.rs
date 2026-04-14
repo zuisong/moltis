@@ -92,8 +92,7 @@ fn test_skills_injected_into_prompt() {
         ..Default::default()
     }];
     let prompt = build_system_prompt_with_session_runtime(
-        &tools, true, None, &skills, None, None, None, None, None, None, None, None,
-        None,
+        &tools, true, None, &skills, None, None, None, None, None, None, None, None, None,
     );
     assert!(prompt.contains("<available_skills>"));
     assert!(prompt.contains("commit"));
@@ -620,8 +619,9 @@ fn test_silent_replies_section_in_tool_prompt() {
 
 #[test]
 fn test_silent_replies_not_in_minimal_prompt() {
-    let prompt =
-        build_system_prompt_minimal_runtime(None, None, None, None, None, None, None, None, None, None);
+    let prompt = build_system_prompt_minimal_runtime(
+        None, None, None, None, None, None, None, None, None, None,
+    );
     assert!(!prompt.contains("## Silent Replies"));
 }
 

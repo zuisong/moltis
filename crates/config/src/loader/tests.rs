@@ -1042,7 +1042,6 @@ enabled = true
     );
 }
 
-
 #[test]
 fn load_guidelines_md_for_agent_falls_back_to_root() {
     let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
@@ -1059,8 +1058,7 @@ fn load_guidelines_md_for_agent_falls_back_to_root() {
 
     let agent_dir = dir.path().join("agents/test-agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("GUIDELINES.md"), "Agent-specific guidelines")
-        .unwrap();
+    std::fs::write(agent_dir.join("GUIDELINES.md"), "Agent-specific guidelines").unwrap();
     assert_eq!(
         load_guidelines_md_for_agent("test-agent").as_deref(),
         Some("Agent-specific guidelines")
@@ -1068,4 +1066,3 @@ fn load_guidelines_md_for_agent_falls_back_to_root() {
 
     clear_data_dir();
 }
-
