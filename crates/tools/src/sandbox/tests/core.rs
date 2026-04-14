@@ -31,7 +31,11 @@ fn test_docker_hardening_args_prebuilt() {
         .iter()
         .position(|a| a == "--hostname")
         .expect("--hostname flag missing");
-    assert_eq!(args[hostname_pos + 1], "sandbox", "--hostname value should be 'sandbox'");
+    assert_eq!(
+        args[hostname_pos + 1],
+        "sandbox",
+        "--hostname value should be 'sandbox'"
+    );
     assert!(args.contains(&"/sys/firmware:ro,nosuid".to_string()));
     assert!(args.contains(&"/sys/class/dmi:ro,nosuid".to_string()));
     assert!(args.contains(&"/sys/devices/virtual/dmi:ro,nosuid".to_string()));
@@ -54,7 +58,11 @@ fn test_docker_hardening_args_not_prebuilt() {
         .iter()
         .position(|a| a == "--hostname")
         .expect("--hostname flag missing");
-    assert_eq!(args[hostname_pos + 1], "sandbox", "--hostname value should be 'sandbox'");
+    assert_eq!(
+        args[hostname_pos + 1],
+        "sandbox",
+        "--hostname value should be 'sandbox'"
+    );
     assert!(args.contains(&"/sys/firmware:ro,nosuid".to_string()));
     assert!(args.contains(&"/sys/class/dmi:ro,nosuid".to_string()));
     assert!(args.contains(&"/sys/devices/virtual/dmi:ro,nosuid".to_string()));
