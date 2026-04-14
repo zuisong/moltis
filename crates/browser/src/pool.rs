@@ -721,7 +721,7 @@ impl Drop for BrowserPool {
 
 /// Generate a random session ID.
 fn generate_session_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let id: u64 = rng.random();
     format!("browser-{:016x}", id)

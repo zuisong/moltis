@@ -34,7 +34,7 @@ pub(crate) fn verify_password(password: &str, hash_str: &str) -> bool {
 }
 
 pub(crate) fn generate_token() -> String {
-    use {base64::Engine, rand::RngCore};
+    use {base64::Engine, rand::Rng};
 
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);

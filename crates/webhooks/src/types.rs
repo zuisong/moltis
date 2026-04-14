@@ -345,7 +345,7 @@ fn default_rate_limit() -> u32 {
 
 /// Generate a high-entropy public ID for a webhook endpoint.
 pub fn generate_public_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let bytes: [u8; 18] = rand::rng().random();
     format!("wh_{}", hex::encode(bytes))
 }

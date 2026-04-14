@@ -5,7 +5,7 @@ pub use moltis_auth::*;
 /// Uses uppercase + digits only (no ambiguous chars like 0/O, 1/I/L) for easy
 /// reading from a terminal.
 pub fn generate_setup_code() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const CHARSET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     let mut rng = rand::rng();
     (0..8)

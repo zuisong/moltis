@@ -5,7 +5,7 @@ use std::io::Write;
 use {
     anyhow::{Result, anyhow},
     clap::{Args, Subcommand},
-    rand::RngCore,
+    rand::Rng,
     serde_json::{Map, Value},
 };
 
