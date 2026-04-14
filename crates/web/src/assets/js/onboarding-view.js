@@ -3622,7 +3622,7 @@ function NostrForm({ onConnected, error, setError }) {
 }
 
 function ChannelStep({ onNext, onBack }) {
-	var offeredList = getGon("channels_offered") || ["telegram", "discord", "slack", "matrix"];
+	var offeredList = getGon("channels_offered") || ["telegram", "whatsapp", "discord", "slack", "matrix"];
 	var offered = new Set(offeredList);
 	var singleType = offeredList.length === 1 ? offeredList[0] : null;
 

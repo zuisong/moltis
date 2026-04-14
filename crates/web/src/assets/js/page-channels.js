@@ -441,7 +441,7 @@ function ChannelCard(props) {
 
 // ── Connect channel buttons ──────────────────────────────────
 function ConnectButtons() {
-	var offered = new Set(getGon("channels_offered") || ["telegram", "discord", "slack", "matrix"]);
+	var offered = new Set(getGon("channels_offered") || ["telegram", "whatsapp", "discord", "slack", "matrix"]);
 	return html`<div class="flex gap-2">
 		${
 			offered.has("telegram") &&
