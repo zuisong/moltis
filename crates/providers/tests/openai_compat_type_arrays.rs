@@ -334,6 +334,16 @@ fn find_type_arrays(schema: &serde_json::Value, path: &str, results: &mut Vec<St
             find_type_arrays(val, &format!("{path}.{key}"), results);
         }
     }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(variants) = obj.get(key).and_then(|v| v.as_array()) {
+            for (i, variant) in variants.iter().enumerate() {
+                find_type_arrays(variant, &format!("{path}.{key}[{i}]"), results);
+            }
+        }
+    }
+    if let Some(items) = obj.get("items") {
+        find_type_arrays(items, &format!("{path}.items"), results);
+    }
 }
 
 fn find_required_orphans(schema: &serde_json::Value, path: &str, results: &mut Vec<String>) {
@@ -357,4 +367,15 @@ fn find_required_orphans(schema: &serde_json::Value, path: &str, results: &mut V
             find_required_orphans(val, &format!("{path}.{key}"), results);
         }
     }
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(variants) = obj.get(key).and_then(|v| v.as_array()) {
+            for (i, variant) in variants.iter().enumerate() {
+                find_required_orphans(variant, &format!("{path}.{key}[{i}]"), results);
+            }
+        }
+    }
+    if let Some(items) = obj.get("items") {
+        find_required_orphans(items, &format!("{path}.items"), results);
+    }
+}
 }
