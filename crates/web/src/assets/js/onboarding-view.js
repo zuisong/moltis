@@ -57,7 +57,7 @@ import {
 	transcribeAudio,
 	VOICE_COUNTERPART_IDS,
 } from "./voice-utils.js";
-import { connectWs } from "./ws-connect.js";
+import { connectWs, subscribeEvents } from "./ws-connect.js";
 
 var wsStarted = false;
 function ensureWsConnected() {
@@ -65,6 +65,9 @@ function ensureWsConnected() {
 	wsStarted = true;
 	connectWs({
 		backoff: { factor: 2, max: 10000 },
+		onConnected: () => {
+			subscribeEvents(["channel"]);
+		},
 		onFrame: (frame) => {
 			if (frame.type !== "event") return;
 			var listeners = eventListeners[frame.event] || [];
