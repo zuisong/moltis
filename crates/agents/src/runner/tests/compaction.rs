@@ -3,8 +3,8 @@ use {super::helpers::*, crate::model::ChatMessage};
 #[test]
 fn compact_oldest_first_compacts_earliest_tool_result() {
     let mut messages = vec![
-        ChatMessage::tool("id1", &"a".repeat(300)),
-        ChatMessage::tool("id2", &"b".repeat(300)),
+        ChatMessage::tool("id1", "a".repeat(300)),
+        ChatMessage::tool("id2", "b".repeat(300)),
     ];
     let reduced = compact_tool_results_oldest_first_in_place(&mut messages, 1);
     assert!(reduced > 0, "should have compacted something");
@@ -31,7 +31,7 @@ fn compact_oldest_first_compacts_earliest_tool_result() {
 fn compact_oldest_first_skips_already_compacted() {
     let mut messages = vec![
         ChatMessage::tool("id1", TOOL_RESULT_COMPACTION_PLACEHOLDER),
-        ChatMessage::tool("id2", &"b".repeat(300)),
+        ChatMessage::tool("id2", "b".repeat(300)),
     ];
     let reduced = compact_tool_results_oldest_first_in_place(&mut messages, 1);
     assert!(reduced > 0);
@@ -53,8 +53,8 @@ fn compact_oldest_first_skips_already_compacted() {
 #[test]
 fn compact_oldest_first_skips_small_results() {
     let mut messages = vec![
-        ChatMessage::tool("id1", &"a".repeat(50)),
-        ChatMessage::tool("id2", &"b".repeat(300)),
+        ChatMessage::tool("id1", "a".repeat(50)),
+        ChatMessage::tool("id2", "b".repeat(300)),
     ];
     let reduced = compact_tool_results_oldest_first_in_place(&mut messages, 1);
     assert!(reduced > 0);
@@ -83,7 +83,7 @@ fn compact_oldest_first_returns_zero_when_nothing_to_compact() {
 
 #[test]
 fn compact_oldest_first_returns_zero_for_zero_tokens_needed() {
-    let mut messages = vec![ChatMessage::tool("id1", &"a".repeat(300))];
+    let mut messages = vec![ChatMessage::tool("id1", "a".repeat(300))];
     let reduced = compact_tool_results_oldest_first_in_place(&mut messages, 0);
     assert_eq!(reduced, 0);
 }
@@ -91,9 +91,9 @@ fn compact_oldest_first_returns_zero_for_zero_tokens_needed() {
 #[test]
 fn compact_oldest_first_stops_once_budget_freed() {
     let mut messages = vec![
-        ChatMessage::tool("id1", &"a".repeat(500)),
-        ChatMessage::tool("id2", &"b".repeat(500)),
-        ChatMessage::tool("id3", &"c".repeat(500)),
+        ChatMessage::tool("id1", "a".repeat(500)),
+        ChatMessage::tool("id2", "b".repeat(500)),
+        ChatMessage::tool("id3", "c".repeat(500)),
     ];
     let reduced = compact_tool_results_oldest_first_in_place(&mut messages, 1);
     assert!(reduced > 0);
@@ -114,7 +114,7 @@ fn compact_oldest_first_stops_once_budget_freed() {
 
 #[test]
 fn enforce_budget_ratio_zero_disables_compaction_ok_when_under_overflow() {
-    let mut messages = vec![ChatMessage::tool("id1", &"a".repeat(300))];
+    let mut messages = vec![ChatMessage::tool("id1", "a".repeat(300))];
     let result = enforce_tool_result_context_budget(&mut messages, &[], 100_000, 0, 90);
     assert!(result.is_ok());
 
@@ -128,7 +128,7 @@ fn enforce_budget_ratio_zero_disables_compaction_ok_when_under_overflow() {
 
 #[test]
 fn enforce_budget_ratio_zero_errors_on_overflow() {
-    let mut messages = vec![ChatMessage::tool("id1", &"a".repeat(500))];
+    let mut messages = vec![ChatMessage::tool("id1", "a".repeat(500))];
     let result = enforce_tool_result_context_budget(&mut messages, &[], 10, 0, 90);
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -142,8 +142,8 @@ fn enforce_budget_ratio_zero_errors_on_overflow() {
 #[test]
 fn enforce_budget_compacts_when_over_compaction_threshold() {
     let mut messages = vec![
-        ChatMessage::tool("id1", &"a".repeat(300)),
-        ChatMessage::tool("id2", &"b".repeat(300)),
+        ChatMessage::tool("id1", "a".repeat(300)),
+        ChatMessage::tool("id2", "b".repeat(300)),
     ];
     let result = enforce_tool_result_context_budget(&mut messages, &[], 100, 75, 90);
     assert!(result.is_ok());
@@ -181,7 +181,7 @@ fn enforce_budget_noop_when_no_tool_results() {
 
 #[test]
 fn enforce_budget_noop_when_context_window_zero() {
-    let mut messages = vec![ChatMessage::tool("id1", &"a".repeat(300))];
+    let mut messages = vec![ChatMessage::tool("id1", "a".repeat(300))];
     let result = enforce_tool_result_context_budget(&mut messages, &[], 0, 75, 90);
     assert!(result.is_ok());
 }

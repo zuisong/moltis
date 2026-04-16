@@ -422,8 +422,9 @@ mod tests {
     #[tokio::test]
     async fn update_account_config_does_not_panic_in_async() {
         let plugin = plugin_with_dummy_account();
-        let new_config =
-            serde_json::to_value(NostrAccountConfig::default()).expect("serialize default config");
+        let Ok(new_config) = serde_json::to_value(NostrAccountConfig::default()) else {
+            panic!("serialize default config");
+        };
         let result = plugin.update_account_config("test", new_config);
         assert!(result.is_ok(), "update_account_config must not panic");
     }
