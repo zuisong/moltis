@@ -7,8 +7,84 @@ use {
             ReplaceUnevaluatedProperties, Transform,
         },
     },
+    std::collections::BTreeSet,
     tracing::warn,
 };
+
+/// Re-infer `"type"` from `"enum"` values when canonicalization stripped it.
+///
+/// `json_schema_ast` canonicalization removes redundant `"type"` annotations
+/// when all enum values match the declared type (`lower_enum_with_type`), and
+/// converts `"type": "boolean"` → `"enum": [false, true]`
+/// (`lower_boolean_and_null_types`). This is correct per JSON Schema semantics
+/// but providers like Fireworks AI reject schemas without explicit `"type"`.
+///
+/// This transform walks every schema node and restores `"type"` when:
+/// - `"enum"` is present but `"type"` is absent
+/// - All non-null enum values share a single JSON type
+#[derive(Debug, Clone, Default)]
+struct RestoreEnumTypeTransform;
+
+impl Transform for RestoreEnumTypeTransform {
+    fn transform(&mut self, schema: &mut Schema) {
+        let Some(obj) = schema.as_object_mut() else {
+            return;
+        };
+
+        // Only act when `enum` is present and `type` is absent.
+        if obj.contains_key("type") {
+            return;
+        }
+        let Some(values) = obj.get("enum").and_then(|v| v.as_array()) else {
+            return;
+        };
+        if values.is_empty() {
+            return;
+        }
+
+        // Collect the distinct JSON types of non-null enum values.
+        let mut types = BTreeSet::new();
+        for value in values {
+            match value {
+                serde_json::Value::Null => {}, // ignore null for type inference
+                serde_json::Value::Bool(_) => {
+                    types.insert("boolean");
+                },
+                serde_json::Value::Number(n) => {
+                    if n.is_f64() && !n.is_i64() && !n.is_u64() {
+                        types.insert("number");
+                    } else {
+                        types.insert("integer");
+                    }
+                },
+                serde_json::Value::String(_) => {
+                    types.insert("string");
+                },
+                serde_json::Value::Array(_) => {
+                    types.insert("array");
+                },
+                serde_json::Value::Object(_) => {
+                    types.insert("object");
+                },
+            }
+        }
+
+        // In JSON Schema, "number" subsumes "integer". When both appear
+        // (e.g. enum mixes 1 and 1.5), collapse to "number".
+        if types.contains("integer") && types.contains("number") {
+            types.remove("integer");
+        }
+
+        // Only restore when all non-null values share a single type.
+        if types.len() == 1 {
+            let inferred_type = types.into_iter().next().unwrap_or_default();
+            obj.insert(
+                "type".to_string(),
+                serde_json::Value::String(inferred_type.to_string()),
+            );
+        }
+    }
+}
 
 const OPENAI_ALLOWED_SCHEMA_KEYWORDS: &[&str] = &[
     "$ref",
@@ -109,6 +185,12 @@ pub(crate) fn sanitize_schema_for_openai_compat(schema: &mut serde_json::Value) 
     remove_ref_siblings.transform(&mut transformed);
     let mut subset_transform = RecursiveTransform(OpenAiSchemaSubsetTransform);
     subset_transform.transform(&mut transformed);
+
+    // Re-infer `"type"` from enum values after canonicalization stripped it.
+    // Providers like Fireworks AI reject schemas without explicit type
+    // annotations even when enum values unambiguously imply the type.
+    let mut restore_enum_type = RecursiveTransform(RestoreEnumTypeTransform);
+    restore_enum_type.transform(&mut transformed);
 
     *schema = transformed.to_value();
 }

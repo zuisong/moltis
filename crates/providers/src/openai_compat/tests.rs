@@ -514,6 +514,159 @@ fn to_openai_tools_strict_nullable_enum_has_null() {
     );
 }
 
+/// Fireworks regression: canonicalization strips `"type": "string"` from
+/// enum properties when all enum values are strings. The post-canonicalization
+/// `RestoreEnumTypeTransform` must re-infer and restore the type annotation
+/// so providers like Fireworks AI don't reject the schema with 400.
+#[test]
+fn sanitize_restores_type_on_string_enum() {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["navigate", "click", "scroll"]
+            }
+        },
+        "required": ["action"]
+    });
+
+    sanitize_schema_for_openai_compat(&mut schema);
+
+    assert_eq!(
+        schema["properties"]["action"]["type"], "string",
+        "type must be restored after canonicalization strips it"
+    );
+    let Some(enum_values) = schema["properties"]["action"]["enum"].as_array() else {
+        panic!("enum should be preserved");
+    };
+    assert_eq!(enum_values.len(), 3);
+}
+
+/// Fireworks regression: `"type": "boolean"` gets canonicalized to
+/// `"enum": [false, true]` (lower_boolean_and_null_types). The restore
+/// transform must re-add `"type": "boolean"`.
+#[test]
+fn sanitize_restores_type_on_boolean_enum() {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "verbose": { "type": "boolean" }
+        }
+    });
+
+    sanitize_schema_for_openai_compat(&mut schema);
+
+    assert_eq!(
+        schema["properties"]["verbose"]["type"], "boolean",
+        "type must be restored for boolean enums"
+    );
+}
+
+/// Fireworks regression: integer enum values (e.g. priority levels) must
+/// also get their type restored after canonicalization.
+#[test]
+fn sanitize_restores_type_on_integer_enum() {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "priority": { "type": "integer", "enum": [1, 2, 3] }
+        }
+    });
+
+    sanitize_schema_for_openai_compat(&mut schema);
+
+    assert_eq!(
+        schema["properties"]["priority"]["type"], "integer",
+        "type must be restored for integer enums"
+    );
+}
+
+/// Mixed integer+float enum values should infer "number" since JSON Schema
+/// "number" subsumes "integer".
+#[test]
+fn sanitize_infers_number_for_mixed_int_float_enum() {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "threshold": {
+                "enum": [1, 1.5, 2]
+            }
+        }
+    });
+
+    sanitize_schema_for_openai_compat(&mut schema);
+
+    assert_eq!(
+        schema["properties"]["threshold"]["type"], "number",
+        "mixed integer+float enum should infer number"
+    );
+}
+
+/// End-to-end: `to_openai_tools` with strict=true must preserve type
+/// annotations on enum properties after the full pipeline.
+#[test]
+fn to_openai_tools_strict_preserves_enum_type_annotation() {
+    let tools = vec![serde_json::json!({
+        "name": "browser_action",
+        "description": "Perform a browser action",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["navigate", "click", "scroll"]
+                },
+                "enabled": { "type": "boolean" }
+            },
+            "required": ["action"]
+        }
+    })];
+
+    let converted = to_openai_tools(&tools, true);
+    let params = &converted[0]["function"]["parameters"];
+
+    assert_eq!(
+        params["properties"]["action"]["type"], "string",
+        "string enum must retain type through strict pipeline"
+    );
+    // `enabled` is optional → strict mode makes it nullable → type becomes
+    // ["boolean", "null"]. The important thing is that "type" is present
+    // (not stripped), and includes "boolean".
+    let enabled_type = &params["properties"]["enabled"]["type"];
+    let has_boolean = if let Some(arr) = enabled_type.as_array() {
+        arr.iter().any(|v| v.as_str() == Some("boolean"))
+    } else {
+        enabled_type.as_str() == Some("boolean")
+    };
+    assert!(
+        has_boolean,
+        "boolean must retain type through strict pipeline, got: {enabled_type}"
+    );
+}
+
+/// Mixed enum values (e.g. string + integer) should NOT get a type
+/// inferred, since there's no single type that covers all values.
+#[test]
+fn sanitize_does_not_infer_type_for_mixed_enums() {
+    let mut schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "value": {
+                "enum": ["auto", 42]
+            }
+        }
+    });
+
+    sanitize_schema_for_openai_compat(&mut schema);
+
+    // Mixed types → no single type can be inferred
+    assert!(
+        schema["properties"]["value"]["type"].is_null(),
+        "mixed enum should not get a type annotation"
+    );
+}
+
 /// Issue #712: enum-only schemas (no `type` key) must also get null
 /// appended. Canonicalization can strip the redundant `"type": "string"`
 /// leaving just `{"enum": [...]}` — the final fallback in make_nullable
