@@ -177,21 +177,24 @@ test.describe("MCP page", () => {
 			var pageErrors = watchPageErrors(page);
 			await navigateAndWait(page, "/settings/mcp");
 			await waitForWsConnected(page);
+			var customServerSection = page.getByRole("heading", { name: "Add Custom MCP Server", exact: true }).locator("..");
+			var expectedServerName = "127";
 
 			// Fill out the Streamable HTTP custom server form
-			await page.getByRole("button", { name: "Streamable HTTP", exact: true }).click();
-			await page.getByPlaceholder("https://mcp.linear.app/mcp").fill(`http://127.0.0.1:${mockMcp.port}`);
-			await page.getByPlaceholder("Authorization=Bearer ...").fill(`Authorization=Bearer e2e-test-token`);
+			await customServerSection.getByRole("button", { name: "Streamable HTTP", exact: true }).click();
+			await customServerSection.getByPlaceholder("https://mcp.linear.app/mcp").fill(`http://127.0.0.1:${mockMcp.port}`);
+			await customServerSection.getByPlaceholder("Authorization=Bearer ...").fill(`Authorization=Bearer e2e-test-token`);
 
 			// Submit the form (press Enter or click Add)
-			var addBtn = page.getByRole("button", { name: "Add", exact: true });
+			var addBtn = customServerSection.getByRole("button", { name: "Add", exact: true });
 			await addBtn.click();
 
 			// Wait for success toast
 			await expect(page.getByText("Added MCP tool", { exact: false })).toBeVisible({ timeout: 15_000 });
 
 			// The server should now appear in the list. Wait for it.
-			// The name is derived from the URL, typically "127-0-0-1" or similar.
+			// The name is derived from the URL hostname via deriveSseName().
+			// For raw IPv4 hosts we currently use the first hostname segment.
 			// Navigate to refresh the MCP list (status_all is called on page load).
 			await navigateAndWait(page, "/settings/mcp");
 
@@ -199,7 +202,7 @@ test.describe("MCP page", () => {
 			// The mock server responds to POST (tools work) but returns 405 for GET.
 			// After the fix for #732, is_alive() treats any HTTP response as alive.
 			var serverEntry = page.locator(".skills-repo-card").filter({
-				has: page.locator(`text=127-0-0-1`),
+				has: page.getByText(expectedServerName, { exact: true }),
 			});
 			await expect(serverEntry).toBeVisible({ timeout: 10_000 });
 
