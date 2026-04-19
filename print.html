@@ -6576,6 +6576,8 @@ offered = ["slack"]
 <tr><td><code>stream_mode</code></td><td>no</td><td><code>"edit_in_place"</code></td><td>Streaming mode: <code>"edit_in_place"</code>, <code>"native"</code>, or <code>"off"</code></td></tr>
 <tr><td><code>edit_throttle_ms</code></td><td>no</td><td><code>500</code></td><td>Minimum milliseconds between streaming edit updates</td></tr>
 <tr><td><code>thread_replies</code></td><td>no</td><td><code>true</code></td><td>Reply in threads</td></tr>
+<tr><td><code>channel_overrides</code></td><td>no</td><td><code>{}</code></td><td>Per-channel model/provider overrides (see below)</td></tr>
+<tr><td><code>user_overrides</code></td><td>no</td><td><code>{}</code></td><td>Per-user model/provider overrides (see below)</td></tr>
 </tbody></table>
 </div><div id="admonition-allowlist-values-are-strings" class="admonition admonish-tip" role="note" aria-labelledby="admonition-allowlist-values-are-strings-title">
 <div class="admonition-title">
@@ -6607,6 +6609,15 @@ model_provider = "anthropic"
 stream_mode = "edit_in_place"
 edit_throttle_ms = 500
 thread_replies = true
+
+# Per-channel override: use a different model in a specific Slack channel
+[channels.slack.my-bot.channel_overrides.C0123456789]
+model = "gpt-4o"
+
+# Per-user override: use a specific model/provider for a Slack user
+[channels.slack.my-bot.user_overrides.U0123456789]
+model = "claude-sonnet-4-20250514"
+model_provider = "anthropic"
 </code></pre>
 <h3 id="events-api-mode"><a class="header" href="#events-api-mode">Events API Mode</a></h3>
 <p>If you prefer webhook-based delivery instead of Socket Mode:</p>
@@ -8436,32 +8447,50 @@ and the agent itself to persist context across messages within a session.</p>
 <h2 id="overview-2"><a class="header" href="#overview-2">Overview</a></h2>
 <p>Session state is scoped to a <code>(session_key, namespace, key)</code> triple, backed by
 SQLite. Each entry stores a string value and is automatically timestamped.</p>
-<p>The agent accesses state through the <code>session_state</code> tool, which supports three
-operations: <code>get</code>, <code>set</code>, and <code>list</code>.</p>
+<p>The agent accesses state through the <code>session_state</code> tool, which supports five
+operations: <code>get</code>, <code>set</code>, <code>delete</code>, <code>list</code>, and <code>clear</code>.</p>
 <h2 id="agent-tool"><a class="header" href="#agent-tool">Agent Tool</a></h2>
 <p>The <code>session_state</code> tool is registered as a built-in tool and available in every
 session.</p>
 <h3 id="get-a-value"><a class="header" href="#get-a-value">Get a value</a></h3>
 <pre><code class="language-json">{
-  "op": "get",
+  "operation": "get",
   "namespace": "my-skill",
   "key": "last_query"
 }
 </code></pre>
+<p>Returns <code>{ "value": "&lt;value or null&gt;" }</code>.</p>
 <h3 id="set-a-value"><a class="header" href="#set-a-value">Set a value</a></h3>
 <pre><code class="language-json">{
-  "op": "set",
+  "operation": "set",
   "namespace": "my-skill",
   "key": "last_query",
   "value": "SELECT * FROM users"
 }
 </code></pre>
+<p>Returns <code>{ "ok": true }</code>. Insert-or-update semantics.</p>
 <h3 id="list-all-keys-in-a-namespace"><a class="header" href="#list-all-keys-in-a-namespace">List all keys in a namespace</a></h3>
 <pre><code class="language-json">{
-  "op": "list",
+  "operation": "list",
   "namespace": "my-skill"
 }
 </code></pre>
+<p>Returns <code>{ "entries": [{ "key": "...", "value": "..." }] }</code>.</p>
+<h3 id="delete-a-single-key"><a class="header" href="#delete-a-single-key">Delete a single key</a></h3>
+<pre><code class="language-json">{
+  "operation": "delete",
+  "namespace": "my-skill",
+  "key": "last_query"
+}
+</code></pre>
+<p>Returns <code>{ "deleted": true }</code> if the key existed, <code>{ "deleted": false }</code> otherwise.</p>
+<h3 id="clear-all-keys-in-a-namespace"><a class="header" href="#clear-all-keys-in-a-namespace">Clear all keys in a namespace</a></h3>
+<pre><code class="language-json">{
+  "operation": "clear",
+  "namespace": "my-skill"
+}
+</code></pre>
+<p>Returns <code>{ "deleted": &lt;count&gt; }</code> with the number of entries removed.</p>
 <h2 id="namespacing"><a class="header" href="#namespacing">Namespacing</a></h2>
 <p>Every state entry belongs to a namespace. This prevents collisions between
 different skills or extensions using state in the same session. Use your skill
@@ -12591,10 +12620,16 @@ LLM response:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
 </span>pub enum StreamEvent {
-    /// Text content delta - a chunk of text from the LLM.
+    /// Text content delta.
     Delta(String),
 
-    /// A tool call has started (for providers with native tool support).
+    /// Raw provider event payload (for debugging API responses).
+    ProviderRaw(serde_json::Value),
+
+    /// Reasoning/planning text delta (not user-visible final answer text).
+    ReasoningDelta(String),
+
+    /// A tool call has started (content_block_start with tool_use).
     ToolCallStart { id: String, name: String, index: usize },
 
     /// Streaming delta for tool call arguments (JSON fragment).
@@ -12603,7 +12638,7 @@ LLM response:</p>
     /// A tool call's arguments are complete.
     ToolCallComplete { index: usize },
 
-    /// Stream completed successfully with token usage.
+    /// Stream completed successfully.
     Done(Usage),
 
     /// An error occurred.
@@ -12613,12 +12648,14 @@ LLM response:</p>
 <h3 id="2-llmprovider-trait-cratesagentssrcmodelrs"><a class="header" href="#2-llmprovider-trait-cratesagentssrcmodelrs">2. LlmProvider Trait (<code>crates/agents/src/model.rs</code>)</a></h3>
 <p>The <code>LlmProvider</code> trait defines two streaming methods:</p>
 <ul>
-<li><code>stream()</code> - Basic streaming without tool support</li>
-<li><code>stream_with_tools()</code> - Streaming with tool schemas passed to the API</li>
+<li><code>stream()</code> — Basic streaming without tool support</li>
+<li><code>stream_with_tools()</code> — Streaming with tool schemas passed to the API</li>
 </ul>
-<p>Providers that support streaming with tools (like Anthropic) override
-<code>stream_with_tools()</code>. Others fall back to <code>stream()</code> which ignores the tools
-parameter.</p>
+<p>Both accept <code>Vec&lt;ChatMessage&gt;</code> (not raw JSON). Providers that support
+streaming with tools override <code>stream_with_tools()</code>. Others fall back to
+<code>stream()</code> via the default implementation, which ignores the tools parameter.</p>
+<p>The trait also exposes <code>supports_tools()</code>, <code>reasoning_effort()</code>, and
+<code>with_reasoning_effort()</code> for provider capability discovery.</p>
 <h3 id="3-anthropic-provider-cratesagentssrcprovidersanthropicrs"><a class="header" href="#3-anthropic-provider-cratesagentssrcprovidersanthropicrs">3. Anthropic Provider (<code>crates/agents/src/providers/anthropic.rs</code>)</a></h3>
 <p>The Anthropic provider implements streaming by:</p>
 <ol>
@@ -12637,7 +12674,7 @@ parameter.</p>
 <tr><td><code>error</code></td><td><code>Error</code></td></tr>
 </tbody></table>
 </div>
-<h3 id="4-agent-runner-cratesagentssrcrunnerrs"><a class="header" href="#4-agent-runner-cratesagentssrcrunnerrs">4. Agent Runner (<code>crates/agents/src/runner.rs</code>)</a></h3>
+<h3 id="4-agent-runner-cratesagentssrcrunnerstreamingrs"><a class="header" href="#4-agent-runner-cratesagentssrcrunnerstreamingrs">4. Agent Runner (<code>crates/agents/src/runner/streaming.rs</code>)</a></h3>
 <p>The <code>run_agent_loop_streaming()</code> function orchestrates the streaming agent
 loop:</p>
 <pre><code>┌─────────────────────────────────────────────────────────┐
@@ -12665,21 +12702,28 @@ loop:</p>
 │  6. Loop back to step 1                                 │
 └─────────────────────────────────────────────────────────┘
 </code></pre>
-<h3 id="5-gateway-cratesgatewaysrcchatrs"><a class="header" href="#5-gateway-cratesgatewaysrcchatrs">5. Gateway (<code>crates/gateway/src/chat.rs</code>)</a></h3>
-<p>The gateway’s <code>run_with_tools()</code> function:</p>
+<h3 id="5-chat-service-crateschatsrcrun_with_toolsrs"><a class="header" href="#5-chat-service-crateschatsrcrun_with_toolsrs">5. Chat Service (<code>crates/chat/src/run_with_tools.rs</code>)</a></h3>
+<p>The chat service’s <code>run_with_tools()</code> function:</p>
 <ol>
 <li>Sets up an event callback that broadcasts <code>RunnerEvent</code>s via WebSocket</li>
-<li>Calls <code>run_agent_loop_streaming()</code></li>
+<li>Calls <code>run_agent_loop_streaming()</code> from <code>crates/agents/src/runner/streaming.rs</code></li>
 <li>Broadcasts events to connected clients as JSON frames</li>
 </ol>
 <p>Event types broadcast to the UI:</p>
 <div class="table-wrapper"><table><thead><tr><th>RunnerEvent</th><th>WebSocket State</th></tr></thead><tbody>
 <tr><td><code>Thinking</code></td><td><code>thinking</code></td></tr>
 <tr><td><code>ThinkingDone</code></td><td><code>thinking_done</code></td></tr>
+<tr><td><code>ThinkingText(text)</code></td><td><code>thinking_text</code></td></tr>
 <tr><td><code>TextDelta(text)</code></td><td><code>delta</code> with <code>text</code> field</td></tr>
 <tr><td><code>ToolCallStart</code></td><td><code>tool_call_start</code></td></tr>
 <tr><td><code>ToolCallEnd</code></td><td><code>tool_call_end</code></td></tr>
+<tr><td><code>ToolCallRejected</code></td><td><code>tool_call_end</code> with <code>rejected: true</code></td></tr>
 <tr><td><code>Iteration(n)</code></td><td><code>iteration</code></td></tr>
+<tr><td><code>SubAgentStart</code></td><td><code>sub_agent_start</code></td></tr>
+<tr><td><code>SubAgentEnd</code></td><td><code>sub_agent_end</code></td></tr>
+<tr><td><code>AutoContinue</code></td><td><code>notice</code> (“Auto-continue”)</td></tr>
+<tr><td><code>RetryingAfterError</code></td><td><code>retrying</code></td></tr>
+<tr><td><code>LoopInterventionFired</code></td><td><code>notice</code> (“Loop detected”)</td></tr>
 </tbody></table>
 </div>
 <h3 id="6-web-crate-cratesweb"><a class="header" href="#6-web-crate-cratesweb">6. Web Crate (<code>crates/web/</code>)</a></h3>
@@ -12719,7 +12763,7 @@ web UI concerns separate from API and agent logic in the gateway.</p>
                                                                       │
                                                                       ▼
 ┌──────────────┐   WebSocket  ┌──────────────┐   Routes/WS   ┌──────────────┐    Callback     ┌──────────────┐
-│   Browser    │◀─────────────│  Web Crate   │◀──────────────│   Gateway    │◀────────────────│   Callback   │
+│   Browser    │◀─────────────│  Web Crate   │◀──────────────│ Chat Service │◀────────────────│   Callback   │
 │              │              │  (moltis-web)│               │              │                 │   (on_event) │
 └──────────────┘              └──────────────┘               └──────────────┘                 └──────────────┘
 </code></pre>
@@ -12739,8 +12783,8 @@ variants</li>
 </span><span class="boring">fn main() {
 </span>fn stream_with_tools(
     &amp;self,
-    messages: Vec&lt;serde_json::Value&gt;,
-    tools: Vec&lt;serde_json::Value&gt;,
+    messages: Vec&lt;ChatMessage&gt;,
+    _tools: Vec&lt;serde_json::Value&gt;,
 ) -&gt; Pin&lt;Box&lt;dyn Stream&lt;Item = StreamEvent&gt; + Send + '_&gt;&gt; {
     Box::pin(async_stream::stream! {
         // Make streaming request to provider API
@@ -12793,7 +12837,7 @@ startup in the correct dependency order.</p>
 │   └── src/lib.rs                     # run_migrations()
 ├── sessions/
 │   ├── migrations/
-│   │   └── 20240205100001_init.sql   # sessions, channel_sessions
+│   │   └── 20240205100001_init.sql   # sessions, channel_sessions, session_state
 │   └── src/lib.rs                     # run_migrations()
 ├── cron/
 │   ├── migrations/
@@ -12801,8 +12845,17 @@ startup in the correct dependency order.</p>
 │   └── src/lib.rs                     # run_migrations()
 ├── gateway/
 │   ├── migrations/
-│   │   └── 20240205100003_init.sql   # auth, message_log, channels
-│   └── src/server.rs                  # orchestrates moltis.db migrations
+│   │   └── 20240205100003_init.sql   # auth, message_log, channels, agents, ...
+│   └── src/server/
+│       └── prepare_core.rs            # orchestrates moltis.db migrations
+├── webhooks/
+│   ├── migrations/
+│   │   └── 20260407000000_initial.sql # webhooks, webhook_deliveries, ...
+│   └── src/lib.rs                     # run_migrations()
+├── vault/
+│   ├── migrations/
+│   │   └── 20260214000001_vault_metadata.sql  # vault_metadata
+│   └── src/lib.rs                     # run_migrations() (feature-gated)
 └── memory/
     ├── migrations/
     │   └── 20240205100004_init.sql   # files, chunks, embedding_cache, FTS
@@ -12813,24 +12866,30 @@ startup in the correct dependency order.</p>
 <p>Each crate is autonomous and owns its schema:</p>
 <div class="table-wrapper"><table><thead><tr><th>Crate</th><th>Database</th><th>Tables</th><th>Migration File</th></tr></thead><tbody>
 <tr><td><code>moltis-projects</code></td><td><code>moltis.db</code></td><td><code>projects</code></td><td><code>20240205100000_init.sql</code></td></tr>
-<tr><td><code>moltis-sessions</code></td><td><code>moltis.db</code></td><td><code>sessions</code>, <code>channel_sessions</code></td><td><code>20240205100001_init.sql</code></td></tr>
-<tr><td><code>moltis-cron</code></td><td><code>moltis.db</code></td><td><code>cron_jobs</code>, <code>cron_runs</code></td><td><code>20240205100002_init.sql</code></td></tr>
-<tr><td><code>moltis-gateway</code></td><td><code>moltis.db</code></td><td><code>auth_*</code>, <code>passkeys</code>, <code>api_keys</code>, <code>env_variables</code>, <code>message_log</code>, <code>channels</code></td><td><code>20240205100003_init.sql</code></td></tr>
+<tr><td><code>moltis-sessions</code></td><td><code>moltis.db</code></td><td><code>sessions</code>, <code>channel_sessions</code>, <code>session_state</code></td><td><code>20240205100001_init.sql</code> + 9 migrations</td></tr>
+<tr><td><code>moltis-cron</code></td><td><code>moltis.db</code></td><td><code>cron_jobs</code>, <code>cron_runs</code></td><td><code>20240205100002_init.sql</code> + 1 migration</td></tr>
+<tr><td><code>moltis-gateway</code></td><td><code>moltis.db</code></td><td><code>auth_*</code>, <code>passkeys</code>, <code>api_keys</code>, <code>env_variables</code>, <code>message_log</code>, <code>channels</code>, <code>agents</code>, <code>session_shares</code>, <code>device_pairing</code>, <code>ssh_keys</code>, <code>ssh_targets</code>, <code>auth_audit_log</code></td><td><code>20240205100003_init.sql</code> + 12 migrations</td></tr>
+<tr><td><code>moltis-webhooks</code></td><td><code>moltis.db</code></td><td><code>webhooks</code>, <code>webhook_deliveries</code>, <code>webhook_response_actions</code></td><td><code>20260407000000_initial.sql</code> + 1 migration</td></tr>
+<tr><td><code>moltis-vault</code></td><td><code>moltis.db</code></td><td><code>vault_metadata</code></td><td><code>20260214000001_vault_metadata.sql</code> (feature-gated)</td></tr>
 <tr><td><code>moltis-memory</code></td><td><code>memory.db</code></td><td><code>files</code>, <code>chunks</code>, <code>embedding_cache</code>, <code>chunks_fts</code></td><td><code>20240205100004_init.sql</code></td></tr>
 </tbody></table>
 </div>
 <h3 id="startup-sequence"><a class="header" href="#startup-sequence">Startup Sequence</a></h3>
-<p>The gateway runs migrations in dependency order:</p>
+<p>The gateway runs migrations in dependency order via
+<code>crates/gateway/src/server/prepare_core.rs</code>:</p>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
-</span>// server.rs
-moltis_projects::run_migrations(&amp;db_pool).await?;   // 1. projects first
-moltis_sessions::run_migrations(&amp;db_pool).await?;   // 2. sessions (FK → projects)
-moltis_cron::run_migrations(&amp;db_pool).await?;       // 3. cron (independent)
-sqlx::migrate!("./migrations").run(&amp;db_pool).await?; // 4. gateway tables
+</span>moltis_projects::run_migrations(&amp;db_pool).await?;    // 1. projects first
+moltis_sessions::run_migrations(&amp;db_pool).await?;    // 2. sessions (FK → projects)
+moltis_cron::run_migrations(&amp;db_pool).await?;        // 3. cron (independent)
+moltis_webhooks::run_migrations(&amp;db_pool).await?;    // 4. webhooks (independent)
+crate::run_migrations(&amp;db_pool).await?;              // 5. gateway tables
+#[cfg(feature = "vault")]
+moltis_vault::run_migrations(&amp;db_pool).await?;      // 6. vault (feature-gated)
 <span class="boring">}</span></code></pre></pre>
 <p>Sessions depends on projects due to a foreign key (<code>sessions.project_id</code> references
-<code>projects.id</code>), so projects must migrate first.</p>
+<code>projects.id</code>), so projects must migrate first. Memory runs separately against
+its own <code>memory.db</code> pool.</p>
 <h3 id="version-tracking"><a class="header" href="#version-tracking">Version Tracking</a></h3>
 <p>sqlx tracks applied migrations in the <code>_sqlx_migrations</code> table:</p>
 <pre><code class="language-sql">SELECT version, description, installed_on, success FROM _sqlx_migrations;
@@ -12839,7 +12898,7 @@ sqlx::migrate!("./migrations").run(&amp;db_pool).await?; // 4. gateway tables
 must be globally unique across all crates.</p>
 <h2 id="database-files"><a class="header" href="#database-files">Database Files</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Database</th><th>Location</th><th>Crates</th></tr></thead><tbody>
-<tr><td><code>moltis.db</code></td><td><code>~/.moltis/moltis.db</code></td><td>projects, sessions, cron, gateway</td></tr>
+<tr><td><code>moltis.db</code></td><td><code>~/.moltis/moltis.db</code></td><td>projects, sessions, cron, gateway, webhooks, vault</td></tr>
 <tr><td><code>memory.db</code></td><td><code>~/.moltis/memory.db</code></td><td>memory (separate, managed internally)</td></tr>
 </tbody></table>
 </div>
@@ -12903,7 +12962,7 @@ CREATE TABLE IF NOT EXISTS session_bookmarks (
 }
 <span class="boring">}</span></code></pre></pre>
 <ol start="4">
-<li>Call it from <code>server.rs</code> in the appropriate order:</li>
+<li>Call it from <code>prepare_core.rs</code> in the appropriate order:</li>
 </ol>
 <pre><pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
 </span><span class="boring">fn main() {
@@ -12974,7 +13033,7 @@ In production, migrations handle schema creation.</p>
 <li>Check for syntax errors in migration SQL files</li>
 </ol>
 <h3 id="migration-order-issues"><a class="header" href="#migration-order-issues">Migration Order Issues</a></h3>
-<p>If you see foreign key errors, verify the migration order in <code>server.rs</code>. Parent
+<p>If you see foreign key errors, verify the migration order in <code>prepare_core.rs</code>. Parent
 tables must be created before child tables with FK references.</p>
 <h3 id="checking-migration-status"><a class="header" href="#checking-migration-status">Checking Migration Status</a></h3>
 <pre><code class="language-bash">sqlite3 ~/.moltis/moltis.db "SELECT version, description, success FROM _sqlx_migrations ORDER BY version"
@@ -12998,7 +13057,7 @@ cargo run  # Creates fresh database with all migrations
 <li>Modify existing migration files after deployment</li>
 <li>Reuse timestamps across crates</li>
 <li>Put multiple crates’ tables in one migration file</li>
-<li>Skip the dependency order in <code>server.rs</code></li>
+<li>Skip the dependency order in <code>prepare_core.rs</code></li>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div><h1 id="metrics-and-tracing"><a class="header" href="#metrics-and-tracing">Metrics and Tracing</a></h1>
 <p>Moltis includes comprehensive observability support through Prometheus metrics and
