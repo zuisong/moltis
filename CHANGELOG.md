@@ -19,6 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260419.01] - 2026-04-19
+### Added
+- [code-index] Add code indexing crate with builtin SQLite+FTS5 backend (#771)
+- [config] Add server.external_url for reverse proxy WebAuthn (#785)
+
+
+### Changed
+- Add thiserror Error types to 8 library crates (#792)
+
+
+### Fixed
+- [task_list] List all tasks by default and add list_lists action (#779)
+- [sandbox] Add observability and prevent repeated package provisioning (#784)
+
 ## [20260417.02] - 2026-04-17
 ### Added
 - [nostr] Add NIP-59 Gift Wrap support for private DMs (#763)
