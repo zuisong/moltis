@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-locales_dir="$repo_root/crates/web/src/assets/js/locales"
+locales_dir="$repo_root/crates/web/ui/src/locales"
 
 if [[ ! -d "$locales_dir/en" ]]; then
 	echo "Missing English locale directory: $locales_dir/en" >&2
@@ -49,7 +49,7 @@ function sortedLocaleDirs(baseDir) {
 function sortedNamespaceFiles(enDir) {
 	return fs
 		.readdirSync(enDir, { withFileTypes: true })
-		.filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+		.filter((entry) => entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js")))
 		.map((entry) => entry.name)
 		.sort();
 }
