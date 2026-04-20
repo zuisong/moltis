@@ -238,9 +238,22 @@ impl SkillsService for NoopSkillsService {
             discover::{FsSkillDiscoverer, SkillDiscoverer},
             requirements::check_requirements,
         };
-        let search_paths = FsSkillDiscoverer::default_paths();
-        let discoverer = FsSkillDiscoverer::new(search_paths);
-        let skills = discoverer.discover().await.map_err(ServiceError::message)?;
+        let fs_discoverer = FsSkillDiscoverer::new(FsSkillDiscoverer::default_paths());
+
+        #[cfg(feature = "bundled-skills")]
+        let skills = {
+            let bundled = Arc::new(moltis_skills::bundled::BundledSkillStore::new());
+            let composite = moltis_skills::discover::CompositeSkillDiscoverer::new(
+                Box::new(fs_discoverer),
+                bundled,
+            );
+            composite.discover().await.map_err(ServiceError::message)?
+        };
+        #[cfg(not(feature = "bundled-skills"))]
+        let skills = fs_discoverer
+            .discover()
+            .await
+            .map_err(ServiceError::message)?;
         let items: Vec<_> = skills
             .iter()
             .map(|s| {
@@ -253,6 +266,7 @@ impl SkillsService for NoopSkillsService {
                 serde_json::json!({
                     "name": s.name,
                     "description": s.description,
+                    "category": s.category,
                     "license": s.license,
                     "allowed_tools": s.allowed_tools,
                     "path": s.path.to_string_lossy(),
@@ -689,6 +703,12 @@ impl SkillsService for NoopSkillsService {
             return skill_detail_discovered(source, skill_name);
         }
 
+        // Bundled skills: read from the embedded store.
+        #[cfg(feature = "bundled-skills")]
+        if source == "bundled" {
+            return skill_detail_bundled(skill_name);
+        }
+
         let install_dir =
             moltis_skills::install::default_install_dir().map_err(ServiceError::message)?;
         let manifest_path = moltis_skills::manifest::ManifestStore::default_path()
@@ -865,9 +885,22 @@ impl SkillsService for NoopSkillsService {
             .unwrap_or(false);
 
         // Discover the skill to get its requirements
-        let search_paths = FsSkillDiscoverer::default_paths();
-        let discoverer = FsSkillDiscoverer::new(search_paths);
-        let skills = discoverer.discover().await.map_err(ServiceError::message)?;
+        let fs_discoverer = FsSkillDiscoverer::new(FsSkillDiscoverer::default_paths());
+
+        #[cfg(feature = "bundled-skills")]
+        let skills = {
+            let bundled = Arc::new(moltis_skills::bundled::BundledSkillStore::new());
+            let composite = moltis_skills::discover::CompositeSkillDiscoverer::new(
+                Box::new(fs_discoverer),
+                bundled,
+            );
+            composite.discover().await.map_err(ServiceError::message)?
+        };
+        #[cfg(not(feature = "bundled-skills"))]
+        let skills = fs_discoverer
+            .discover()
+            .await
+            .map_err(ServiceError::message)?;
 
         let meta = skills
             .iter()
@@ -1193,6 +1226,45 @@ fn skill_detail_discovered(source_type: &str, skill_name: &str) -> ServiceResult
         "body_html": markdown_to_html(&content.body),
         "source": source_type,
         "path": skill_dir.to_string_lossy(),
+    }))
+}
+
+/// Load skill detail for a bundled skill by name.
+#[cfg(feature = "bundled-skills")]
+fn skill_detail_bundled(skill_name: &str) -> ServiceResult {
+    use moltis_skills::requirements::check_requirements;
+
+    let store = moltis_skills::bundled::BundledSkillStore::new();
+    let skills = store.discover();
+    let meta = skills
+        .iter()
+        .find(|s| s.name == skill_name)
+        .ok_or_else(|| format!("bundled skill '{skill_name}' not found"))?;
+
+    let body = store
+        .read_skill(skill_name)
+        .ok_or_else(|| format!("bundled skill '{skill_name}' body not readable"))?;
+
+    let elig = check_requirements(meta);
+
+    Ok(serde_json::json!({
+        "name": meta.name,
+        "description": meta.description,
+        "category": meta.category,
+        "license": meta.license,
+        "compatibility": meta.compatibility,
+        "allowed_tools": meta.allowed_tools,
+        "requires": meta.requires,
+        "origin": meta.origin,
+        "eligible": elig.eligible,
+        "missing_bins": elig.missing_bins,
+        "install_options": elig.install_options,
+        "trusted": true,
+        "enabled": true,
+        "protected": true,
+        "body": body,
+        "body_html": markdown_to_html(&body),
+        "source": "bundled",
     }))
 }
 

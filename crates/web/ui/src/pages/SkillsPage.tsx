@@ -19,6 +19,7 @@ import { ConfirmDialog, requestConfirm } from "../ui";
 interface SkillSummary {
 	name: string;
 	description?: string;
+	category?: string;
 	source?: string;
 	enabled?: boolean;
 	protected?: boolean;
@@ -845,7 +846,29 @@ function EnabledSkillsTable(): VNode | null {
 	const activeDetail = useSignal<SkillDetail | null>(null);
 	const detailLoading = useSignal(false);
 	const pending = useSignal<string | null>(null);
+	const activeCategory = useSignal<string | null>(null);
+	const searchQuery = useSignal("");
 	if (!s?.length) return null;
+
+	// Build sorted category list from skills
+	const categories = computed(() => {
+		const cats = new Set<string>();
+		for (const sk of enabledSkills.value) {
+			cats.add(sk.category || "other");
+		}
+		return Array.from(cats).sort();
+	});
+
+	// Filter skills by search query and active category
+	const filtered = s.filter((sk) => {
+		if (activeCategory.value && (sk.category || "other") !== activeCategory.value) return false;
+		if (searchQuery.value) {
+			const q = searchQuery.value.toLowerCase();
+			return sk.name.toLowerCase().includes(q) || (sk.description || "").toLowerCase().includes(q);
+		}
+		return true;
+	});
+
 	function isDisc(sk: SkillSummary): boolean {
 		return sk.source === "personal" || sk.source === "project";
 	}
@@ -887,7 +910,51 @@ function EnabledSkillsTable(): VNode | null {
 	}
 	return (
 		<div className="skills-section">
-			<h3 className="skills-section-title">Enabled Skills</h3>
+			<div className="flex items-center gap-3 mb-2">
+				<h3 className="skills-section-title" style={{ margin: 0 }}>
+					Enabled Skills
+					<span className="ml-2 text-xs font-normal text-[var(--muted)]">
+						({filtered.length}
+						{filtered.length !== s.length ? ` of ${s.length}` : ""})
+					</span>
+				</h3>
+				<input
+					type="text"
+					placeholder="Search skills..."
+					value={searchQuery.value}
+					onInput={(e) => {
+						searchQuery.value = (e.target as HTMLInputElement).value;
+					}}
+					className="skills-install-input"
+					style={{ maxWidth: "240px", fontSize: ".78rem", padding: "4px 8px" }}
+				/>
+			</div>
+			{categories.value.length > 1 && (
+				<div className="flex flex-wrap gap-1.5 mb-3">
+					<button
+						className={`skills-category-pill ${activeCategory.value === null ? "active" : ""}`}
+						onClick={() => {
+							activeCategory.value = null;
+						}}
+					>
+						All ({s.length})
+					</button>
+					{categories.value.map((cat) => {
+						const count = s.filter((sk) => (sk.category || "other") === cat).length;
+						return (
+							<button
+								key={cat}
+								className={`skills-category-pill ${activeCategory.value === cat ? "active" : ""}`}
+								onClick={() => {
+									activeCategory.value = activeCategory.value === cat ? null : cat;
+								}}
+							>
+								{cat} ({count})
+							</button>
+						);
+					})}
+				</div>
+			)}
 			<div className="skills-table-wrap">
 				<table style={{ width: "100%", borderCollapse: "collapse", fontSize: ".82rem" }}>
 					<thead>
@@ -932,60 +999,80 @@ function EnabledSkillsTable(): VNode | null {
 						</tr>
 					</thead>
 					<tbody>
-						{s.map((sk) => (
-							<tr
-								key={sk.name}
-								className="cursor-pointer"
-								style={{ borderBottom: "1px solid var(--border)" }}
-								onClick={() => loadDetail(sk)}
-							>
-								<td
-									style={{
-										padding: "8px 12px",
-										fontWeight: 500,
-										color: "var(--accent)",
-										fontFamily: "var(--font-mono)",
-									}}
-								>
-									{sk.name}
-								</td>
-								<td style={{ padding: "8px 12px" }}>{sk.description || "\u2014"}</td>
-								<td style={{ padding: "8px 12px" }}>
-									<span className={sk.source?.includes("/") ? "tier-badge" : "recommended-badge"}>{sk.source}</span>
-								</td>
-								<td style={{ padding: "8px 12px", textAlign: "right" }}>
-									<button
-										disabled={(isDisc(sk) && sk.protected === true) || pending.value === sk.name}
-										className={
-											isDisc(sk)
-												? "provider-btn provider-btn-sm provider-btn-danger"
-												: "provider-btn provider-btn-sm provider-btn-secondary"
-										}
-										onClick={(e) => {
-											e.stopPropagation();
-											onDisable(sk);
+						{filtered.map((sk) => {
+							const isActive = activeDetail.value?.name === sk.name;
+							return (
+								<>
+									<tr
+										key={sk.name}
+										className="cursor-pointer"
+										style={{
+											borderBottom: isActive ? "none" : "1px solid var(--border)",
+											background: isActive ? "var(--bg-hover)" : undefined,
 										}}
+										onClick={() => loadDetail(sk)}
 									>
-										{pending.value === sk.name ? "..." : isDisc(sk) ? "Delete" : "Disable"}
-									</button>
-								</td>
-							</tr>
-						))}
+										<td
+											style={{
+												padding: "8px 12px",
+												fontWeight: 500,
+												color: "var(--accent)",
+												fontFamily: "var(--font-mono)",
+											}}
+										>
+											{sk.name}
+											{sk.category && !activeCategory.value && (
+												<span className="skills-category-badge">{sk.category}</span>
+											)}
+										</td>
+										<td style={{ padding: "8px 12px" }}>{sk.description || "\u2014"}</td>
+										<td style={{ padding: "8px 12px" }}>
+											<span className={sk.source?.includes("/") ? "tier-badge" : "recommended-badge"}>{sk.source}</span>
+										</td>
+										<td style={{ padding: "8px 12px", textAlign: "right" }}>
+											{sk.source !== "bundled" && (
+												<button
+													disabled={(isDisc(sk) && sk.protected === true) || pending.value === sk.name}
+													className={
+														isDisc(sk)
+															? "provider-btn provider-btn-sm provider-btn-danger"
+															: "provider-btn provider-btn-sm provider-btn-secondary"
+													}
+													onClick={(e) => {
+														e.stopPropagation();
+														onDisable(sk);
+													}}
+												>
+													{pending.value === sk.name ? "..." : isDisc(sk) ? "Delete" : "Disable"}
+												</button>
+											)}
+										</td>
+									</tr>
+									{isActive && activeDetail.value && (
+										<tr key={`${sk.name}-detail`}>
+											<td colSpan={4} style={{ padding: 0, borderBottom: "1px solid var(--border)" }}>
+												<SkillDetailPanel
+													detail={activeDetail.value}
+													repoSource={activeDetail.value.source}
+													onClose={() => {
+														activeDetail.value = null;
+													}}
+													onReload={() =>
+														loadDetail({
+															name: activeDetail.value?.name,
+															source: activeDetail.value?.source,
+														} as SkillSummary)
+													}
+												/>
+											</td>
+										</tr>
+									)}
+								</>
+							);
+						})}
 					</tbody>
 				</table>
 			</div>
-			{activeDetail.value && (
-				<SkillDetailPanel
-					detail={activeDetail.value}
-					repoSource={activeDetail.value.source}
-					onClose={() => {
-						activeDetail.value = null;
-					}}
-					onReload={() =>
-						loadDetail({ name: activeDetail.value?.name, source: activeDetail.value?.source } as SkillSummary)
-					}
-				/>
-			)}
 		</div>
 	);
 }

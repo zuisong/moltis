@@ -30,13 +30,32 @@ const SIDECAR_SUBDIRS: &[&str] = moltis_skills::SIDECAR_SUBDIRS;
 /// filesystem MCP server to load `SKILL.md` by absolute path.
 pub struct ReadSkillTool {
     discoverer: Arc<dyn SkillDiscoverer>,
+    #[cfg(feature = "bundled-skills")]
+    bundled_store: Option<Arc<moltis_skills::bundled::BundledSkillStore>>,
 }
 
 impl ReadSkillTool {
     /// Construct a `ReadSkillTool` backed by the given discoverer.
     #[must_use]
     pub fn new(discoverer: Arc<dyn SkillDiscoverer>) -> Self {
-        Self { discoverer }
+        Self {
+            discoverer,
+            #[cfg(feature = "bundled-skills")]
+            bundled_store: None,
+        }
+    }
+
+    /// Construct a `ReadSkillTool` with bundled skill support.
+    #[cfg(feature = "bundled-skills")]
+    #[must_use]
+    pub fn with_bundled(
+        discoverer: Arc<dyn SkillDiscoverer>,
+        bundled_store: Arc<moltis_skills::bundled::BundledSkillStore>,
+    ) -> Self {
+        Self {
+            discoverer,
+            bundled_store: Some(bundled_store),
+        }
     }
 
     /// Convenience constructor that uses default filesystem paths.
@@ -44,7 +63,11 @@ impl ReadSkillTool {
     pub fn with_default_paths() -> Self {
         use moltis_skills::discover::FsSkillDiscoverer;
         let discoverer = Arc::new(FsSkillDiscoverer::new(FsSkillDiscoverer::default_paths()));
-        Self { discoverer }
+        Self {
+            discoverer,
+            #[cfg(feature = "bundled-skills")]
+            bundled_store: None,
+        }
     }
 }
 
@@ -89,7 +112,11 @@ impl AgentTool for ReadSkillTool {
             .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::message("missing 'name'"))?;
-        let file_path = params.get("file_path").and_then(|v| v.as_str());
+        // Treat empty string the same as absent — models often send "" instead of omitting.
+        let file_path = params
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
 
         let skills = self.discoverer.discover().await?;
         let meta = skills.iter().find(|s| s.name == name).ok_or_else(|| {
@@ -104,6 +131,23 @@ impl AgentTool for ReadSkillTool {
                  in <available_skills>."
             ))
         })?;
+
+        // Check requirements and provide install instructions if missing.
+        let install_note = if file_path.is_none() {
+            auto_install_requirements(meta).await
+        } else {
+            None
+        };
+
+        // Bundled skills are served from the embedded store, not the filesystem.
+        #[cfg(feature = "bundled-skills")]
+        if meta.source.as_ref() == Some(&SkillSource::Bundled)
+            && let Some(ref store) = self.bundled_store
+        {
+            let mut result = read_bundled(name, meta, store, file_path)?;
+            inject_install_note(&mut result, &install_note);
+            return Ok(result);
+        }
 
         if let Some(rel) = file_path {
             if meta.source.as_ref() == Some(&SkillSource::Plugin)
@@ -121,7 +165,9 @@ impl AgentTool for ReadSkillTool {
             return read_sidecar(name, &meta.path, rel).await;
         }
 
-        read_primary(name, meta).await
+        let mut result = read_primary(name, meta).await?;
+        inject_install_note(&mut result, &install_note);
+        Ok(result)
     }
 }
 
@@ -220,6 +266,7 @@ async fn read_primary(
         Some(SkillSource::Personal) => "personal",
         Some(SkillSource::Plugin) => "plugin",
         Some(SkillSource::Registry) => "registry",
+        Some(SkillSource::Bundled) => "bundled",
         None => "unknown",
     };
 
@@ -465,4 +512,148 @@ async fn collect_sidecar_entries(skill_dir: &Path) -> crate::Result<Vec<SidecarE
     }
 
     Ok(out)
+}
+
+// ── Bundled skill reading ──────────────────────────────────────────────────
+
+/// Read a bundled skill from the embedded store (no filesystem I/O).
+#[cfg(feature = "bundled-skills")]
+fn read_bundled(
+    name: &str,
+    meta: &moltis_skills::types::SkillMetadata,
+    store: &moltis_skills::bundled::BundledSkillStore,
+    file_path: Option<&str>,
+) -> anyhow::Result<Value> {
+    if let Some(rel) = file_path {
+        let rel_normalized = normalize_relative_skill_file_path(rel)
+            .map_err(|e| Error::message(format!("invalid file_path: {e}")))?;
+        let rel = rel_normalized.to_str().unwrap_or(rel);
+
+        return match store.read_sidecar(name, rel) {
+            Some((bytes, true)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                Ok(json!({
+                    "name": name,
+                    "file_path": rel,
+                    "bytes": bytes.len(),
+                    "content": text,
+                    "is_binary": false,
+                }))
+            },
+            Some((bytes, false)) => Ok(json!({
+                "name": name,
+                "file_path": rel,
+                "bytes": bytes.len(),
+                "is_binary": true,
+                "note": format!("Binary file ({} bytes). Contents omitted.", bytes.len()),
+            })),
+            None => {
+                let available = store.list_sidecars(name);
+                let hint = if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|(p, _)| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                Err(Error::message(format!(
+                    "sidecar file '{rel}' not found in bundled skill '{name}'. \
+                     Available sidecar files: {hint}"
+                ))
+                .into())
+            },
+        };
+    }
+
+    let body = store
+        .read_skill(name)
+        .ok_or_else(|| Error::message(format!("bundled skill '{name}' body not readable")))?;
+
+    let linked: Vec<Value> = store
+        .list_sidecars(name)
+        .into_iter()
+        .map(|(path, bytes)| json!({"path": path, "bytes": bytes}))
+        .collect();
+
+    let mut response = serde_json::Map::new();
+    response.insert("name".into(), json!(name));
+    response.insert("description".into(), json!(meta.description));
+    response.insert("source".into(), json!("bundled"));
+    if let Some(ref cat) = meta.category {
+        response.insert("category".into(), json!(cat));
+    }
+    response.insert("body".into(), json!(body));
+    response.insert("bytes".into(), json!(body.len()));
+
+    if let Some(display_name) = &meta.display_name {
+        response.insert("display_name".into(), json!(display_name));
+    }
+    if let Some(license) = &meta.license {
+        response.insert("license".into(), json!(license));
+    }
+    if let Some(homepage) = &meta.homepage {
+        response.insert("homepage".into(), json!(homepage));
+    }
+    if let Some(origin) = &meta.origin {
+        response.insert("origin".into(), json!(origin));
+    }
+    if !meta.allowed_tools.is_empty() {
+        response.insert("allowed_tools".into(), json!(meta.allowed_tools));
+    }
+    if !linked.is_empty() {
+        response.insert(
+            "usage_hint".into(),
+            json!(
+                "To view a linked file, call read_skill again with file_path \
+                 set to one of the paths in linked_files."
+            ),
+        );
+    }
+    response.insert("linked_files".into(), json!(linked));
+
+    Ok(Value::Object(response))
+}
+
+// ── Install requirements ───────────────────────────────────────────────────
+
+/// Check skill requirements and return install instructions if binaries are
+/// missing. Does NOT run the install — the agent should run the commands via
+/// `exec` so they execute in the correct environment (sandbox or host).
+async fn auto_install_requirements(meta: &moltis_skills::types::SkillMetadata) -> Option<String> {
+    use moltis_skills::requirements::{check_requirements, install_command_preview};
+
+    let elig = check_requirements(meta);
+    if elig.eligible || elig.install_options.is_empty() {
+        return None;
+    }
+
+    let commands: Vec<String> = elig
+        .install_options
+        .iter()
+        .filter_map(|spec| install_command_preview(spec).ok())
+        .collect();
+
+    if commands.is_empty() {
+        return Some(format!(
+            "Missing binaries: {}. No install instructions available.",
+            elig.missing_bins.join(", ")
+        ));
+    }
+
+    Some(format!(
+        "Missing binaries: {}. Install with: {}",
+        elig.missing_bins.join(", "),
+        commands.join(" OR ")
+    ))
+}
+
+/// Inject an install note into a skill read response.
+fn inject_install_note(result: &mut Value, note: &Option<String>) {
+    if let Some(msg) = note
+        && let Some(obj) = result.as_object_mut()
+    {
+        obj.insert("install_note".into(), json!(msg));
+    }
 }
