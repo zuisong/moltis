@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260421.03] - 2026-04-21
+### Fixed
+- [ci] Restore original step order, fix gix open, revert npm flag
+
 ## [20260421.02] - 2026-04-21
 ### Fixed
 - [ci] Gix safe.directory, read_ops file_path regression, npm --ignore-scripts
