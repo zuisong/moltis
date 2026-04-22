@@ -17,7 +17,7 @@ fn test_sandbox_scope_display() {
 
 #[test]
 fn test_docker_hardening_args_prebuilt() {
-    let args = DockerSandbox::hardening_args(true, BackendKind::Docker);
+    let args = DockerSandbox::hardening_args(true, BackendKind::Docker, false);
     assert!(args.contains(&"--cap-drop".to_string()));
     assert!(args.contains(&"ALL".to_string()));
     assert!(args.contains(&"--security-opt".to_string()));
@@ -44,7 +44,7 @@ fn test_docker_hardening_args_prebuilt() {
 
 #[test]
 fn test_docker_hardening_args_not_prebuilt() {
-    let args = DockerSandbox::hardening_args(false, BackendKind::Docker);
+    let args = DockerSandbox::hardening_args(false, BackendKind::Docker, false);
     assert!(args.contains(&"--cap-drop".to_string()));
     assert!(args.contains(&"ALL".to_string()));
     assert!(args.contains(&"--security-opt".to_string()));
@@ -71,7 +71,7 @@ fn test_docker_hardening_args_not_prebuilt() {
 
 #[test]
 fn test_docker_hardening_args_podman() {
-    let args = DockerSandbox::hardening_args(true, BackendKind::Podman);
+    let args = DockerSandbox::hardening_args(true, BackendKind::Podman, false);
     // Core hardening flags must still be present
     assert!(args.contains(&"--cap-drop".to_string()));
     assert!(args.contains(&"ALL".to_string()));
@@ -95,6 +95,69 @@ fn test_docker_hardening_args_podman() {
     assert!(!args.contains(&"/sys/class/dmi:ro,nosuid".to_string()));
     assert!(!args.contains(&"/sys/devices/virtual/dmi:ro,nosuid".to_string()));
     assert!(!args.contains(&"/sys/class/block:ro,nosuid".to_string()));
+}
+
+#[test]
+fn test_docker_hardening_args_skips_sysfs_on_wsl() {
+    // On WSL2 the sysfs directories (/sys/class/dmi, /sys/devices/virtual/dmi,
+    // etc.) may not exist inside the container's sysfs, so Docker cannot create
+    // tmpfs mountpoints on the read-only overlayfs.  hardening_args must skip
+    // sysfs masks when `skip_sysfs_mounts` is true.
+    let args = DockerSandbox::hardening_args(true, BackendKind::Docker, true);
+
+    // Core hardening flags must still be present
+    assert!(args.contains(&"--cap-drop".to_string()));
+    assert!(args.contains(&"ALL".to_string()));
+    assert!(args.contains(&"--security-opt".to_string()));
+    assert!(args.contains(&"no-new-privileges".to_string()));
+    assert!(args.contains(&"--read-only".to_string()));
+    // Basic tmpfs mounts (writable /tmp and /run) must still be present
+    assert!(args.contains(&"/tmp:rw,nosuid,size=256m".to_string()));
+    assert!(args.contains(&"/run:rw,nosuid,size=64m".to_string()));
+    // Hostname isolation still present
+    let hostname_pos = args
+        .iter()
+        .position(|a| a == "--hostname")
+        .expect("--hostname flag missing");
+    assert_eq!(
+        args[hostname_pos + 1],
+        "sandbox",
+        "--hostname value should be 'sandbox'"
+    );
+    // Sysfs tmpfs overlays must NOT be present (WSL2 compat)
+    assert!(!args.contains(&"/sys/firmware:ro,nosuid".to_string()));
+    assert!(!args.contains(&"/sys/class/dmi:ro,nosuid".to_string()));
+    assert!(!args.contains(&"/sys/devices/virtual/dmi:ro,nosuid".to_string()));
+    assert!(!args.contains(&"/sys/class/block:ro,nosuid".to_string()));
+}
+
+#[test]
+fn test_is_wsl_returns_false_on_non_wsl() {
+    // On macOS and standard Linux CI, is_wsl() must return false.
+    // Note: uses the OnceLock-cached value — this test assumes it does not
+    // run on an actual WSL2 host.
+    assert!(!is_wsl());
+}
+
+#[test]
+fn test_detect_wsl_from_path_positive() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proc_version");
+    std::fs::write(&path, "Linux version 5.15.167.4-microsoft-standard-WSL2").unwrap();
+    assert!(detect_wsl_from_path(path.to_str().unwrap()));
+}
+
+#[test]
+fn test_detect_wsl_from_path_negative() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("proc_version");
+    std::fs::write(&path, "Linux version 6.8.0-45-generic (buildd@lcy02-amd64)").unwrap();
+    assert!(!detect_wsl_from_path(path.to_str().unwrap()));
+}
+
+#[test]
+fn test_detect_wsl_from_path_missing_file() {
+    assert!(!detect_wsl_from_path("/nonexistent/path/proc/version"));
 }
 
 #[test]
