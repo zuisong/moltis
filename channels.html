@@ -196,6 +196,7 @@ capabilities that control what features are available.</p>
 <tr><td>WhatsApp</td><td>Gateway (WebSocket)</td><td>No</td><td>Streaming, voice ingest, OTP, pairing, location</td></tr>
 <tr><td>Slack</td><td>Socket Mode</td><td>No</td><td>Streaming, interactive messages, threads, reactions</td></tr>
 <tr><td>Nostr</td><td>Gateway (relay subscription)</td><td>No</td><td>OTP, encrypted DMs (NIP-04)</td></tr>
+<tr><td>Signal</td><td>Gateway (signal-cli SSE)</td><td>No</td><td>OTP, DMs, groups, outbound text</td></tr>
 </tbody></table>
 </div>
 <h2 id="inbound-modes"><a class="header" href="#inbound-modes">Inbound Modes</a></h2>
@@ -274,10 +275,15 @@ user_id = "@bot:example.com"
 
 [channels.whatsapp.my_wa]
 dm_policy = "open"
+
+[channels.signal.my_signal]
+account = "+15551234567"
+http_url = "http://127.0.0.1:8080"
 </code></pre>
 <p>For detailed configuration, see the per-channel pages:
 <a href="telegram.html">Telegram</a>, <a href="teams.html">Microsoft Teams</a>, <a href="discord.html">Discord</a>,
-<a href="slack.html">Slack</a>, <a href="matrix.html">Matrix</a>, <a href="whatsapp.html">WhatsApp</a>.</p>
+<a href="slack.html">Slack</a>, <a href="matrix.html">Matrix</a>, <a href="whatsapp.html">WhatsApp</a>,
+<a href="nostr.html">Nostr</a>, <a href="signal.html">Signal</a>.</p>
 <p>You can also use the web UI’s <strong>Channels</strong> tab for guided setup with each platform. Web-added channels do not get written back into <code>moltis.toml</code>.</p>
 <p>For Matrix specifically, the web UI now supports the full normal setup flow:</p>
 <ul>

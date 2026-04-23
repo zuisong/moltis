@@ -690,8 +690,8 @@
 <h2 id="channels--integrations"><a class="header" href="#channels--integrations">Channels &amp; Integrations</a></h2>
 <h3 id="channels--channelsconfig"><a class="header" href="#channels--channelsconfig"><code>channels</code> — ChannelsConfig</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>offered</code></td><td>array of string</td><td><code>["telegram", "msteams", "discord", "slack", "matrix", "nostr"]</code></td><td>Which channel types are offered in the web UI (onboarding + channels page). Add <code>"whatsapp"</code> to opt in.</td></tr>
-<tr><td><code>&lt;channel_type&gt;</code></td><td>map of <code>serde_json::Value</code></td><td><code>{}</code></td><td>Account configs keyed by account name. Known types: <code>telegram</code>, <code>whatsapp</code>, <code>msteams</code>, <code>discord</code>, <code>slack</code>, <code>nostr</code>. Additional types accepted via flatten.</td></tr>
+<tr><td><code>offered</code></td><td>array of string</td><td><code>["telegram", "whatsapp", "msteams", "discord", "slack", "matrix", "nostr", "signal"]</code></td><td>Which channel types are offered in the web UI (onboarding + channels page).</td></tr>
+<tr><td><code>&lt;channel_type&gt;</code></td><td>map of <code>serde_json::Value</code></td><td><code>{}</code></td><td>Account configs keyed by account name. Known types: <code>telegram</code>, <code>whatsapp</code>, <code>msteams</code>, <code>discord</code>, <code>slack</code>, <code>matrix</code>, <code>nostr</code>, <code>signal</code>. Additional types accepted via flatten.</td></tr>
 </tbody></table>
 </div>
 <p>Each channel account (<code>channels.&lt;channel_type&gt;.&lt;account_name&gt;</code>) is an arbitrary JSON object that may contain provider-specific keys plus a <code>tools</code> sub-block (see below).</p>
