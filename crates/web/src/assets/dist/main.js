@@ -22859,6 +22859,7 @@ function ServerCard({ server }) {
   const expanded = useSignal(false);
   const tools = useSignal(null);
   const toggling = useSignal(false);
+  const authing = useSignal(false);
   const editing = useSignal(false);
   const editTransport = useSignal("stdio");
   const editCmd = useSignal("");
@@ -22898,6 +22899,19 @@ function ServerCard({ server }) {
     await sendRpc("mcp.restart", { name: server.name });
     showToast$1(`Restarted "${server.name}"`, "success");
     await refreshServers();
+  }
+  async function reauth(e) {
+    var _a2;
+    e.stopPropagation();
+    authing.value = true;
+    const res = await sendRpc("mcp.reauth", { name: server.name, redirectUri: oauthCallbackUrl() });
+    if (res == null ? void 0 : res.ok) {
+      const p = res.payload;
+      showToast$1(`OAuth started for "${server.name}"`, "success");
+      if (p == null ? void 0 : p.authUrl) window.open(p.authUrl, "_blank", "noopener,noreferrer");
+    } else showToast$1(`Re-auth failed: ${((_a2 = res == null ? void 0 : res.error) == null ? void 0 : _a2.message) || "unknown"}`, "error");
+    await refreshServers();
+    authing.value = false;
   }
   function startEdit(e) {
     e.stopPropagation();
@@ -22973,6 +22987,7 @@ function ServerCard({ server }) {
       });
     });
   }
+  const needsReauth = server.auth_state === "awaiting_browser" || server.auth_state === "failed";
   const displayName = server.display_name || server.name;
   const showTechnical = server.display_name && server.display_name !== server.name;
   const currentSafeUrl = typeof server.url === "string" ? server.url.trim() : "";
@@ -22996,9 +23011,11 @@ function ServerCard({ server }) {
           server.tool_count,
           " tool",
           server.tool_count !== 1 ? "s" : ""
-        ] })
+        ] }),
+        needsReauth && /* @__PURE__ */ u("span", { className: "text-[0.62rem] px-1.5 py-px rounded-full bg-[var(--error)] text-white font-medium", children: server.auth_state === "failed" ? "Auth failed" : "OAuth required" })
       ] }),
       /* @__PURE__ */ u("div", { className: "flex items-center gap-1.5", children: [
+        needsReauth && /* @__PURE__ */ u("button", { onClick: reauth, disabled: authing.value, className: "provider-btn provider-btn-sm", children: authing.value ? "…" : "Re-auth" }),
         /* @__PURE__ */ u("button", { onClick: startEdit, className: "provider-btn provider-btn-secondary provider-btn-sm", children: "Edit" }),
         /* @__PURE__ */ u(
           "button",
