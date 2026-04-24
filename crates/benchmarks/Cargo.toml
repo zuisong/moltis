@@ -12,6 +12,7 @@ moltis-agents    = { workspace = true }
 moltis-code-index = { workspace = true }
 moltis-config    = { workspace = true }
 moltis-providers = { workspace = true }
+moltis-qmd       = { optional = true, workspace = true }
 moltis-sessions  = { workspace = true }
 serde_json       = { workspace = true }
 tempfile         = { workspace = true }
@@ -30,7 +31,7 @@ harness = false
 name    = "code_index"
 
 [features]
-qmd = []
+qmd = ["dep:moltis-qmd"]
 
 [lints]
 workspace = true
