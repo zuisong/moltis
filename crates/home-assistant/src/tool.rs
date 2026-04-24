@@ -74,20 +74,20 @@ impl HomeAssistantTool {
         states
             .iter()
             .filter(|s| {
-                if let Some(d) = domain {
-                    if s.domain() != d {
-                        return false;
-                    }
+                if let Some(d) = domain
+                    && s.domain() != d
+                {
+                    return false;
                 }
-                if let Some(a) = area_id {
-                    if s.area_id() != Some(a) {
-                        return false;
-                    }
+                if let Some(a) = area_id
+                    && s.area_id() != Some(a)
+                {
+                    return false;
                 }
-                if let Some(prefix) = entity_id_prefix {
-                    if !s.entity_id.starts_with(prefix) {
-                        return false;
-                    }
+                if let Some(prefix) = entity_id_prefix
+                    && !s.entity_id.starts_with(prefix)
+                {
+                    return false;
                 }
                 true
             })
@@ -501,8 +501,10 @@ mod tests {
     };
 
     fn make_tool(server: &MockServer) -> HomeAssistantTool {
-        let mut config = HomeAssistantConfig::default();
-        config.enabled = true;
+        let mut config = HomeAssistantConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config
             .instances
             .insert("home".to_owned(), HomeAssistantAccountConfig {
@@ -574,8 +576,10 @@ mod tests {
 
     #[test]
     fn from_config_returns_none_when_empty_instances() {
-        let mut config = HomeAssistantConfig::default();
-        config.enabled = true;
+        let config = HomeAssistantConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(HomeAssistantTool::from_config(&config).is_none());
     }
 

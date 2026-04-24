@@ -31,8 +31,10 @@ mod tests {
     use {super::*, secrecy::Secret};
 
     fn make_config() -> HomeAssistantConfig {
-        let mut config = HomeAssistantConfig::default();
-        config.enabled = true;
+        let mut config = HomeAssistantConfig {
+            enabled: true,
+            ..Default::default()
+        };
         config
             .instances
             .insert("home".to_owned(), HomeAssistantAccountConfig {
