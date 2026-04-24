@@ -313,6 +313,7 @@ fn test_runtime_context_injected_when_provided() {
             session_override: Some(true),
         }),
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -372,6 +373,7 @@ fn test_runtime_context_sandbox_without_sudo_omits_sudo_hint() {
             ..Default::default()
         }),
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -408,6 +410,7 @@ fn test_runtime_context_no_sandbox_uses_host_only_routing() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -447,6 +450,7 @@ fn test_runtime_context_no_sandbox_with_sudo_includes_sudo_hint() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -481,6 +485,7 @@ fn test_runtime_context_includes_location_when_set() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -518,6 +523,7 @@ fn test_runtime_context_includes_channel_surface_fields_when_set() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -555,6 +561,7 @@ fn test_runtime_context_omits_location_when_none() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -585,6 +592,7 @@ fn test_minimal_prompt_runtime_does_not_add_exec_routing_block() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_minimal_runtime(
@@ -921,6 +929,7 @@ fn test_system_prompt_does_not_contain_datetime() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let prompt = build_system_prompt_with_session_runtime(
@@ -953,6 +962,7 @@ fn test_runtime_datetime_message_returns_time_when_present() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let msg = runtime_datetime_message(Some(&runtime));
@@ -971,6 +981,7 @@ fn test_runtime_datetime_message_falls_back_to_today() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     let msg = runtime_datetime_message(Some(&runtime));
@@ -983,6 +994,7 @@ fn test_runtime_datetime_message_returns_none_without_time_or_date() {
         host: PromptHostRuntimeContext::default(),
         sandbox: None,
         nodes: None,
+        mode: None,
     };
 
     assert!(runtime_datetime_message(Some(&runtime)).is_none());
@@ -1274,6 +1286,7 @@ fn test_prepend_datetime_to_text_content() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
     let content = UserContent::Text("Hello, what time is it?".into());
     let result = prepend_datetime_to_user_content(&content, Some(&runtime));
@@ -1297,6 +1310,7 @@ fn test_prepend_datetime_to_multimodal_content() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
     let content = UserContent::Multimodal(vec![
         ContentPart::Text("Describe this image".into()),
@@ -1344,6 +1358,7 @@ fn test_prepend_datetime_returns_none_without_time_or_date() {
         host: PromptHostRuntimeContext::default(),
         sandbox: None,
         nodes: None,
+        mode: None,
     };
     let content = UserContent::Text("Hello".into());
     assert!(prepend_datetime_to_user_content(&content, Some(&runtime)).is_none());
@@ -1358,6 +1373,7 @@ fn test_prepend_datetime_falls_back_to_today() {
         },
         sandbox: None,
         nodes: None,
+        mode: None,
     };
     let content = UserContent::Text("What day is it?".into());
     let result = prepend_datetime_to_user_content(&content, Some(&runtime));
