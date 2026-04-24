@@ -348,8 +348,8 @@ required for the current request.</p>
 <tr><td><code>POST /api/auth/login</code></td><td>5 requests per 60 seconds</td></tr>
 <tr><td>Other <code>/api/auth/*</code></td><td>120 requests per 60 seconds</td></tr>
 <tr><td>Other <code>/api/*</code></td><td>180 requests per 60 seconds</td></tr>
-<tr><td><code>/ws/chat</code> upgrade</td><td>30 requests per 60 seconds</td></tr>
-<tr><td><code>/ws</code> upgrade</td><td>30 requests per 60 seconds</td></tr>
+<tr><td><code>/share/*</code></td><td>90 requests per 60 seconds</td></tr>
+<tr><td><code>/ws/*</code></td><td>30 requests per 60 seconds</td></tr>
 </tbody></table>
 </div>
 <p>When a limit is exceeded:</p>

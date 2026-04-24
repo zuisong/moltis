@@ -198,13 +198,15 @@ enforced edits, typed error payloads, and structured audit logs.</p>
 <pre><code class="language-json">{
   "file_path": "/absolute/path/to/file.rs",
   "offset": 1,
-  "limit": 2000
+  "limit": 2000,
+  "pages": "1-5"
 }
 </code></pre>
 <ul>
 <li><code>file_path</code> — absolute path (required). Relative paths are rejected.</li>
 <li><code>offset</code> — 1-indexed line to start at. Default <code>1</code>.</li>
 <li><code>limit</code> — max lines to return. Default <code>2000</code>.</li>
+<li><code>pages</code> — (PDF only) page range to extract, e.g. <code>"1-5"</code>, <code>"3"</code>, or <code>"10-20"</code>. Max 20 pages per request.</li>
 </ul>
 <p>Returns one of the following typed payloads (the <code>kind</code> field is the
 discriminator the LLM branches on):</p>
@@ -218,6 +220,12 @@ numbers), <code>total_lines</code>, <code>rendered_lines</code>, <code>start_lin
 <li><code>kind: "too_large"</code> — file exceeds <code>max_read_bytes</code>.</li>
 <li><code>kind: "not_regular_file"</code> — path is a directory, fifo, socket, etc.</li>
 <li><code>kind: "path_denied"</code> — blocked by <code>[tools.fs]</code> allow/deny rules.</li>
+<li><code>kind: "image"</code> — file detected as a supported image format
+(PNG, JPEG, GIF, WebP). Includes <code>width</code>, <code>height</code>, <code>format</code>, and <code>base64</code>
+data. Images are resized and optimized for LLM consumption.</li>
+<li><code>kind: "pdf"</code> — file detected as PDF. Includes <code>text</code> (extracted content),
+<code>pages</code> (total page count), <code>rendered_pages</code>, and <code>truncated</code>. Supports
+optional <code>pages</code> parameter (e.g. <code>"1-5"</code>) to extract a page range.</li>
 </ul>
 <p>CRLF files are rendered with <code>\r</code> stripped so the line-number column
 aligns correctly; the file on disk is not modified.</p>
@@ -325,6 +333,11 @@ respect_gitignore = true
 # be restored via the `checkpoint_restore` tool. Off by default because
 # checkpoints grow with agent activity.
 checkpoint_before_mutation = false
+
+# Adaptive read sizing: when set, Read caps per-call output so a single
+# call can't consume more than ~20% of the model's working set.
+# Clamped to [50 KB, 512 KB]. When unset, Read uses a fixed 256 KB cap.
+# context_window_tokens = 200000  # e.g. Claude Sonnet
 </code></pre>
 <p><code>require_approval</code> reuses the existing approval queue and WebSocket
 prompting path. If nobody approves the request, the mutation times out

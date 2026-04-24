@@ -204,28 +204,32 @@ shows <code>fork@N</code> where N is the message index at which the fork occurre
 <h2 id="agent-tool"><a class="header" href="#agent-tool">Agent Tool</a></h2>
 <p>The agent can also fork programmatically using the <code>branch_session</code> tool:</p>
 <pre><code class="language-json">{
-  "at_message": 5,
+  "fork_point": 5,
   "label": "explore-alternative"
 }
 </code></pre>
 <ul>
-<li><strong><code>at_message</code></strong> — the message index to fork at (messages 0..N are copied).
-If omitted, all messages are copied.</li>
-<li><strong><code>label</code></strong> — optional human-readable label for the new session.</li>
+<li><strong><code>label</code></strong> — label for the new session (required).</li>
+<li><strong><code>fork_point</code></strong> — the message index to fork at (0-based). Messages at
+indices 0 through N-1 are copied; the message at index N becomes the
+first new message in the forked session. If omitted, all messages are
+copied.</li>
 </ul>
-<p>The tool returns the new session key.</p>
+<p>The tool returns <code>{ "key": "&lt;session-key&gt;", "forkPoint": N }</code>.</p>
 <h2 id="rpc-method"><a class="header" href="#rpc-method">RPC Method</a></h2>
 <p>The <code>sessions.fork</code> RPC method is the underlying mechanism:</p>
-<pre><code class="language-json">{ "key": "main", "at_message": 5, "label": "my-fork" }
+<pre><code class="language-json">{ "key": "main", "forkPoint": 5, "label": "my-fork" }
 </code></pre>
-<p>On success the response payload contains <code>{ "sessionKey": "session:&lt;uuid&gt;" }</code>.</p>
+<p>On success the response payload contains <code>{ "sessionKey": "session:&lt;uuid&gt;", "forkPoint": N, "label": "..." }</code>.</p>
 <h2 id="what-gets-inherited"><a class="header" href="#what-gets-inherited">What Gets Inherited</a></h2>
 <p>When forking, the new session inherits:</p>
 <div class="table-wrapper"><table><thead><tr><th>Inherited</th><th>Not inherited</th></tr></thead><tbody>
 <tr><td>Messages (up to fork point)</td><td>Worktree branch</td></tr>
 <tr><td>Model selection</td><td>Sandbox settings</td></tr>
 <tr><td>Project assignment</td><td>Channel binding</td></tr>
+<tr><td>Agent ID</td><td></td></tr>
 <tr><td>MCP disabled flag</td><td></td></tr>
+<tr><td>Node assignment</td><td></td></tr>
 </tbody></table>
 </div>
 <h2 id="parent-child-relationships"><a class="header" href="#parent-child-relationships">Parent-Child Relationships</a></h2>
