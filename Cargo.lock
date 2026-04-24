@@ -1016,6 +1016,7 @@ dependencies = [
  "moltis-code-index",
  "moltis-config",
  "moltis-providers",
+ "moltis-qmd",
  "moltis-sessions",
  "serde_json",
  "tempfile",
