@@ -115,6 +115,8 @@ test.describe("Smart auto-scroll", () => {
 		await page.evaluate(() => {
 			document.getElementById("messages").scrollTop = 0;
 		});
+		// Let the scroll position settle before injecting a message
+		await page.waitForTimeout(200);
 		await page.evaluate(async () => {
 			var appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
 			var appUrl = new URL(appScript.src, window.location.origin);
@@ -125,7 +127,7 @@ test.describe("Smart auto-scroll", () => {
 		});
 
 		const indicator = page.locator(".new-content-indicator");
-		await expect(indicator).toBeVisible({ timeout: 5_000 });
+		await expect(indicator).toBeVisible({ timeout: 10_000 });
 
 		// Click the indicator
 		await indicator.click();

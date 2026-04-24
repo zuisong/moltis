@@ -1576,7 +1576,9 @@ jobs:
           git push
 
   update-deploy-tags:
-    needs: merge-docker
+    needs:
+      - upload-release
+      - merge-docker
     if: startsWith(github.ref, 'refs/tags/') && !(github.event_name == 'workflow_dispatch' && (inputs.dry_run || inputs.pre_release))
     runs-on: ubuntu-latest
     name: Update deploy template tags

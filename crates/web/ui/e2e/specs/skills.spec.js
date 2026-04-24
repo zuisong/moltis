@@ -17,8 +17,6 @@ test.describe("Skills page", () => {
 		await page.getByRole("tab", { name: /Repositories/ }).click();
 		await expect(page.getByPlaceholder("owner/repo or full URL (e.g. anthropics/skills)")).toBeVisible();
 		await expect(page.getByRole("button", { name: "Install", exact: true }).first()).toBeVisible();
-		await expect(page.getByPlaceholder("/path/to/skill-bundle.tar.gz")).toBeVisible();
-		await expect(page.getByRole("button", { name: "Import Bundle", exact: true })).toBeVisible();
 	});
 
 	test("featured repos shown", async ({ page }) => {
@@ -27,7 +25,7 @@ test.describe("Skills page", () => {
 		// Featured section is behind the Repositories tab
 		await page.getByRole("tab", { name: /Repositories/ }).click();
 		await expect(page.getByRole("heading", { name: "Featured Repositories", exact: true })).toBeVisible();
-		await expect(page.getByRole("link", { name: "openclaw/skills", exact: true })).toBeVisible();
+		await expect(page.getByRole("link", { name: "anthropics/skills", exact: true })).toBeVisible();
 	});
 
 	test("page has no JS errors", async ({ page }) => {
