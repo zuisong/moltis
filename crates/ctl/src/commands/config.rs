@@ -37,7 +37,7 @@ pub async fn run(client: &mut CtlClient, cmd: ConfigCommand) -> anyhow::Result<V
         },
         ConfigCommand::Set { key, value } => {
             let parsed: Value =
-                serde_json::from_str(&value).unwrap_or_else(|_| Value::String(value));
+                serde_json::from_str(&value).unwrap_or(Value::String(value));
             client
                 .call("config.set", json!({ "key": key, "value": parsed }))
                 .await
