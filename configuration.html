@@ -184,14 +184,49 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="configuration"><a class="header" href="#configuration">Configuration</a></h1>
-<p>Moltis is configured through <code>moltis.toml</code>, located in <code>~/.config/moltis/</code> by default.</p>
-<p>On first run, a complete configuration file is generated with sensible defaults. You can edit it to customize behavior.</p>
+<p>Moltis uses a <strong>layered config model</strong> with two files:</p>
+<div class="table-wrapper"><table><thead><tr><th>File</th><th>Owner</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>defaults.toml</code></td><td><strong>Moltis</strong></td><td>Shipped defaults, regenerated on every startup</td></tr>
+<tr><td><code>moltis.toml</code></td><td><strong>You</strong></td><td>Your overrides only</td></tr>
+</tbody></table>
+</div>
+<p>On first run, both files are created in <code>~/.config/moltis/</code>. Your <code>moltis.toml</code>
+starts nearly empty — only the installation-specific port is set. All other
+settings inherit from <code>defaults.toml</code> automatically.</p>
+<h2 id="merge-order"><a class="header" href="#merge-order">Merge Order</a></h2>
+<p>Settings are resolved in this order (later wins):</p>
+<ol>
+<li><strong>Built-in defaults</strong> — compiled into Moltis (<code>MoltisConfig::default()</code>)</li>
+<li><strong><code>defaults.toml</code></strong> — Moltis-managed, refreshed on every startup</li>
+<li><strong><code>moltis.toml</code></strong> — your overrides (additive deep merge)</li>
+<li><strong><code>MOLTIS_*</code> environment variables</strong> — highest precedence</li>
+</ol>
+<p>This means you only need to put values in <code>moltis.toml</code> that you intentionally
+want to differ from the shipped defaults. When Moltis upgrades and improves a
+default, your installation picks it up automatically — unless you’ve overridden
+that specific setting.</p>
+<div id="admonition-dont-copy-defaults-into-moltistoml" class="admonition admonish-tip" role="note" aria-labelledby="admonition-dont-copy-defaults-into-moltistoml-title">
+<div class="admonition-title">
+<div id="admonition-dont-copy-defaults-into-moltistoml-title">
+<p>Don’t copy defaults into moltis.toml</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-dont-copy-defaults-into-moltistoml"></a>
+</div>
+<div>
+<p>Copying a built-in default into <code>moltis.toml</code> “freezes” it — future built-in
+improvements for that setting won’t apply. The Settings UI shows <strong>Built-in</strong>,
+<strong>Overridden</strong>, and <strong>Custom</strong> badges so you can see which values are yours
+and which are inherited.</p>
+</div>
+</div>
 <h2 id="configuration-file-location"><a class="header" href="#configuration-file-location">Configuration File Location</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Platform</th><th>Default Path</th></tr></thead><tbody>
 <tr><td>macOS/Linux</td><td><code>~/.config/moltis/moltis.toml</code></td></tr>
 <tr><td>Custom</td><td>Set via <code>--config-dir</code> or <code>MOLTIS_CONFIG_DIR</code></td></tr>
 </tbody></table>
 </div>
+<p>The <code>defaults.toml</code> file lives in the same directory. Do not edit it — your
+changes will be overwritten on the next startup.</p>
 <h2 id="basic-settings"><a class="header" href="#basic-settings">Basic Settings</a></h2>
 <pre><code class="language-toml">[server]
 port = 13131                    # HTTP/WebSocket port

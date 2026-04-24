@@ -243,6 +243,8 @@
 <li><a href="#chatcompaction"><code>chat.compaction</code></a></li>
 <li><a href="#agents"><code>agents</code></a></li>
 <li><a href="#agentspresetsname"><code>agents.presets.&lt;name&gt;</code></a></li>
+<li><a href="#modes"><code>modes</code></a></li>
+<li><a href="#modespresetsname"><code>modes.presets.&lt;name&gt;</code></a></li>
 <li><a href="#skills"><code>skills</code></a></li>
 </ul>
 </li>
@@ -460,8 +462,8 @@
 </div>
 <h3 id="agents--agentsconfig"><a class="header" href="#agents--agentsconfig"><code>agents</code> — AgentsConfig</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>default_preset</code></td><td>optional string</td><td><code>null</code></td><td>Default preset name used when <code>spawn_agent.preset</code> is omitted. Applies only to sub-agents.</td></tr>
-<tr><td><code>presets</code></td><td>map of <code>AgentPreset</code></td><td><code>{}</code></td><td>Named spawn presets, keyed by name.</td></tr>
+<tr><td><code>default_preset</code></td><td>optional string</td><td><code>"research"</code></td><td>Default preset name used when <code>spawn_agent.preset</code> is omitted. Applies only to sub-agents.</td></tr>
+<tr><td><code>presets</code></td><td>map of <code>AgentPreset</code></td><td>built-in presets</td><td>Named spawn presets, keyed by name. Built-ins: <code>research</code>, <code>coder</code>, <code>reviewer</code>, <code>qa</code>, <code>ux</code>, <code>docs</code>, <code>coordinator</code>.</td></tr>
 </tbody></table>
 </div>
 <h3 id="agentspresetsname--agentpreset"><a class="header" href="#agentspresetsname--agentpreset"><code>agents.presets.&lt;name&gt;</code> — AgentPreset</a></h3>
@@ -497,6 +499,20 @@
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>scope</code></td><td>enum: <code>user</code>, <code>project</code>, <code>local</code></td><td><code>"user"</code></td><td>Memory scope: <code>user</code> stores in <code>~/.moltis/agent-memory/&lt;preset&gt;/</code>, <code>project</code> in <code>.moltis/agent-memory/&lt;preset&gt;/</code>, <code>local</code> in <code>.moltis/agent-memory-local/&lt;preset&gt;/</code>.</td></tr>
 <tr><td><code>max_lines</code></td><td>integer</td><td><code>200</code></td><td>Maximum lines to load from <code>MEMORY.md</code>.</td></tr>
+</tbody></table>
+</div>
+<h3 id="modes--modesconfig"><a class="header" href="#modes--modesconfig"><code>modes</code> — ModesConfig</a></h3>
+<p>Modes are temporary per-session prompt overlays selected with <code>/mode</code>. They do
+not create chat agents, change memory, or affect <code>spawn_agent</code> presets.</p>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>presets</code></td><td>map of <code>ModePreset</code></td><td>built-in presets</td><td>Named mode presets. Built-ins: <code>concise</code>, <code>technical</code>, <code>creative</code>, <code>teacher</code>, <code>plan</code>, <code>build</code>, <code>review</code>, <code>research</code>, <code>elevated</code>.</td></tr>
+</tbody></table>
+</div>
+<h3 id="modespresetsname--modepreset"><a class="header" href="#modespresetsname--modepreset"><code>modes.presets.&lt;name&gt;</code> — ModePreset</a></h3>
+<div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>name</code></td><td>optional string</td><td><code>null</code></td><td>Display name shown in the UI and <code>/mode</code> list.</td></tr>
+<tr><td><code>description</code></td><td>optional string</td><td><code>null</code></td><td>Short user-facing summary.</td></tr>
+<tr><td><code>prompt</code></td><td>string</td><td><code>""</code></td><td>Prompt overlay injected into the active session while this mode is selected.</td></tr>
 </tbody></table>
 </div>
 <h3 id="skills--skillsconfig"><a class="header" href="#skills--skillsconfig"><code>skills</code> — SkillsConfig</a></h3>

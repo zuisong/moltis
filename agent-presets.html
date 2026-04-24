@@ -186,14 +186,33 @@
                         <h1 id="agent-presets"><a class="header" href="#agent-presets">Agent Presets</a></h1>
 <p>Agent presets let <code>spawn_agent</code> run sub-agents with role-specific configuration.
 Use them to control model cost, tool access, session visibility, and behavior.</p>
+<p>They are different from <a href="modes.html">modes</a>: modes are temporary overlays for the
+current chat session, while agent presets configure delegated sub-agents.</p>
+<h2 id="built-in-presets"><a class="header" href="#built-in-presets">Built-In Presets</a></h2>
+<p>Moltis ships with these presets on every install:</p>
+<div class="table-wrapper"><table><thead><tr><th>Preset</th><th>Role</th></tr></thead><tbody>
+<tr><td><code>research</code></td><td>Evidence gathering and synthesis. This is the default when <code>spawn_agent.preset</code> is omitted.</td></tr>
+<tr><td><code>coder</code></td><td>Scoped implementation, debugging, cleanup, and focused verification.</td></tr>
+<tr><td><code>reviewer</code></td><td>Code review for correctness, regressions, security, and missing tests.</td></tr>
+<tr><td><code>qa</code></td><td>End-to-end behavior validation, repro steps, and pass/fail reporting.</td></tr>
+<tr><td><code>ux</code></td><td>UX, accessibility, interaction, and visual quality review.</td></tr>
+<tr><td><code>docs</code></td><td>User-facing documentation, examples, and config reference updates.</td></tr>
+<tr><td><code>coordinator</code></td><td>Delegation-first planning and result integration.</td></tr>
+</tbody></table>
+</div>
+<p>User TOML presets and markdown agent definitions with the same name override
+the built-in preset. The built-ins do not set a model or tool allow/deny
+policy, so they inherit the session’s provider and normal tool access. The
+<code>coordinator</code> preset sets <code>delegate_only = true</code>, restricting it to delegation,
+session, and task-list tools.</p>
 <h2 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h2>
 <pre><code class="language-toml">[agents.presets.researcher]
 identity.name = "scout"
 identity.emoji = "🔍"
 identity.theme = "thorough and methodical"
 model = "anthropic/claude-haiku-3-5-20241022"
-tools.allow = ["read_file", "glob", "grep", "web_search", "web_fetch"]
-tools.deny = ["exec", "write_file"]
+tools.allow = ["Read", "Glob", "Grep", "web_search", "web_fetch"]
+tools.deny = ["exec", "Write"]
 system_prompt_suffix = "Gather facts and report clearly."
 
 [agents.presets.coordinator]

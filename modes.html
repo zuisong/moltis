@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Quickstart - Moltis Documentation</title>
+        <title>Modes - Moltis Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -149,7 +149,7 @@
                         <a href="https://github.com/moltis-org/moltis" title="Git repository" aria-label="Git repository">
                             <i id="git-repository-button" class="fa fa-github"></i>
                         </a>
-                        <a href="https://github.com/moltis-org/moltis/edit/main/docs/src/src/quickstart.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/moltis-org/moltis/edit/main/docs/src/src/modes.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <i id="git-edit-button" class="fa fa-edit"></i>
                         </a>
 
@@ -183,133 +183,52 @@
 
                 <div id="content" class="content">
                     <main>
-                        <h1 id="quickstart"><a class="header" href="#quickstart">Quickstart</a></h1>
-<p>Get Moltis running in under 5 minutes.</p>
-<h2 id="1-install"><a class="header" href="#1-install">1. Install</a></h2>
-<pre><code class="language-bash">curl -fsSL https://www.moltis.org/install.sh | sh
-</code></pre>
-<p>Or via Homebrew:</p>
-<pre><code class="language-bash">brew install moltis-org/tap/moltis
-</code></pre>
-<h2 id="2-start"><a class="header" href="#2-start">2. Start</a></h2>
-<pre><code class="language-bash">moltis
-</code></pre>
-<p>You’ll see output like:</p>
-<pre><code>🚀 Moltis gateway starting...
-🌐 Open http://localhost:13131 in your browser
-</code></pre>
-<h2 id="3-configure-a-provider"><a class="header" href="#3-configure-a-provider">3. Configure a Provider</a></h2>
-<p>You need an LLM provider configured to chat. The fastest options:</p>
-<h3 id="option-a-api-key-anthropic-openai-gemini-etc"><a class="header" href="#option-a-api-key-anthropic-openai-gemini-etc">Option A: API Key (Anthropic, OpenAI, Gemini, etc.)</a></h3>
-<ol>
-<li>Set an API key as an environment variable and restart Moltis:
-<pre><code class="language-bash">export ANTHROPIC_API_KEY="sk-ant-..."   # Anthropic
-export OPENAI_API_KEY="sk-..."          # OpenAI
-export GEMINI_API_KEY="..."             # Google Gemini
-</code></pre>
-</li>
-<li>Models appear automatically in the model picker.</li>
-</ol>
-<p>Or configure via the web UI: <strong>Settings</strong> → <strong>Providers</strong> → enter your API key.</p>
-<h3 id="option-b-oauth-codex--copilot"><a class="header" href="#option-b-oauth-codex--copilot">Option B: OAuth (Codex / Copilot)</a></h3>
-<ol>
-<li>In Moltis, go to <strong>Settings</strong> → <strong>Providers</strong></li>
-<li>Click <strong>OpenAI Codex</strong> or <strong>GitHub Copilot</strong> → <strong>Connect</strong></li>
-<li>Complete the OAuth flow</li>
-</ol>
-<h3 id="option-c-local-llm-offline"><a class="header" href="#option-c-local-llm-offline">Option C: Local LLM (Offline)</a></h3>
-<ol>
-<li>In Moltis, go to <strong>Settings</strong> → <strong>Providers</strong></li>
-<li>Click <strong>Local LLM</strong></li>
-<li>Choose a model and save</li>
-</ol>
-<p>See <a href="providers.html">Providers</a> for the full list of supported providers.</p>
-<h2 id="4-chat"><a class="header" href="#4-chat">4. Chat!</a></h2>
-<p>Go to the <strong>Chat</strong> tab and start a conversation:</p>
-<pre><code>You: Write a Python function to check if a number is prime
-
-Agent: Here's a Python function to check if a number is prime:
-
-def is_prime(n):
-    if n &lt; 2:
-        return False
-    for i in range(2, int(n ** 0.5) + 1):
-        if n % i == 0:
-            return False
-    return True
-</code></pre>
-<h2 id="whats-next"><a class="header" href="#whats-next">What’s Next?</a></h2>
-<h3 id="enable-tool-use"><a class="header" href="#enable-tool-use">Enable Tool Use</a></h3>
-<p>Moltis can execute code, browse the web, and more. Tools are enabled by default with sandbox protection.</p>
-<p>Try:</p>
-<pre><code>You: Create a hello.py file that prints "Hello, World!" and run it
-</code></pre>
-<h3 id="connect-telegram"><a class="header" href="#connect-telegram">Connect Telegram</a></h3>
-<p>Chat with your agent from anywhere:</p>
-<ol>
-<li>Create a bot via <a href="https://t.me/BotFather">@BotFather</a></li>
-<li>Copy the bot token</li>
-<li>In Moltis: <strong>Settings</strong> → <strong>Telegram</strong> → Enter token → <strong>Save</strong></li>
-<li>Message your bot!</li>
-</ol>
-<h3 id="connect-discord"><a class="header" href="#connect-discord">Connect Discord</a></h3>
-<ol>
-<li>Create a bot in the <a href="https://discord.com/developers/applications">Discord Developer Portal</a></li>
-<li>Enable <strong>Message Content Intent</strong> and copy the bot token</li>
-<li>In Moltis: <strong>Settings</strong> → <strong>Channels</strong> → <strong>Connect Discord</strong> → Enter token → <strong>Connect</strong></li>
-<li>Invite the bot to your server and @mention it!</li>
-</ol>
-<p>→ <a href="discord.html">Full Discord setup guide</a></p>
-<h3 id="add-mcp-servers"><a class="header" href="#add-mcp-servers">Add MCP Servers</a></h3>
-<p>Extend capabilities with <a href="mcp.html">MCP servers</a>:</p>
-<pre><code class="language-toml"># In moltis.toml
-[mcp]
-[mcp.servers.github]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-env = { GITHUB_TOKEN = "ghp_..." }
-</code></pre>
-<h3 id="set-up-memory"><a class="header" href="#set-up-memory">Set Up Memory</a></h3>
-<p>Enable long-term memory for context across sessions:</p>
-<pre><code class="language-toml"># In moltis.toml
-[memory]
-provider = "openai"
-model = "text-embedding-3-small"
-</code></pre>
-<p>Add knowledge by placing Markdown files in <code>~/.moltis/memory/</code>.</p>
-<h2 id="useful-commands"><a class="header" href="#useful-commands">Useful Commands</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>/new</code></td><td>Start a new session</td></tr>
-<tr><td><code>/model &lt;name&gt;</code></td><td>Switch models</td></tr>
-<tr><td><code>/agent</code></td><td>List or switch chat agents</td></tr>
-<tr><td><code>/mode</code></td><td>List or switch temporary session modes</td></tr>
-<tr><td><code>/clear</code></td><td>Clear chat history</td></tr>
-<tr><td><code>/help</code></td><td>Show available commands</td></tr>
+                        <h1 id="modes"><a class="header" href="#modes">Modes</a></h1>
+<p>Modes are session-scoped prompt overlays. They change how the currently selected
+chat agent works right now without creating a new agent, changing memory, or
+changing sub-agent presets.</p>
+<p>Use modes when you want a temporary working style:</p>
+<div class="table-wrapper"><table><thead><tr><th>Mode</th><th>Use it for</th></tr></thead><tbody>
+<tr><td><code>concise</code></td><td>Short, direct answers</td></tr>
+<tr><td><code>technical</code></td><td>Detailed technical analysis</td></tr>
+<tr><td><code>creative</code></td><td>Broad ideation and alternatives</td></tr>
+<tr><td><code>teacher</code></td><td>Step-by-step explanation</td></tr>
+<tr><td><code>plan</code></td><td>Scoping and sequencing before implementation</td></tr>
+<tr><td><code>build</code></td><td>Implementation-focused work</td></tr>
+<tr><td><code>review</code></td><td>Bug-focused code review</td></tr>
+<tr><td><code>research</code></td><td>Evidence-first investigation</td></tr>
+<tr><td><code>elevated</code></td><td>Extra caution for risky operations</td></tr>
 </tbody></table>
 </div>
-<h2 id="file-locations"><a class="header" href="#file-locations">File Locations</a></h2>
-<div class="table-wrapper"><table><thead><tr><th>Path</th><th>Contents</th></tr></thead><tbody>
-<tr><td><code>~/.config/moltis/moltis.toml</code></td><td>Configuration</td></tr>
-<tr><td><code>~/.config/moltis/provider_keys.json</code></td><td>API keys</td></tr>
-<tr><td><code>~/.moltis/</code></td><td>Data (sessions, memory, logs)</td></tr>
-</tbody></table>
-</div>
-<h2 id="getting-help"><a class="header" href="#getting-help">Getting Help</a></h2>
-<ul>
-<li><strong>Documentation</strong>: <a href="https://docs.moltis.org">docs.moltis.org</a></li>
-<li><strong>GitHub Issues</strong>: <a href="https://github.com/moltis-org/moltis/issues">github.com/moltis-org/moltis/issues</a></li>
-<li><strong>Discussions</strong>: <a href="https://github.com/moltis-org/moltis/discussions">github.com/moltis-org/moltis/discussions</a></li>
-</ul>
+<p>Switch the active session from the web chat input or any channel that supports
+regular slash commands:</p>
+<pre><code class="language-text">/mode
+/mode review
+/mode 3
+/mode none
+</code></pre>
+<p><code>/mode</code> lists available modes. <code>/mode none</code> clears the overlay.</p>
+<h2 id="configure-modes"><a class="header" href="#configure-modes">Configure Modes</a></h2>
+<p>Built-in modes are available on every install. Add or override modes in
+<code>moltis.toml</code>:</p>
+<pre><code class="language-toml">[modes.presets.incident]
+name = "Incident"
+description = "production incident response"
+prompt = "Prioritize impact, timeline, mitigation, rollback, logs, and clear status updates."
+</code></pre>
+<p>Mode presets are intentionally small. For durable identity, memory, and chat
+history, create a chat agent. For delegated work through <code>spawn_agent</code>, use an
+agent preset.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="index.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="session-state.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="installation.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="session-branching.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -319,11 +238,11 @@ model = "text-embedding-3-small"
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="index.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="session-state.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="installation.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="session-branching.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>
