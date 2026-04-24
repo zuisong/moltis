@@ -115,10 +115,10 @@ mod tests {
         }
 
         assert_eq!(chunks[0].start_line, 1);
-        assert_eq!(
-            chunks.last().expect("chunks must not be empty").end_line,
-            10
-        );
+        let Some(last) = chunks.last() else {
+            panic!("chunks must not be empty");
+        };
+        assert_eq!(last.end_line, 10);
     }
 
     #[test]

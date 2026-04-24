@@ -206,9 +206,9 @@ def foo():
     #[test]
     fn byte_offset_to_line_conversion() {
         let text = "line1\nline2\nline3\nline4\nline5";
-        let offset = text
-            .find("line3")
-            .expect("test fixture must contain 'line3'");
+        let Some(offset) = text.find("line3") else {
+            panic!("test fixture must contain 'line3'");
+        };
         let line = text[..offset].matches('\n').count() + 1;
         assert_eq!(line, 3);
     }
