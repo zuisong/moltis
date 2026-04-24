@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260424.04] - 2026-04-24
+### Changed
+- [splitter] Extract moltis-splitter crate for AST-aware chunking (#791)
+
+
+### Fixed
+- [ci] Prevent releases.json from updating before GitHub release exists
+- Revert releases.json to latest published release (20260421.05)
+
 ## [20260424.03] - 2026-04-24
 ### Added
 - [skills] Add bundled skill category management to onboarding and settings (#829)
