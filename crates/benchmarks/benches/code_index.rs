@@ -183,7 +183,7 @@ fn content_hash_multiple_files(count: usize) {
 fn compute_delta_first_run() {
     let project_dir = Path::new(MOLTIS_PROJECT_PATH);
     let config = moltis_code_index::CodeIndexConfig::default();
-    let previous: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let previous: moltis_code_index::delta::HashSnapshot = std::collections::HashMap::new();
 
     let delta = moltis_code_index::delta::compute_delta(project_dir, &config, &previous);
     divan::black_box(delta.unwrap());
@@ -202,7 +202,24 @@ fn compute_delta_incremental() {
 
     for file in filtered.iter().take(filtered.len() / 2) {
         if let Ok(hash) = moltis_code_index::filter::content_hash(&file.path) {
-            previous.insert(file.relative_path.to_string_lossy().into_owned(), hash);
+            let meta = std::fs::metadata(&file.path);
+            previous.insert(
+                file.relative_path.to_string_lossy().into_owned(),
+                moltis_code_index::FileMeta {
+                    content_hash: hash,
+                    modified_time: meta
+                        .as_ref()
+                        .map(|m| {
+                            m.modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        })
+                        .unwrap_or(0),
+                    size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                },
+            );
         }
     }
 
@@ -261,7 +278,24 @@ fn full_delta_computation_with_snapshot() {
 
     for file in filtered.iter().take(filtered.len() / 2) {
         if let Ok(hash) = moltis_code_index::filter::content_hash(&file.path) {
-            previous.insert(file.relative_path.to_string_lossy().into_owned(), hash);
+            let meta = std::fs::metadata(&file.path);
+            previous.insert(
+                file.relative_path.to_string_lossy().into_owned(),
+                moltis_code_index::FileMeta {
+                    content_hash: hash,
+                    modified_time: meta
+                        .as_ref()
+                        .map(|m| {
+                            m.modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                        })
+                        .unwrap_or(0),
+                    size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                },
+            );
         }
     }
 

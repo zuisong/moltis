@@ -872,7 +872,12 @@ pub(super) async fn complete_startup(
             moltis_code_index::tools::register_tools_wrapped(
                 &mut tool_registry,
                 code_index_for_tools,
-                |tool| ProjectAwareCodeIndexTool::new(tool, Arc::clone(&project_store)),
+                |tool| {
+                    Box::new(ProjectAwareCodeIndexTool::new(
+                        tool,
+                        Arc::clone(&project_store),
+                    ))
+                },
             );
         }
 
@@ -882,7 +887,12 @@ pub(super) async fn complete_startup(
             moltis_code_index::tools::register_tools_wrapped(
                 &mut tool_registry,
                 code_index_for_tools_builtin,
-                |tool| ProjectAwareCodeIndexTool::new(tool, Arc::clone(&project_store)),
+                |tool| {
+                    Box::new(ProjectAwareCodeIndexTool::new(
+                        tool,
+                        Arc::clone(&project_store),
+                    ))
+                },
             );
         }
 

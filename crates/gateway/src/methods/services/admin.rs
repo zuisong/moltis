@@ -4,7 +4,7 @@ use super::*;
 use crate::methods::voice;
 
 #[cfg(any(feature = "qmd", feature = "code-index-builtin"))]
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 #[cfg(any(feature = "qmd", feature = "code-index-builtin"))]
 use tracing::info;
@@ -156,7 +156,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                     if new_enabled == Some(true) {
                         if let Some(ref pid) = project_id {
                             // Fetch old project to check previous state
-                            if let Ok(Some(old)) = ctx
+                            if let Ok(old) = ctx
                                 .state
                                 .services
                                 .project
@@ -172,7 +172,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                                     let dir = old
                                         .get("directory")
                                         .and_then(|v| v.as_str())
-                                        .map(std::path::PathBuf::from);
+                                        .map(PathBuf::from);
 
                                     if let Some(project_dir) = dir {
                                         info!(
