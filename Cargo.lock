@@ -1010,12 +1010,16 @@ name = "benchmarks"
 version = "0.1.0"
 dependencies = [
  "codspeed-divan-compat",
+ "grep-regex",
+ "grep-searcher",
  "moltis-agents",
+ "moltis-code-index",
  "moltis-config",
  "moltis-providers",
  "moltis-sessions",
  "serde_json",
  "tempfile",
+ "tokio",
  "toml 0.8.23",
 ]
 
