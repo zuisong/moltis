@@ -453,10 +453,10 @@ pub mod gguf {
             let mut sampler = LlamaSampler::chain_simple(samplers);
 
             let mut output_tokens = Vec::new();
-            let mut pos = tokens.len() as i32;
+            let base_pos = tokens.len() as i32;
             let eos_token = model.token_eos();
 
-            for _ in 0..max_tokens {
+            for (i, _) in (0..max_tokens).enumerate() {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
                 if token == eos_token {
@@ -469,12 +469,10 @@ pub mod gguf {
 
                 batch.clear();
                 batch
-                    .add(token, pos, &[0], true)
+                    .add(token, base_pos + i as i32, &[0], true)
                     .map_err(|e| anyhow::anyhow!("batch add token failed: {e}"))?;
                 ctx.decode(&mut batch)
                     .map_err(|e| anyhow::anyhow!("token decode failed: {e}"))?;
-
-                pos += 1;
             }
 
             let output_text = detokenize(&model, &output_tokens)?;
@@ -683,11 +681,11 @@ pub mod gguf {
             ]);
 
             let mut output_tokens = 0u32;
-            let mut pos = tokens.len() as i32;
+            let base_pos = tokens.len() as i32;
             let eos_token = model.token_eos();
             let mut decoder = encoding_rs::UTF_8.new_decoder();
 
-            for _ in 0..max_tokens {
+            for (i, _) in (0..max_tokens).enumerate() {
                 let token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
                 if token == eos_token {
@@ -707,12 +705,10 @@ pub mod gguf {
 
                 batch.clear();
                 batch
-                    .add(token, pos, &[0], true)
+                    .add(token, base_pos + i as i32, &[0], true)
                     .map_err(|e| anyhow::anyhow!("batch add token failed: {e}"))?;
                 ctx.decode(&mut batch)
                     .map_err(|e| anyhow::anyhow!("token decode failed: {e}"))?;
-
-                pos += 1;
             }
 
             Ok((input_tokens, output_tokens))

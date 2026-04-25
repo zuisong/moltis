@@ -108,7 +108,8 @@ default = [
   "graphql",
   "local-llm",
   "local-llm-metal",
-  "matrix",
+  # "matrix" excluded from defaults: matrix-sdk 0.16 hits compiler query-depth
+  # limit on nightly >= 2025-12-28. Enable explicitly with --features matrix.
   "mdns",
   "metrics",
   "nostr",
@@ -153,7 +154,7 @@ metrics = [
   "dep:moltis-metrics",
   "moltis-chat/metrics",
   "moltis-discord/metrics",
-  "moltis-matrix/metrics",
+  "moltis-matrix?/metrics",
   "moltis-metrics/sqlite",
   "moltis-msteams/metrics",
   "moltis-nostr?/metrics",

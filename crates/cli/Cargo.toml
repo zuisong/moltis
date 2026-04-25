@@ -120,7 +120,7 @@ default = [
   "llm-compaction",
   "local-llm",
   "local-llm-metal",
-  "matrix",
+  # "matrix" excluded: matrix-sdk 0.16 compiler compat (nightly >= 2025-12-28)
   "mdns",
   "metrics",
   "ngrok",
