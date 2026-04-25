@@ -66,12 +66,21 @@ install_vulkan_sdk() {
 }
 
 install_nccl() {
-  # Pin NCCL to the version matching the container's CUDA toolkit (12.4).
-  # Without pinning, apt pulls the latest NCCL (e.g. 2.30.x for CUDA 13.2)
-  # which causes undefined-symbol linker errors (ncclCommInitAll, etc.).
-  local nccl_ver="${NCCL_VERSION:-2.21.5-1+cuda12.4}"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-change-held-packages \
-    "libnccl-dev=${nccl_ver}" "libnccl2=${nccl_ver}"
+  # The CUDA container ships libnccl2 pre-installed, but NVIDIA's apt repo
+  # may no longer carry that exact version.  Install the -dev headers for
+  # whatever runtime is already present so the linker can find NCCL symbols.
+  local installed_ver
+  installed_ver="$(dpkg-query -W -f='${Version}' libnccl2 2>/dev/null || true)"
+
+  if [ -n "$installed_ver" ]; then
+    echo "libnccl2 already installed at ${installed_ver}, installing matching -dev headers"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-change-held-packages \
+      "libnccl-dev=${installed_ver}"
+  else
+    echo "libnccl2 not pre-installed, installing latest libnccl-dev + libnccl2"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-change-held-packages \
+      libnccl-dev libnccl2
+  fi
 }
 
 retry 5 15 apt_update
