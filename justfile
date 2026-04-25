@@ -3,7 +3,7 @@ default:
     @just --list
 
 # Keep local formatting/linting toolchain aligned with CI/release workflows.
-nightly_toolchain := "nightly-2025-11-30"
+nightly_toolchain := "nightly-2026-04-24"
 
 # Format Rust code
 format:

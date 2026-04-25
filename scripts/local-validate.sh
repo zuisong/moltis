@@ -160,7 +160,7 @@ detect_nightly_toolchain() {
     fi
   fi
 
-  printf '%s' "nightly-2025-11-30"
+  printf '%s' "nightly-2026-04-24"
 }
 
 nightly_toolchain="$(detect_nightly_toolchain)"

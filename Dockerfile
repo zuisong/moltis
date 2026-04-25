@@ -16,7 +16,7 @@ FROM rust:bookworm AS builder
 WORKDIR /build
 
 # Switch to nightly (pinned for reproducibility; wacore-binary needs portable_simd)
-RUN rustup install nightly-2025-11-30 && rustup default nightly-2025-11-30
+RUN rustup install nightly-2026-04-24 && rustup default nightly-2026-04-24
 
 # Copy manifests first for better caching
 COPY Cargo.toml Cargo.lock ./
