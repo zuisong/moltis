@@ -828,6 +828,7 @@ not create chat agents, change memory, or affect <code>spawn_agent</code> preset
 <tr><td><code>to</code></td><td>optional string</td><td>—</td><td>Destination chat/recipient id for heartbeat delivery.</td></tr>
 <tr><td><code>sandbox_enabled</code></td><td>bool</td><td><code>true</code></td><td>Whether heartbeat runs inside a sandbox.</td></tr>
 <tr><td><code>sandbox_image</code></td><td>optional string</td><td>—</td><td>Override sandbox image for heartbeat.</td></tr>
+<tr><td><code>wake_cooldown</code></td><td>string</td><td><code>"5m"</code></td><td>Minimum duration between exec-triggered heartbeat wakes. Use <code>"0"</code> to disable the guard.</td></tr>
 </tbody></table>
 </div>
 <h3 id="heartbeatactive_hours"><a class="header" href="#heartbeatactive_hours"><code>heartbeat.active_hours</code></a></h3>

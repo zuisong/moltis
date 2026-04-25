@@ -237,6 +237,15 @@ deduplicated. Events that arrive after the buffer is full are silently dropped
 enqueues a summary event with the command name, exit code, and a short preview
 of stdout/stderr. If the heartbeat is idle, it is woken immediately so the
 agent can react to the result.</p>
+<p>Exec-triggered wakes have a cooldown guard so a heartbeat turn that runs <code>exec</code>
+does not immediately re-wake itself in a loop. Configure it with
+<code>[heartbeat].wake_cooldown</code> in <code>moltis.toml</code>:</p>
+<pre><code class="language-toml">[heartbeat]
+wake_cooldown = "5m" # default; set "0" to disable
+</code></pre>
+<p>The value uses Moltis duration syntax such as <code>"30s"</code>, <code>"10m"</code>, or <code>"1h"</code>.
+The cooldown applies only to exec-completion wakes. Cron jobs with
+<code>wakeMode = "now"</code> still wake the heartbeat immediately.</p>
 <p>This means the agent learns about completed background tasks without polling
 — a long-running build or deployment that finishes while the user is away will
 surface in the next heartbeat turn.</p>

@@ -227,6 +227,14 @@ and which are inherited.</p>
 </div>
 <p>The <code>defaults.toml</code> file lives in the same directory. Do not edit it — your
 changes will be overwritten on the next startup.</p>
+<h2 id="checking-config"><a class="header" href="#checking-config">Checking Config</a></h2>
+<p><code>moltis config check</code> validates your override file (<code>moltis.toml</code>) against the
+known config schema. It also checks that Moltis-managed <code>defaults.toml</code> exists
+and can be parsed, but it does not treat <code>defaults.toml</code> as user-authored input.</p>
+<p>New config fields should be added to the Rust config schema and its <code>Default</code>
+implementation. Moltis regenerates <code>defaults.toml</code> from those built-in defaults
+on startup, while <code>moltis.toml</code> should contain only values you intentionally
+override.</p>
 <h2 id="basic-settings"><a class="header" href="#basic-settings">Basic Settings</a></h2>
 <pre><code class="language-toml">[server]
 port = 13131                    # HTTP/WebSocket port
