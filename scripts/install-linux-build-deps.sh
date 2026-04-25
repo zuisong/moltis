@@ -66,7 +66,7 @@ install_vulkan_sdk() {
 }
 
 install_nccl() {
-  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libnccl-dev libnccl2
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --allow-change-held-packages libnccl-dev libnccl2
 }
 
 retry 5 15 apt_update
