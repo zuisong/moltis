@@ -225,7 +225,7 @@ the opt-in Vulkan path covered locally, install the Vulkan development
 packages first, for example <code>libvulkan-dev</code> and <code>glslang-tools</code> on Debian/Ubuntu
 (on Ubuntu 22.04, install <code>glslang-tools</code> from the LunarG Vulkan SDK).</li>
 <li><code>local/lint</code> uses the same clippy flags as CI and release:
-<code>cargo +nightly-2025-11-30 clippy -Z unstable-options --workspace --all-features --all-targets --timings -- -D warnings</code>.</li>
+<code>cargo clippy -Z unstable-options --workspace --all-features --all-targets --timings -- -D warnings</code> (uses the nightly pinned in <code>rust-toolchain.toml</code>).</li>
 <li><code>zizmor</code> is installed automatically (Homebrew on macOS, apt on Linux) when
 not already available.</li>
 <li><code>zizmor</code> is advisory in local runs and does not block lint/test execution.</li>
