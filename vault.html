@@ -298,6 +298,7 @@ password:</p>
 <div class="table-wrapper"><table><thead><tr><th>Data</th><th>Storage</th><th>AAD</th></tr></thead><tbody>
 <tr><td>Environment variables (<code>env_variables</code> table)</td><td>SQLite</td><td><code>env:{key}</code></td></tr>
 <tr><td>Managed SSH private keys (<code>ssh_keys</code> table)</td><td>SQLite</td><td><code>ssh-key:{name}</code></td></tr>
+<tr><td>Provider API keys (<code>provider_keys.json.enc</code>)</td><td>File</td><td><code>provider_keys</code></td></tr>
 </tbody></table>
 </div>
 <p>The <code>encrypted</code> column in <code>env_variables</code> and <code>ssh_keys</code> tracks whether each
@@ -308,7 +309,11 @@ key hierarchy. When sealed or
 uninitialized, they are written as plaintext.</p>
 <p>On the first successful vault unseal after enabling the feature, Moltis also
 migrates any previously stored plaintext env vars and managed SSH private keys
-to encrypted storage in-place.</p>
+to encrypted storage in-place. Provider API keys (<code>provider_keys.json</code>) are
+encrypted to a <code>.enc</code> copy alongside the original; the plaintext file is kept
+for backward compatibility until all consumers use the vault-aware read path.
+Voice provider API keys are now stored in <code>provider_keys.json</code> (same as LLM
+keys), not in <code>moltis.toml</code>.</p>
 <div id="admonition-planned" class="admonition admonish-info" role="note" aria-labelledby="admonition-planned-title">
 <div class="admonition-title">
 <div id="admonition-planned-title">
@@ -317,9 +322,8 @@ to encrypted storage in-place.</p>
 <a class="admonition-anchor-link" href="#admonition-planned"></a>
 </div>
 <div>
-<p>KeyStore (provider API keys in <code>provider_keys.json</code>) and TokenStore
-(OAuth tokens in <code>credentials.json</code>) are currently sync/file-based and
-cannot easily call async vault methods. Encryption for these stores is
+<p>TokenStore (OAuth tokens in <code>credentials.json</code>) is currently sync/file-based
+and cannot easily call async vault methods. Encryption for this store is
 planned after an async refactor.</p>
 </div>
 </div>
