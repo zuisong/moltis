@@ -33,6 +33,12 @@ pub struct ModelLifecycleManager {
     state: Arc<tokio::sync::OnceCell<Arc<GatewayState>>>,
 }
 
+impl Default for ModelLifecycleManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModelLifecycleManager {
     pub fn new() -> Self {
         Self {
