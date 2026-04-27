@@ -39,7 +39,7 @@ async function sendRpcFromPage(page, method, params) {
 			.catch((error) => ({ ok: false, error: { message: error?.message || String(error) } }));
 
 		if (lastResponse?.ok) return lastResponse;
-		if (!isRetryableRpcError(lastResponse?.error?.message) && !lastResponse?.error?.message?.includes("RPC timeout"))
+		if (!(isRetryableRpcError(lastResponse?.error?.message) || lastResponse?.error?.message?.includes("RPC timeout")))
 			return lastResponse;
 	}
 	return lastResponse;
@@ -751,10 +751,7 @@ test.describe("Session management", () => {
 		await renameInput.press("Enter");
 
 		// The display name should update in the toolbar.
-		await expect(nameMount.getByTitle("Click to rename")).toHaveText(
-			newName,
-			{ timeout: 5_000 },
-		);
+		await expect(nameMount.getByTitle("Click to rename")).toHaveText(newName, { timeout: 5_000 });
 
 		expect(pageErrors).toEqual([]);
 	});
