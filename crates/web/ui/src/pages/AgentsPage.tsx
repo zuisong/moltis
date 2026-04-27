@@ -804,8 +804,8 @@ function AgentsPageComponent({ subPath }: { subPath?: string }): VNode {
 					<div className="flex flex-col gap-1">
 						<h3 className="text-xs font-medium text-[var(--muted)]">Modes</h3>
 						<p className="text-xs text-[var(--muted)] leading-relaxed" style={{ margin: 0 }}>
-							Defined in <code>[modes]</code> in <code>moltis.toml</code>. Temporary per-session prompt overlays.
-							Use /mode in chat or any connected channel to switch how the current agent works without changing its
+							Defined in <code>[modes]</code> in <code>moltis.toml</code>. Temporary per-session prompt overlays. Use
+							/mode in chat or any connected channel to switch how the current agent works without changing its
 							identity, memory, or presets.
 						</p>
 					</div>

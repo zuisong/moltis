@@ -309,10 +309,7 @@ pub async fn scan_repo_skills(
                 continue;
             }
             // Skip directories that are unlikely to contain real skills.
-            let dir_name = subdir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let dir_name = subdir.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if matches!(
                 dir_name,
                 "test"

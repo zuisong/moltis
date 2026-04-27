@@ -1430,9 +1430,7 @@ fn toggle_skill(params: &Value, enabled: bool) -> ServiceResult {
             .ok_or_else(|| format!("skill '{skill_name}' not found in repo '{source}'"))?;
         if !trusted {
             if !manifest.set_skill_trusted(source, skill_name, true) {
-                return Err(
-                    format!("skill '{skill_name}' not found in repo '{source}'").into(),
-                );
+                return Err(format!("skill '{skill_name}' not found in repo '{source}'").into());
             }
             auto_trusted = true;
         }

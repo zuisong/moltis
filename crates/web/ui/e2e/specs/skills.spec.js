@@ -188,9 +188,7 @@ test.describe("Skills page", () => {
 				contentType: "application/json",
 				body: JSON.stringify({
 					skills: [],
-					repos: [
-						{ source: "test-org/multi", skill_count: 3, enabled_count: 1, trusted_count: 1 },
-					],
+					repos: [{ source: "test-org/multi", skill_count: 3, enabled_count: 1, trusted_count: 1 }],
 				}),
 			});
 		});
@@ -215,9 +213,7 @@ test.describe("Skills page", () => {
 			await route.fulfill({
 				contentType: "application/json",
 				body: JSON.stringify({
-					skills: [
-						{ name: "only-skill", display_name: "Only Skill", description: "All enabled", enabled: true },
-					],
+					skills: [{ name: "only-skill", display_name: "Only Skill", description: "All enabled", enabled: true }],
 				}),
 			});
 		});
@@ -226,9 +222,7 @@ test.describe("Skills page", () => {
 				contentType: "application/json",
 				body: JSON.stringify({
 					skills: [],
-					repos: [
-						{ source: "test-org/all-enabled", skill_count: 1, enabled_count: 1, trusted_count: 1 },
-					],
+					repos: [{ source: "test-org/all-enabled", skill_count: 1, enabled_count: 1, trusted_count: 1 }],
 				}),
 			});
 		});

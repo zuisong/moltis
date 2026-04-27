@@ -887,6 +887,7 @@ function RepoCard({ repo }: { repo: RepoSummary }): VNode {
 									className="skills-ac-item"
 									style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}
 								>
+									{/* biome-ignore lint/a11y/useSemanticElements: complex layout requires div wrapper */}
 									<div
 										role="button"
 										tabIndex={0}
