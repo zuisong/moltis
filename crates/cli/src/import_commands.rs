@@ -390,17 +390,11 @@ fn import_claude_all(
         let mcp_path = data_dir.join("mcp-servers.json");
         let skills_dir = data_dir.join("skills");
 
-        let mut categories = Vec::new();
-        categories.push(moltis_claude_import::mcp_servers::import_mcp_servers(
-            &detection, &mcp_path,
-        ));
-        categories.push(moltis_claude_import::skills::import_skills(
-            &detection,
-            &skills_dir,
-        ));
-        categories.push(moltis_claude_import::memory::import_memory(
-            &detection, data_dir,
-        ));
+        let categories = vec![
+            moltis_claude_import::mcp_servers::import_mcp_servers(&detection, &mcp_path),
+            moltis_claude_import::skills::import_skills(&detection, &skills_dir),
+            moltis_claude_import::memory::import_memory(&detection, data_dir),
+        ];
 
         let total: usize = categories.iter().map(|c| c.items_imported).sum();
 
@@ -444,17 +438,11 @@ fn import_hermes_all(
 
         let skills_dir = data_dir.join("skills");
 
-        let mut categories = Vec::new();
-        categories.push(moltis_hermes_import::credentials::import_credentials(
-            &detection, config_dir,
-        ));
-        categories.push(moltis_hermes_import::skills::import_skills(
-            &detection,
-            &skills_dir,
-        ));
-        categories.push(moltis_hermes_import::memory::import_memory(
-            &detection, data_dir,
-        ));
+        let categories = vec![
+            moltis_hermes_import::credentials::import_credentials(&detection, config_dir),
+            moltis_hermes_import::skills::import_skills(&detection, &skills_dir),
+            moltis_hermes_import::memory::import_memory(&detection, data_dir),
+        ];
 
         let total: usize = categories.iter().map(|c| c.items_imported).sum();
 
