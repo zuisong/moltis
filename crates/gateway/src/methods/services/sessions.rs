@@ -177,6 +177,12 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 let key = ctx.params.get("key").and_then(|v| v.as_str()).unwrap_or("");
                 if !key.is_empty() {
                     crate::session::summary::run_session_summary_if_enabled(&ctx.state, key).await;
+
+                    // Export the session before the reset destroys its history.
+                    let hooks = ctx.state.inner.read().await.hook_registry.clone();
+                    if let Some(ref hooks) = hooks {
+                        crate::session::dispatch_command_hook(hooks, key, "reset", None).await;
+                    }
                 }
 
                 ctx.state
