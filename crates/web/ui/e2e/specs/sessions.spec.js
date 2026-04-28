@@ -381,6 +381,9 @@ test.describe("Session management", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	// Stop button is now in the thinking indicator bubble, not the session header.
+	// The thinking indicator lifecycle is WebSocket-driven and the system-event
+	// RPC doesn't trigger it in the same way. Needs dedicated thinking indicator test.
 	test.skip("stop action appears for active run and clears after abort", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await page.goto("/");
@@ -601,7 +604,7 @@ test.describe("Session management", () => {
 		}
 	});
 
-	test.skip("clear all sessions resets list", async ({ page }) => {
+	test("clear all sessions resets list", async ({ page }) => {
 		await navigateAndWait(page, "/");
 		await waitForWsConnected(page);
 
@@ -609,7 +612,10 @@ test.describe("Session management", () => {
 		await createSession(page);
 		await createSession(page);
 
-		await page.locator("#chatMoreDeleteAllBtn").click();
+		// Navigate to settings where "Delete all sessions" now lives
+		await page.goto("/settings/config");
+		await expect(page.getByText("Danger zone")).toBeVisible({ timeout: 10_000 });
+		await page.getByRole("button", { name: "Delete all sessions" }).click();
 
 		const confirmModal = page.locator(".provider-modal-backdrop:not(.hidden)").filter({
 			hasText: /Delete \d+ sessions\?/,
@@ -618,6 +624,8 @@ test.describe("Session management", () => {
 		await confirmModal.getByRole("button", { name: "Delete", exact: true }).click();
 		await expect(confirmModal).toHaveCount(0, { timeout: 10_000 });
 
+		// Navigate back to chat and verify only main session remains
+		await page.goto("/");
 		await expectPageContentMounted(page);
 		const items = page.locator("#sessionList .session-item");
 		const count = await items.count();
@@ -757,7 +765,7 @@ test.describe("Session management", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
-	test.skip("channel-bound session can be renamed", async ({ page }) => {
+	test("channel-bound session can be renamed", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 		await waitForWsConnected(page);
@@ -779,11 +787,12 @@ test.describe("Session management", () => {
 		await expect(channelItem).toBeVisible({ timeout: 10_000 });
 		await channelItem.click();
 
-		// Open session controls and start rename.
-		const renameBtn = page.locator('button[title="Rename session"]');
-		await expect(renameBtn).toBeVisible({ timeout: 5_000 });
-		await renameBtn.click();
-		const renameInput = page.locator(".chat-session-rename-input");
+		// Click the session name to start rename (name is clickable in the toolbar).
+		const nameMount = page.locator("#sessionNameMount");
+		const nameEl = nameMount.getByTitle("Click to rename");
+		await expect(nameEl).toBeVisible({ timeout: 5_000 });
+		await nameEl.click();
+		const renameInput = nameMount.getByRole("textbox");
 		await expect(renameInput).toBeVisible({ timeout: 5_000 });
 
 		// Type a new name and press Enter.
