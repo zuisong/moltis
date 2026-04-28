@@ -187,7 +187,7 @@ pub fn import_credentials(detection: &HermesDetection, config_dir: &Path) -> Cat
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use {super::*};
+    use super::*;
 
     fn make_detection(home: &Path) -> HermesDetection {
         HermesDetection {
