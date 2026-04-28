@@ -598,6 +598,8 @@ not create chat agents, change memory, or affect <code>spawn_agent</code> preset
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>enabled</code></td><td>bool</td><td><code>true</code></td><td>Whether browser support is enabled.</td></tr>
 <tr><td><code>chrome_path</code></td><td>optional string</td><td><code>null</code></td><td>Path to Chrome/Chromium binary (auto-detected if not set).</td></tr>
+<tr><td><code>obscura_path</code></td><td>optional string</td><td><code>null</code></td><td>Path to the Obscura binary for <code>browser = "obscura"</code> requests (auto-detected from <code>OBSCURA</code> or <code>PATH</code> if not set).</td></tr>
+<tr><td><code>lightpanda_path</code></td><td>optional string</td><td><code>null</code></td><td>Path to the Lightpanda binary for <code>browser = "lightpanda"</code> requests (auto-detected from <code>LIGHTPANDA</code> or <code>PATH</code> if not set).</td></tr>
 <tr><td><code>headless</code></td><td>bool</td><td><code>true</code></td><td>Whether to run in headless mode.</td></tr>
 <tr><td><code>viewport_width</code></td><td>integer</td><td><code>2560</code></td><td>Default viewport width in pixels.</td></tr>
 <tr><td><code>viewport_height</code></td><td>integer</td><td><code>1440</code></td><td>Default viewport height in pixels.</td></tr>

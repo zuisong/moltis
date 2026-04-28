@@ -1576,6 +1576,8 @@ not create chat agents, change memory, or affect <code>spawn_agent</code> preset
 <div class="table-wrapper"><table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>enabled</code></td><td>bool</td><td><code>true</code></td><td>Whether browser support is enabled.</td></tr>
 <tr><td><code>chrome_path</code></td><td>optional string</td><td><code>null</code></td><td>Path to Chrome/Chromium binary (auto-detected if not set).</td></tr>
+<tr><td><code>obscura_path</code></td><td>optional string</td><td><code>null</code></td><td>Path to the Obscura binary for <code>browser = "obscura"</code> requests (auto-detected from <code>OBSCURA</code> or <code>PATH</code> if not set).</td></tr>
+<tr><td><code>lightpanda_path</code></td><td>optional string</td><td><code>null</code></td><td>Path to the Lightpanda binary for <code>browser = "lightpanda"</code> requests (auto-detected from <code>LIGHTPANDA</code> or <code>PATH</code> if not set).</td></tr>
 <tr><td><code>headless</code></td><td>bool</td><td><code>true</code></td><td>Whether to run in headless mode.</td></tr>
 <tr><td><code>viewport_width</code></td><td>integer</td><td><code>2560</code></td><td>Default viewport width in pixels.</td></tr>
 <tr><td><code>viewport_height</code></td><td>integer</td><td><code>1440</code></td><td>Default viewport height in pixels.</td></tr>
@@ -7892,6 +7894,8 @@ navigation_timeout_ms = 30000  # Page load timeout
 
 # Optional customization
 # chrome_path = "/path/to/chrome"  # Custom Chrome path
+# obscura_path = "/path/to/obscura"  # Custom Obscura path
+# lightpanda_path = "/path/to/lightpanda"  # Custom Lightpanda path
 # user_agent = "Custom UA"         # Custom user agent
 # chrome_args = ["--disable-extensions"]  # Extra args
 
@@ -7968,10 +7972,16 @@ pass <code>session_id</code> explicitly:</p>
 <pre><code class="language-json">{ "action": "navigate", "url": "https://example.com", "browser": "brave" }
 </code></pre>
 <p>Supported values: <code>auto</code>, <code>chrome</code>, <code>chromium</code>, <code>edge</code>, <code>brave</code>, <code>opera</code>,
-<code>vivaldi</code>, <code>arc</code>.</p>
+<code>vivaldi</code>, <code>arc</code>, <code>obscura</code>, <code>lightpanda</code>.</p>
 <p><code>auto</code> (default) picks the first detected installed browser. If none are
 installed, Moltis will attempt a best-effort auto-install, then retry
 detection.</p>
+<p><code>obscura</code> launches the Obscura sidecar binary from <code>obscura_path</code>, the
+<code>OBSCURA</code> environment variable, or <code>PATH</code>. It supports DOM-oriented browsing
+through CDP, but not pixel screenshots.</p>
+<p><code>lightpanda</code> launches the Lightpanda sidecar binary from <code>lightpanda_path</code>, the
+<code>LIGHTPANDA</code> environment variable, or <code>PATH</code>. It supports DOM-oriented browsing
+through CDP, but not pixel screenshots.</p>
 <h3 id="workflow-example"><a class="header" href="#workflow-example">Workflow Example</a></h3>
 <pre><code class="language-json">// 1. Navigate to a page
 {
