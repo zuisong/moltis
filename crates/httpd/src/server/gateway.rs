@@ -1,7 +1,7 @@
 //! Full gateway preparation: config loading, migration, service wiring,
 //! background task spawning, and the composed axum application.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use {
     axum::{
@@ -9,7 +9,6 @@ use {
         http::StatusCode,
         response::{IntoResponse, Json},
     },
-    moltis_channels::ChannelPlugin,
     moltis_gateway::server::{PreparedGatewayCore, prepare_gateway_core},
     moltis_sessions::session_events::SessionEventBus,
 };
