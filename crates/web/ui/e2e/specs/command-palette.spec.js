@@ -2,13 +2,13 @@ const { expect, test } = require("../base-test");
 const { expectPageContentMounted, navigateAndWait, watchPageErrors } = require("../helpers");
 
 test.describe("Command palette", () => {
-	test("opens on Cmd+K and closes on Escape", async ({ page }) => {
+	test("opens on Ctrl+K and closes on Escape", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
 		await expect(page.locator(".cmd-palette")).toHaveCount(0);
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 		await expect(page.locator(".cmd-palette-input")).toBeFocused();
 
@@ -47,7 +47,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
 		// Click the backdrop (outside the palette box)
@@ -57,14 +57,14 @@ test.describe("Command palette", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
-	test("toggle: second Cmd+K closes the palette", async ({ page }) => {
+	test("toggle: second Ctrl+K closes the palette", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toHaveCount(0);
 
 		expect(pageErrors).toEqual([]);
@@ -74,7 +74,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
 		// Should show group headers
@@ -94,7 +94,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
 		await page.locator(".cmd-palette-input").fill("prov");
@@ -113,7 +113,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await page.locator(".cmd-palette-input").fill("xyznonexistent");
 
 		await expect(page.locator(".cmd-palette-empty")).toBeVisible();
@@ -126,7 +126,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await page.locator(".cmd-palette-input").fill("docker");
 
 		// "docker" is a keyword for Sandboxes
@@ -140,7 +140,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
 		// First item should be active by default
@@ -165,7 +165,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await page.locator(".cmd-palette-input").fill("Skills");
 
 		// Wait for filtered results
@@ -187,7 +187,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await page.locator(".cmd-palette-input").fill("Logs");
 
 		const logsItem = page.locator(".cmd-palette-item", { hasText: "Logs" }).first();
@@ -204,7 +204,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
 		const thirdItem = page.locator(".cmd-palette-item").nth(2);
@@ -220,14 +220,14 @@ test.describe("Command palette", () => {
 		await navigateAndWait(page, "/");
 
 		// Open and type a query
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await page.locator(".cmd-palette-input").fill("test");
 		await page.keyboard.press("ArrowDown");
 		await page.keyboard.press("ArrowDown");
 		await page.keyboard.press("Escape");
 
 		// Reopen — should be reset
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette-input")).toHaveValue("");
 		const firstItem = page.locator(".cmd-palette-item").first();
 		await expect(firstItem).toHaveClass(/cmd-palette-item-active/);
@@ -264,7 +264,7 @@ test.describe("Command palette", () => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/");
 
-		await page.keyboard.press("Meta+k");
+		await page.keyboard.press("Control+k");
 		await expect(page.locator(".cmd-palette")).toBeVisible();
 
 		await expect(page.locator('[role="dialog"][aria-modal="true"]')).toBeVisible();
