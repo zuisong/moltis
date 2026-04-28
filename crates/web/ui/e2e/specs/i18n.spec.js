@@ -132,16 +132,16 @@ test.describe("i18n", () => {
 	});
 
 	test("settings page renders translated heading", async ({ page }) => {
-		const pageErrors = await navigateAndWait(page, "/settings/identity");
+		const pageErrors = await navigateAndWait(page, "/settings/profile");
 
-		// The Identity heading should render as English text.
-		await expect(page.getByRole("heading", { name: "Identity", exact: true })).toBeVisible();
+		// The User Profile heading should render as English text.
+		await expect(page.getByRole("heading", { name: "User Profile", exact: true })).toBeVisible();
 
 		expect(pageErrors).toEqual([]);
 	});
 
 	test("settings language selector persists and clears locale preference", async ({ page }) => {
-		const pageErrors = await navigateAndWait(page, "/settings/identity");
+		const pageErrors = await navigateAndWait(page, "/settings/profile");
 
 		const languageSelect = page.locator("#identityLanguageSelect");
 		const applyButton = page.locator("#identityLanguageApplyBtn");

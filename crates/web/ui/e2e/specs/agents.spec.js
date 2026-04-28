@@ -111,9 +111,8 @@ test.describe("Agents settings page", () => {
 		const mainCard = page.locator(".backend-card").filter({ hasText: "Default" });
 		await expect(mainCard).toBeVisible();
 
-		// Main agent should have an "Identity Settings" button, not Edit/Delete
-		await expect(mainCard.getByRole("button", { name: "Identity Settings", exact: true })).toBeVisible();
-		await expect(mainCard.getByRole("button", { name: "Edit", exact: true })).toHaveCount(0);
+		// Main agent has Edit but no Delete (cannot delete the main agent)
+		await expect(mainCard.getByRole("button", { name: "Edit", exact: true })).toBeVisible();
 		await expect(mainCard.getByRole("button", { name: "Delete", exact: true })).toHaveCount(0);
 
 		expect(pageErrors).toEqual([]);
@@ -149,7 +148,7 @@ test.describe("Agents settings page", () => {
 		await expect(page.getByRole("heading", { name: "Sub-Agent Presets", exact: true })).toBeVisible({
 			timeout: 10_000,
 		});
-		await expect(page.getByText("already usable by spawn_agent", { exact: false })).toBeVisible();
+		await expect(page.getByText("usable by spawn_agent", { exact: false })).toBeVisible();
 		const presetCard = page
 			.locator(".backend-card")
 			.filter({ hasText: "Coder" })
@@ -319,15 +318,15 @@ test.describe("Agents settings page", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
-	test("Identity Settings button on main agent navigates to identity page", async ({ page }) => {
+	test("Edit button on main agent opens edit form", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/settings/agents");
 
 		const mainCard = page.locator(".backend-card").filter({ hasText: "Default" });
-		await mainCard.getByRole("button", { name: "Identity Settings", exact: true }).click();
+		await mainCard.getByRole("button", { name: "Edit", exact: true }).click();
 
-		await expect(page).toHaveURL(/\/settings\/identity$/);
-		await expectPageContentMounted(page);
+		// The edit form should appear (heading begins with "Edit")
+		await expect(page.getByText(/^Edit\s/, { exact: false })).toBeVisible({ timeout: 10_000 });
 
 		expect(pageErrors).toEqual([]);
 	});

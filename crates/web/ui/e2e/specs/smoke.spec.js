@@ -184,9 +184,9 @@ const routeCases = [
 	},
 	{
 		path: "/settings",
-		expectedUrl: /\/settings\/identity$/,
+		expectedUrl: /\/settings\/profile$/,
 		settingsActive: true,
-		heading: "Identity",
+		heading: "User Profile",
 	},
 ];
 
