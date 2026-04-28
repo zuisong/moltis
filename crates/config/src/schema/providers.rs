@@ -5,6 +5,50 @@ use {
     std::collections::HashMap,
 };
 
+/// Canonical list of known LLM provider names and accepted config-key aliases.
+///
+/// This is the **single source of truth** for provider name validation.
+/// Config validation (`semantic.rs`) uses this to detect typos, and
+/// `moltis-providers` cross-validates its registrations against it.
+///
+/// The list includes both canonical provider names (used in registration)
+/// and config-key aliases that users may write in `[providers.<name>]`
+/// sections (e.g. `"local"` is an alias for `"local-llm"`, mapped at
+/// runtime by `ProvidersConfig::provider_entry`).
+///
+/// When adding a new provider, add its config name here.  A compile-time
+/// test in `moltis-providers` will fail if a registered provider is
+/// missing from this list.
+pub const KNOWN_PROVIDER_NAMES: &[&str] = &[
+    // Built-in providers (always available)
+    "anthropic",
+    "openai",
+    // OpenAI-compatible providers (table-driven)
+    "alibaba-coding",
+    "cerebras",
+    "deepseek",
+    "fireworks",
+    "gemini",
+    "lmstudio",
+    "minimax",
+    "mistral",
+    "moonshot",
+    "ollama",
+    "openrouter",
+    "venice",
+    "zai",
+    "zai-code",
+    // Feature-gated providers
+    "github-copilot",
+    "kimi-code",
+    "local", // alias for local-llm
+    "local-llm",
+    "openai-codex",
+    // Providers registered via genai/async-openai backends
+    "groq",
+    "xai",
+];
+
 /// OAuth provider configuration (e.g. openai-codex).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OAuthProviderConfig {
@@ -53,7 +97,7 @@ pub struct ProvidersConfig {
     pub show_legacy_models: bool,
 
     /// Provider-specific settings keyed by provider name.
-    /// Known keys: "anthropic", "openai", "gemini", "groq", "xai", "deepseek"
+    /// See [`KNOWN_PROVIDER_NAMES`] for the full list of recognised names.
     #[serde(flatten)]
     pub providers: HashMap<String, ProviderEntry>,
 
