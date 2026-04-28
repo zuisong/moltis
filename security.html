@@ -514,8 +514,8 @@ acknowledge this non-default setup.</p>
 <code>proxy_http_version 1.1;</code> and upgrade headers.</p>
 <pre><code class="language-nginx">location / {
     proxy_pass http://172.17.0.1:13131;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Host $http_host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Real-IP $remote_addr;
@@ -540,13 +540,18 @@ acknowledge this non-default setup.</p>
 <li>NPM preserves browser host/origin context</li>
 </ul>
 <p>Use this in NPM’s <strong>Advanced</strong> field:</p>
-<pre><code class="language-nginx">proxy_set_header Host $host;
-proxy_set_header X-Forwarded-Host $host;
+<pre><code class="language-nginx">proxy_set_header Host $http_host;
+proxy_set_header X-Forwarded-Host $http_host;
 proxy_set_header X-Forwarded-Proto $scheme;
 proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection "upgrade";
 </code></pre>
+<p><strong>Why <code>$http_host</code> instead of <code>$host</code>?</strong> Nginx’s <code>$host</code> strips the port,
+while <code>$http_host</code> preserves it. Moltis validates that the WebSocket <code>Origin</code>
+header matches the <code>Host</code> header (including port). On non-standard ports
+(e.g., <code>:444</code> instead of <code>:443</code>), using <code>$host</code> causes a mismatch and
+WebSocket connections are rejected with “cross-origin WebSocket upgrade”.</p>
 <p>Upstream scheme guidance:</p>
 <ul>
 <li><strong>Edge TLS termination (most setups)</strong>: proxy to <code>http://&lt;moltis-host&gt;:13131</code>
