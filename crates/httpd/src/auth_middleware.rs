@@ -242,9 +242,13 @@ fn is_public_path(path: &str) -> bool {
         || path.starts_with("/api/public/")
         || {
             #[cfg(feature = "msteams")]
-            { path.starts_with("/api/channels/msteams/") }
+            {
+                path.starts_with("/api/channels/msteams/")
+            }
             #[cfg(not(feature = "msteams"))]
-            { false }
+            {
+                false
+            }
         }
         || path.starts_with("/api/webhooks/ingest/")
         || path.starts_with("/assets/")
