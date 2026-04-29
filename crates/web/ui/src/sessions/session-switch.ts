@@ -30,13 +30,6 @@ import {
 	shouldApplyServerHistory,
 } from "./session-history";
 
-/** Focus the chat input only when the user isn't actively editing
- *  something else (e.g. rename input, search field). */
-function focusChatInputIfIdle(): void {
-	const active = document.activeElement;
-	if (active && active !== document.body && active !== S.chatInput) return;
-	S.chatInput?.focus();
-}
 import {
 	hideSessionLoadIndicator,
 	postHistoryLoadActions,
@@ -45,6 +38,14 @@ import {
 	showSessionLoadIndicator,
 	updateChatSessionHeader,
 } from "./session-render";
+
+/** Focus the chat input only when the user isn't actively editing
+ *  something else (e.g. rename input, search field). */
+function focusChatInputIfIdle(): void {
+	const active = document.activeElement;
+	if (active && active !== document.body && active !== S.chatInput) return;
+	S.chatInput?.focus();
+}
 
 // ── Types ────────────────────────────────────────────────────
 
