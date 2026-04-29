@@ -415,6 +415,85 @@ endpoint = "http://localhost:5002"
 <p><strong>Request:</strong></p>
 <pre><code class="language-json">{ "provider": "openai" }
 </code></pre>
+<h3 id="voice-personas"><a class="header" href="#voice-personas">Voice Personas</a></h3>
+<p>Voice personas are named, reusable voice identities that get injected
+deterministically into every TTS call. Instead of the agent improvising
+voice “flair” per-message, a persona defines a stable spoken character.</p>
+<p><strong>Key concepts:</strong></p>
+<div class="table-wrapper"><table><thead><tr><th>Concept</th><th>Description</th></tr></thead><tbody>
+<tr><td>Persona prompt</td><td>Provider-neutral fields: profile, style, accent, pacing, scene, constraints</td></tr>
+<tr><td>Provider bindings</td><td>Per-provider overrides: voice_id, model, speed, stability</td></tr>
+<tr><td>Fallback policy</td><td>What happens when the active provider has no binding: <code>preserve-persona</code>, <code>provider-defaults</code>, <code>fail</code></td></tr>
+<tr><td>Active persona</td><td>One persona active at a time, applied to all TTS calls automatically</td></tr>
+</tbody></table>
+</div>
+<p><strong>Manage personas</strong> via the web UI (Settings &gt; Voice &gt; Voice Personas) or the RPC API.</p>
+<h4 id="rpc-methods-1"><a class="header" href="#rpc-methods-1">RPC Methods</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Method</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>voice.personas.list</code></td><td>List all personas with active indicator</td></tr>
+<tr><td><code>voice.personas.get</code></td><td>Get a single persona by ID</td></tr>
+<tr><td><code>voice.personas.create</code></td><td>Create a new persona</td></tr>
+<tr><td><code>voice.personas.update</code></td><td>Update persona fields/bindings</td></tr>
+<tr><td><code>voice.personas.delete</code></td><td>Delete a persona</td></tr>
+<tr><td><code>voice.personas.set_active</code></td><td>Set the active persona (or <code>"none"</code> to deactivate)</td></tr>
+</tbody></table>
+</div>
+<h4 id="voicepersonascreate"><a class="header" href="#voicepersonascreate"><code>voice.personas.create</code></a></h4>
+<p><strong>Request:</strong></p>
+<pre><code class="language-json">{
+  "id": "alfred",
+  "label": "Alfred",
+  "description": "A wise British butler",
+  "provider": "openai",
+  "prompt": {
+    "profile": "A wise British butler with dry wit",
+    "style": "Measured, deliberate, slightly amused",
+    "accent": "Received Pronunciation",
+    "pacing": "Unhurried, with dramatic pauses"
+  },
+  "providerBindings": [
+    {
+      "provider": "openai",
+      "voice_id": "cedar",
+      "model": "gpt-4o-mini-tts"
+    },
+    {
+      "provider": "elevenlabs",
+      "voice_id": "21m00Tcm4TlvDq8ikWAM",
+      "stability": 0.65,
+      "similarity_boost": 0.8
+    }
+  ]
+}
+</code></pre>
+<h4 id="provider-support"><a class="header" href="#provider-support">Provider Support</a></h4>
+<div class="table-wrapper"><table><thead><tr><th>Provider</th><th>Instructions support</th><th>Notes</th></tr></thead><tbody>
+<tr><td>OpenAI (<code>gpt-4o-mini-tts</code>)</td><td>Full</td><td>Persona prompt rendered as <code>instructions</code> field</td></tr>
+<tr><td>Google Gemini TTS (<code>gemini-*</code>)</td><td>Full</td><td>Persona prompt as <code>system_instruction</code>; set <code>model = "gemini-2.5-flash-preview-tts"</code></td></tr>
+<tr><td>ElevenLabs</td><td>Partial</td><td>Uses provider binding overrides (voice_id, stability)</td></tr>
+<tr><td>Google Cloud TTS v1</td><td>Partial</td><td>Uses provider binding overrides (voice, speaking_rate, pitch)</td></tr>
+<tr><td>Piper / Coqui</td><td>None</td><td>Local providers ignore instructions</td></tr>
+</tbody></table>
+</div>
+<h4 id="agent-tool-integration"><a class="header" href="#agent-tool-integration">Agent Tool Integration</a></h4>
+<p>The <code>speak()</code> agent tool accepts an optional <code>persona</code> parameter:</p>
+<pre><code class="language-json">{
+  "text": "Good evening, sir.",
+  "persona": "alfred"
+}
+</code></pre>
+<p>When omitted, the active persona is used automatically.</p>
+<h4 id="agent--persona-link"><a class="header" href="#agent--persona-link">Agent ↔ Persona Link</a></h4>
+<p>Each agent persona can optionally reference a voice persona via the
+<code>voice_persona_id</code> field. Set it when creating or updating an agent:</p>
+<pre><code class="language-json">{
+  "id": "butler",
+  "name": "Butler Agent",
+  "voice_persona_id": "alfred"
+}
+</code></pre>
+<p>This links the agent’s identity to its voice — the UI can use this
+to auto-switch the active voice persona when switching agents.</p>
 <h3 id="auto-speak-modes"><a class="header" href="#auto-speak-modes">Auto-Speak Modes</a></h3>
 <div class="table-wrapper"><table><thead><tr><th>Mode</th><th>Description</th></tr></thead><tbody>
 <tr><td><code>always</code></td><td>Speak all AI responses</td></tr>
@@ -573,7 +652,7 @@ model_dir = "~/.moltis/models/sherpa-onnx-whisper-tiny.en"
 </code></pre>
 </li>
 </ol>
-<h3 id="rpc-methods-1"><a class="header" href="#rpc-methods-1">RPC Methods</a></h3>
+<h3 id="rpc-methods-2"><a class="header" href="#rpc-methods-2">RPC Methods</a></h3>
 <h4 id="sttstatus"><a class="header" href="#sttstatus"><code>stt.status</code></a></h4>
 <p>Get current STT status.</p>
 <p><strong>Response:</strong></p>
@@ -687,6 +766,12 @@ pub trait SttProvider: Send + Sync {
 <li><code>LiveSttService</code>: Wraps STT providers, implements <code>SttService</code> trait</li>
 <li><code>NoopSttService</code>: No-op for when STT is not configured</li>
 </ul>
+<h3 id="voice-personas-cratesgatewaysrcvoice_personars"><a class="header" href="#voice-personas-cratesgatewaysrcvoice_personars">Voice Personas (<code>crates/gateway/src/voice_persona.rs</code>)</a></h3>
+<ul>
+<li><code>VoicePersonaStore</code>: SQLite-backed CRUD for named voice identities</li>
+<li><code>apply_persona_to_request()</code>: Merges persona bindings and instructions into <code>SynthesizeRequest</code></li>
+<li>Types: <code>VoicePersona</code>, <code>VoicePersonaPrompt</code>, <code>VoicePersonaProviderBinding</code>, <code>FallbackPolicy</code> (in <code>moltis-voice</code>)</li>
+</ul>
 <h2 id="security"><a class="header" href="#security">Security</a></h2>
 <ul>
 <li>API keys are stored using <code>secrecy::Secret&lt;String&gt;</code> to prevent accidental logging</li>
@@ -723,7 +808,7 @@ pub trait SttProvider: Send + Sync {
 <li><strong>VoiceWake</strong>: Wake word detection and continuous listening</li>
 <li><strong>Audio playback</strong>: Play TTS responses directly in the chat</li>
 <li><strong>Channel Integration</strong>: Auto-transcribe Telegram voice messages</li>
-<li><strong>Per-Agent Voices</strong>: Different voices for different agents</li>
+<li><strong>Automatic Persona Switching</strong>: Auto-activate the linked voice persona when the active agent changes</li>
 </ul>
 
                     </main>
