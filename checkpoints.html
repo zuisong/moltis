@@ -184,22 +184,32 @@
                 <div id="content" class="content">
                     <main>
                         <h1 id="checkpoints"><a class="header" href="#checkpoints">Checkpoints</a></h1>
-<p>Moltis now creates automatic checkpoints before built-in file mutations that
-change personal skills or agent memory files.</p>
-<h2 id="what-gets-checkpointed"><a class="header" href="#what-gets-checkpointed">What Gets Checkpointed</a></h2>
-<p>Current built-in checkpoint coverage includes:</p>
+<p>Moltis automatically snapshots files before the agent modifies them. If the
+agent breaks something, use <a href="commands.html#rollback"><code>/rollback</code></a> to restore files
+to their pre-turn state.</p>
+<h2 id="automatic-per-turn-checkpointing"><a class="header" href="#automatic-per-turn-checkpointing">Automatic Per-Turn Checkpointing</a></h2>
+<p>An <code>AutoCheckpointHook</code> runs before every file-mutating tool call (<code>Write</code>,
+<code>Edit</code>, <code>MultiEdit</code>) and snapshots the target file. Checkpoints are grouped by
+<strong>turn</strong> (one user message = one turn), so <code>/rollback 1</code> undoes all file changes
+from that turn at once.</p>
+<p>The hook also fires on skill and memory mutations:</p>
 <ul>
-<li><code>create_skill</code></li>
-<li><code>update_skill</code></li>
-<li><code>delete_skill</code></li>
-<li><code>write_skill_files</code></li>
-<li><code>memory_save</code></li>
-<li><code>memory_forget</code></li>
-<li><code>memory_delete</code></li>
+<li><code>create_skill</code>, <code>update_skill</code>, <code>delete_skill</code>, <code>write_skill_files</code></li>
+<li><code>memory_save</code>, <code>memory_forget</code>, <code>memory_delete</code></li>
 <li>the silent pre-compaction memory flush</li>
 </ul>
 <p>Each mutation creates a manifest-backed snapshot in <code>~/.moltis/checkpoints/</code>
 before the write or delete happens.</p>
+<h2 id="rollback-command"><a class="header" href="#rollback-command">/rollback Command</a></h2>
+<p>Available in the web UI, all channels (Telegram, Discord, Slack, etc.), and CLI.</p>
+<pre><code>/rollback           # list recent turns with file changes
+/rollback 1         # restore all files from turn 1
+/rollback diff 1    # preview which files were changed in turn 1
+</code></pre>
+<p>Turns are session-scoped — you only see checkpoints from your current session.</p>
+<h2 id="cleanup"><a class="header" href="#cleanup">Cleanup</a></h2>
+<p>When checkpoint count exceeds 500, the oldest 20% are automatically pruned.
+Cleanup runs lazily on each new checkpoint creation.</p>
 <h2 id="tool-surface"><a class="header" href="#tool-surface">Tool Surface</a></h2>
 <h3 id="checkpoints_list"><a class="header" href="#checkpoints_list"><code>checkpoints_list</code></a></h3>
 <p>List recent automatic checkpoints.</p>

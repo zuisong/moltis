@@ -221,9 +221,9 @@ the bound agent.</li>
 <li>The resulting session is visible in the web UI like any other conversation.</li>
 </ol>
 <h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
-<p>Webhooks are configured exclusively from <strong>Settings → Webhooks</strong> in the web UI.
-They are not part of the onboarding flow.</p>
-<h3 id="creating-a-webhook"><a class="header" href="#creating-a-webhook">Creating a Webhook</a></h3>
+<p>Webhooks can be created from the <strong>web UI</strong>, the <strong>CLI</strong>, or by the <strong>agent</strong> itself
+using the <code>webhook</code> tool. They are not part of the onboarding flow.</p>
+<h3 id="creating-a-webhook-web-ui"><a class="header" href="#creating-a-webhook-web-ui">Creating a Webhook (Web UI)</a></h3>
 <ol>
 <li>Navigate to <strong>Settings → Webhooks</strong> and click <strong>Create webhook</strong>.</li>
 <li>Choose a <strong>source profile</strong> (GitHub, GitLab, Stripe, or Generic).</li>
@@ -233,6 +233,31 @@ They are not part of the onboarding flow.</p>
 <li>Click <strong>Create</strong> — the endpoint URL is displayed with a copy button.</li>
 <li>Register this URL in the external service’s webhook settings.</li>
 </ol>
+<h3 id="creating-a-webhook-cli"><a class="header" href="#creating-a-webhook-cli">Creating a Webhook (CLI)</a></h3>
+<pre><code class="language-bash">moltis webhooks create \
+  --name github-pr-review \
+  --source-profile github \
+  --auth-mode github_hmac_sha256 \
+  --events "pull_request.opened,pull_request.synchronize" \
+  --system-prompt "Review this PR for security issues"
+</code></pre>
+<p>For a zero-cost event forwarder (no LLM tokens):</p>
+<pre><code class="language-bash">moltis webhooks create \
+  --name stripe-payments \
+  --source-profile stripe \
+  --auth-mode stripe_webhook_signature \
+  --deliver-only \
+  --prompt-template "Payment: {data.object.amount} {data.object.currency} from {data.object.customer_email}" \
+  --deliver-to telegram \
+  --events "payment_intent.succeeded"
+</code></pre>
+<h3 id="creating-a-webhook-agent-tool"><a class="header" href="#creating-a-webhook-agent-tool">Creating a Webhook (Agent Tool)</a></h3>
+<p>The agent can create webhooks programmatically using the <code>webhook</code> tool:</p>
+<blockquote>
+<p>“Set up a webhook for GitHub issues on my repo and forward them to my Slack channel”</p>
+</blockquote>
+<p>The agent will use the <code>webhook</code> tool with <code>action: "create"</code> to set up the endpoint,
+then tell you the URL to register in GitHub’s settings.</p>
 <h3 id="endpoint-url"><a class="header" href="#endpoint-url">Endpoint URL</a></h3>
 <p>Each webhook gets a stable, high-entropy public URL:</p>
 <pre><code>https://your-moltis-host/api/webhooks/ingest/wh_a1b2c3d4e5f6...
@@ -618,6 +643,95 @@ and suggest next steps.
 <tr><td><code>webhooks_worker_queue_depth</code></td><td>Gauge</td><td>Pending deliveries in worker queue</td></tr>
 </tbody></table>
 </div>
+<h2 id="deliver-only-mode-webhook-proxy"><a class="header" href="#deliver-only-mode-webhook-proxy">Deliver-Only Mode (Webhook Proxy)</a></h2>
+<p>By default, each webhook delivery triggers an agent run — the LLM processes the
+event, reasons about it, and optionally acts using tools. This costs tokens and
+takes seconds.</p>
+<p><strong>Deliver-only mode</strong> skips the agent entirely. The webhook payload is rendered
+through a template and forwarded directly to a channel. Zero LLM tokens,
+sub-second delivery.</p>
+<p>This turns Moltis into a <strong>webhook proxy</strong>: external services POST events, and
+formatted messages appear in your Telegram, Discord, Slack, or any other
+configured channel.</p>
+<h3 id="when-to-use-deliver-only"><a class="header" href="#when-to-use-deliver-only">When to Use Deliver-Only</a></h3>
+<ul>
+<li><strong>Monitoring alerts</strong>: Datadog/Grafana/Sentry → Discord</li>
+<li><strong>Payment notifications</strong>: Stripe → Telegram</li>
+<li><strong>CI/CD status</strong>: GitHub Actions → Slack</li>
+<li><strong>Inter-service notifications</strong>: any HTTP POST → any channel</li>
+<li><strong>High-volume events</strong>: where per-event LLM calls would be wasteful</li>
+</ul>
+<h3 id="configuration"><a class="header" href="#configuration">Configuration</a></h3>
+<p>Set <code>deliver_only: true</code> and provide a <code>prompt_template</code> with <code>{dot.notation}</code>
+variables, plus a <code>deliver_to</code> channel target.</p>
+<p><strong>Web UI</strong>: Toggle “Deliver only” in the webhook settings, fill in the template
+and target channel.</p>
+<p><strong>CLI</strong>:</p>
+<pre><code class="language-bash">moltis webhooks create \
+  --name deploy-status \
+  --source-profile generic \
+  --auth-mode static_header \
+  --deliver-only \
+  --prompt-template "Deploy {status}: {environment} ({commit_sha})" \
+  --deliver-to slack
+</code></pre>
+<p><strong>Agent</strong>: The agent can also create deliver-only webhooks using the <code>webhook</code> tool.</p>
+<h3 id="how-it-works-1"><a class="header" href="#how-it-works-1">How It Works</a></h3>
+<pre><code>External Service POSTs event
+        │
+        ▼
+┌──────────────────────────────────┐
+│         Ingress Handler          │
+│  verify → filter → dedup → 202  │
+└──────────────┬───────────────────┘
+               │
+               ▼
+┌──────────────────────────────────┐
+│       Background Worker          │
+│  render template → deliver to    │
+│  channel → mark completed        │
+│  (no agent, no LLM tokens)       │
+└──────────────────────────────────┘
+</code></pre>
+<h2 id="template-rendering"><a class="header" href="#template-rendering">Template Rendering</a></h2>
+<p>Templates use <code>{dot.notation}</code> to interpolate values from the webhook JSON payload.</p>
+<div class="table-wrapper"><table><thead><tr><th>Syntax</th><th>Resolves to</th></tr></thead><tbody>
+<tr><td><code>{action}</code></td><td>Top-level field: <code>payload["action"]</code></td></tr>
+<tr><td><code>{pull_request.title}</code></td><td>Nested: <code>payload["pull_request"]["title"]</code></td></tr>
+<tr><td><code>{pull_request.user.login}</code></td><td>Deep nested: <code>payload["pull_request"]["user"]["login"]</code></td></tr>
+<tr><td><code>{__raw__}</code></td><td>Full payload as indented JSON (truncated at 4000 chars)</td></tr>
+</tbody></table>
+</div>
+<ul>
+<li><strong>Missing keys</strong> are left as literal <code>{key}</code> in the output (no error).</li>
+<li><strong>Objects and arrays</strong> are JSON-serialized (truncated at 2000 chars).</li>
+<li><strong>Strings and numbers</strong> are inserted directly.</li>
+</ul>
+<p>Templates work in both <code>prompt_template</code> (the message body) and <code>deliver_extra</code>
+values (channel-specific metadata like chat IDs).</p>
+<h3 id="example-github-issue--telegram"><a class="header" href="#example-github-issue--telegram">Example: GitHub Issue → Telegram</a></h3>
+<pre><code class="language-bash">moltis webhooks create \
+  --name github-issues \
+  --source-profile github \
+  --auth-mode github_hmac_sha256 \
+  --deliver-only \
+  --prompt-template "#{issue.number} {issue.title} ({action} by {sender.login})" \
+  --deliver-to telegram \
+  --events "issues.opened,issues.closed"
+</code></pre>
+<p>When someone opens issue #42 “Fix auth bug”, Telegram receives:</p>
+<pre><code>#42 Fix auth bug (opened by alice)
+</code></pre>
+<h3 id="example-stripe-payment--discord"><a class="header" href="#example-stripe-payment--discord">Example: Stripe Payment → Discord</a></h3>
+<pre><code class="language-bash">moltis webhooks create \
+  --name stripe-notify \
+  --source-profile stripe \
+  --auth-mode stripe_webhook_signature \
+  --deliver-only \
+  --prompt-template "Payment {data.object.status}: {data.object.amount} cents ({data.object.currency})" \
+  --deliver-to discord \
+  --events "payment_intent.succeeded,payment_intent.payment_failed"
+</code></pre>
 <h2 id="comparison-with-channels-and-cron"><a class="header" href="#comparison-with-channels-and-cron">Comparison with Channels and Cron</a></h2>
 <div class="table-wrapper"><table><thead><tr><th></th><th>Channels</th><th>Webhooks</th><th>Cron</th></tr></thead><tbody>
 <tr><td><strong>Purpose</strong></td><td>Human messaging</td><td>Machine event ingress</td><td>Scheduled tasks</td></tr>

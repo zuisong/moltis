@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Session Branching - Moltis Documentation</title>
+        <title>Slash Commands - Moltis Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -149,7 +149,7 @@
                         <a href="https://github.com/moltis-org/moltis" title="Git repository" aria-label="Git repository">
                             <i id="git-repository-button" class="fa fa-github"></i>
                         </a>
-                        <a href="https://github.com/moltis-org/moltis/edit/main/docs/src/src/session-branching.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/moltis-org/moltis/edit/main/docs/src/src/commands.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <i id="git-edit-button" class="fa fa-edit"></i>
                         </a>
 
@@ -183,122 +183,126 @@
 
                 <div id="content" class="content">
                     <main>
-                        <h1 id="session-branching"><a class="header" href="#session-branching">Session Branching</a></h1>
-<p>Session branching (forking) lets you create an independent copy of a
-conversation at any point. The new session diverges without affecting the
-original — useful for exploring alternative approaches, running “what if”
-scenarios, or preserving a checkpoint before a risky prompt.</p>
-<h2 id="fork-command"><a class="header" href="#fork-command">/fork Command</a></h2>
-<p>The quickest way to fork — type in the chat input or on any channel:</p>
-<pre><code>/fork                    # fork with auto-generated label
-/fork experiment-a       # fork with a custom label
-</code></pre>
-<p>Available in the web UI, Telegram, Discord, Slack, Matrix, and all other
-channels. See <a href="commands.html">Slash Commands</a> for the full list.</p>
-<h2 id="forking-from-the-ui"><a class="header" href="#forking-from-the-ui">Forking from the UI</a></h2>
-<p>There are three ways to fork a session:</p>
-<ul>
-<li><strong><code>/fork</code> command</strong> — type <code>/fork [label]</code> in the chat input.</li>
-<li><strong>Chat header</strong> — click the <strong>Fork</strong> button in the header bar (next to
-Delete). This is visible for every session except cron sessions.</li>
-<li><strong>Sidebar</strong> — hover over a session in the sidebar and click the fork icon
-that appears in the action buttons.</li>
-</ul>
-<p>All three create a new session that copies all messages from the current one and
-immediately switch you to it.</p>
-<p>Forked sessions appear <strong>indented</strong> under their parent in the sidebar, with a
-branch icon to distinguish them from top-level sessions. The metadata line
-shows <code>fork@N</code> where N is the message index at which the fork occurred.</p>
-<h2 id="agent-tool"><a class="header" href="#agent-tool">Agent Tool</a></h2>
-<p>The agent can also fork programmatically using the <code>branch_session</code> tool:</p>
-<pre><code class="language-json">{
-  "fork_point": 5,
-  "label": "explore-alternative"
-}
-</code></pre>
-<ul>
-<li><strong><code>label</code></strong> — label for the new session (required).</li>
-<li><strong><code>fork_point</code></strong> — the message index to fork at (0-based). Messages at
-indices 0 through N-1 are copied; the message at index N becomes the
-first new message in the forked session. If omitted, all messages are
-copied.</li>
-</ul>
-<p>The tool returns <code>{ "key": "&lt;session-key&gt;", "forkPoint": N }</code>.</p>
-<h2 id="rpc-method"><a class="header" href="#rpc-method">RPC Method</a></h2>
-<p>The <code>sessions.fork</code> RPC method is the underlying mechanism:</p>
-<pre><code class="language-json">{ "key": "main", "forkPoint": 5, "label": "my-fork" }
-</code></pre>
-<p>On success the response payload contains <code>{ "sessionKey": "session:&lt;uuid&gt;", "forkPoint": N, "label": "..." }</code>.</p>
-<h2 id="what-gets-inherited"><a class="header" href="#what-gets-inherited">What Gets Inherited</a></h2>
-<p>When forking, the new session inherits:</p>
-<div class="table-wrapper"><table><thead><tr><th>Inherited</th><th>Not inherited</th></tr></thead><tbody>
-<tr><td>Messages (up to fork point)</td><td>Worktree branch</td></tr>
-<tr><td>Model selection</td><td>Sandbox settings</td></tr>
-<tr><td>Project assignment</td><td>Channel binding</td></tr>
-<tr><td>Agent ID</td><td></td></tr>
-<tr><td>MCP disabled flag</td><td></td></tr>
-<tr><td>Node assignment</td><td></td></tr>
+                        <h1 id="slash-commands"><a class="header" href="#slash-commands">Slash Commands</a></h1>
+<p>Slash commands are available in the <strong>web UI chat input</strong>, on all <strong>messaging
+channels</strong> (Telegram, Discord, Slack, Matrix, etc.), and where noted, via the
+<strong>CLI</strong>.</p>
+<p>Type <code>/</code> in the chat input to see the autocomplete popup.</p>
+<h2 id="session-management"><a class="header" href="#session-management">Session Management</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/new</code></td><td>Start a new session</td></tr>
+<tr><td><code>/clear</code></td><td>Clear session history</td></tr>
+<tr><td><code>/compact</code></td><td>Summarize conversation to save tokens</td></tr>
+<tr><td><code>/context</code></td><td>Show session context and project info</td></tr>
+<tr><td><code>/sessions</code></td><td>List and switch sessions (channels only)</td></tr>
+<tr><td><code>/attach</code></td><td>Attach an existing session to this channel (channels only)</td></tr>
+<tr><td><code>/fork [label]</code></td><td>Fork the current session into a new branch</td></tr>
 </tbody></table>
 </div>
-<h2 id="parent-child-relationships"><a class="header" href="#parent-child-relationships">Parent-Child Relationships</a></h2>
-<p>Fork relationships are stored directly on the <code>sessions</code> table:</p>
-<ul>
-<li><strong><code>parent_session_key</code></strong> — the key of the session this was forked from.</li>
-<li><strong><code>fork_point</code></strong> — the message index where the fork occurred.</li>
-</ul>
-<p>These fields drive the tree rendering in the sidebar. Sessions with a parent
-appear indented under it; deeply nested forks indent further.</p>
-<div id="admonition-deleting-a-parent" class="admonition admonish-warning" role="note" aria-labelledby="admonition-deleting-a-parent-title">
-<div class="admonition-title">
-<div id="admonition-deleting-a-parent-title">
-<p>Deleting a parent</p>
+<h3 id="fork"><a class="header" href="#fork">/fork</a></h3>
+<p>Creates an independent copy of the current conversation. The new session
+inherits the parent’s model, project, mode, and agent. Messages up to the
+current point are copied.</p>
+<pre><code>/fork experiment-a
+</code></pre>
+<p>Available in web UI, all channels, and via the <code>sessions.fork</code> RPC. See
+<a href="session-branching.html">Session Branching</a> for details.</p>
+<h2 id="control"><a class="header" href="#control">Control</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/agent [N]</code></td><td>Switch session agent</td></tr>
+<tr><td><code>/mode [N|name|none]</code></td><td>Switch session mode</td></tr>
+<tr><td><code>/model [N]</code></td><td>Switch provider/model</td></tr>
+<tr><td><code>/sandbox [on|off|image N]</code></td><td>Toggle sandbox and choose image</td></tr>
+<tr><td><code>/sh [on|off]</code></td><td>Enter command mode (passthrough to shell)</td></tr>
+<tr><td><code>/stop</code></td><td>Abort the current running agent</td></tr>
+<tr><td><code>/peek</code></td><td>Show current thinking/tool status</td></tr>
+<tr><td><code>/update [version]</code></td><td>Update moltis (owner-only)</td></tr>
+</tbody></table>
 </div>
-<a class="admonition-anchor-link" href="#admonition-deleting-a-parent"></a>
+<h2 id="quick-actions"><a class="header" href="#quick-actions">Quick Actions</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/btw &lt;question&gt;</code></td><td>Quick side question (no tools, not persisted)</td></tr>
+<tr><td><code>/fast [on|off|status]</code></td><td>Toggle fast/priority mode</td></tr>
+<tr><td><code>/insights [days]</code></td><td>Show usage analytics (tokens, providers)</td></tr>
+<tr><td><code>/steer &lt;text&gt;</code></td><td>Inject guidance into the current agent run</td></tr>
+<tr><td><code>/queue &lt;message&gt;</code></td><td>Queue a message for the next agent turn</td></tr>
+<tr><td><code>/rollback [N|diff N]</code></td><td>List or restore file checkpoints</td></tr>
+</tbody></table>
 </div>
-<div>
-<p>Deleting a parent session does <strong>not</strong> cascade to its children. Child sessions
-become top-level sessions — they keep their messages and history but lose
-their visual nesting in the sidebar.</p>
+<h3 id="btw"><a class="header" href="#btw">/btw</a></h3>
+<p>Ask a quick side question without tools and without persisting the exchange to
+session history. Uses the session’s current model and recent context (last 20
+messages) as read-only background.</p>
+<pre><code>/btw what's the default port for PostgreSQL?
+</code></pre>
+<p>The response appears inline and is discarded after display.</p>
+<h3 id="fast"><a class="header" href="#fast">/fast</a></h3>
+<p>Toggle fast/priority mode for the current session. When enabled, uses
+provider-specific priority processing where supported (Anthropic prompt caching
+priority, OpenAI priority processing).</p>
+<pre><code>/fast          # toggle
+/fast on       # enable
+/fast off      # disable
+/fast status   # check current state
+</code></pre>
+<p>Session-scoped — does not persist across gateway restarts.</p>
+<h3 id="insights"><a class="header" href="#insights">/insights</a></h3>
+<p>Show usage analytics from the metrics store. Displays LLM completions, token
+counts (input/output), errors, tool executions, and per-provider breakdowns.</p>
+<pre><code>/insights       # last 30 days (default)
+/insights 7     # last 7 days
+/insights 90    # last 90 days
+</code></pre>
+<p>In the web UI, <code>/insights</code> renders a formatted markdown table inline. The same
+data is available as a dashboard in <strong>Monitoring &gt; Insights</strong> tab, and via the
+REST API at <code>GET /api/metrics/insights?days=N</code>.</p>
+<h3 id="steer"><a class="header" href="#steer">/steer</a></h3>
+<p>Inject guidance into an active agent run without interrupting it. The text is
+seen by the LLM on its next iteration (after the current tool call completes).</p>
+<pre><code>/steer use the staging API, not production
+/steer focus on security issues only
+</code></pre>
+<p>Only works while an agent run is active. If no run is active, returns an error.</p>
+<h3 id="queue"><a class="header" href="#queue">/queue</a></h3>
+<p>Queue a message for the next agent turn without interrupting the current one.
+When the active run finishes, the queued message is automatically submitted.</p>
+<pre><code>/queue now write tests for what you just built
+</code></pre>
+<p>If no run is active, the message is sent immediately.</p>
+<h3 id="rollback"><a class="header" href="#rollback">/rollback</a></h3>
+<p>List and restore file checkpoints created by the automatic checkpointing
+system. Before every <code>Write</code>, <code>Edit</code>, or <code>MultiEdit</code> tool call, the original
+file is snapshotted.</p>
+<pre><code>/rollback           # list recent turns with file changes
+/rollback 1         # restore all files from turn 1
+/rollback diff 1    # preview which files were changed in turn 1
+</code></pre>
+<p>Checkpoints are grouped by <strong>turn</strong> (one user message = one turn). Restoring a
+turn reverts all files that were modified during that turn to their pre-turn
+state.</p>
+<p>See <a href="checkpoints.html">Checkpoints</a> for details on the automatic checkpointing
+system.</p>
+<h2 id="approval-management"><a class="header" href="#approval-management">Approval Management</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/approvals</code></td><td>List pending exec approvals</td></tr>
+<tr><td><code>/approve [N]</code></td><td>Approve a pending exec request</td></tr>
+<tr><td><code>/deny [N]</code></td><td>Deny a pending exec request</td></tr>
+</tbody></table>
 </div>
+<h2 id="help"><a class="header" href="#help">Help</a></h2>
+<div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
+<tr><td><code>/help</code></td><td>Show available commands (handled locally by each channel)</td></tr>
+</tbody></table>
 </div>
-<h2 id="navigation-after-delete"><a class="header" href="#navigation-after-delete">Navigation After Delete</a></h2>
-<p>When you delete a forked session, the UI navigates back to its parent session.
-If the deleted session had no parent (or the parent no longer exists), it falls
-back to the next sibling or <code>main</code>.</p>
-<h2 id="archive-in-the-ui"><a class="header" href="#archive-in-the-ui">Archive in the UI</a></h2>
-<p>The web UI also lets you archive sessions when you want to keep them without
-leaving them in the main sidebar list.</p>
-<ul>
-<li>Open <strong>More controls</strong> for a session and click <strong>Archive</strong>.</li>
-<li>Archived sessions are hidden from the default sidebar list.</li>
-<li>Enable <strong>Show archived sessions</strong> in the sidebar to reveal and restore them.</li>
-</ul>
-<p>Archive is available for any non-<code>main</code> session, including cron and
-channel-bound chats, except when the session is the current active session for
-its bound channel chat. That prevents hiding the live Telegram, Discord, or
-similar chat out from under the channel router.</p>
-<div id="admonition-independence" class="admonition admonish-info" role="note" aria-labelledby="admonition-independence-title">
-<div class="admonition-title">
-<div id="admonition-independence-title">
-<p>Independence</p>
-</div>
-<a class="admonition-anchor-link" href="#admonition-independence"></a>
-</div>
-<div>
-<p>A forked session is fully independent after creation. Changes to the parent
-do not propagate to the fork, and vice versa.</p>
-</div>
-</div>
-
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="modes.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="session-state.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="checkpoints.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="modes.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -308,11 +312,11 @@ do not propagate to the fork, and vice versa.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="modes.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="session-state.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="checkpoints.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="modes.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>
