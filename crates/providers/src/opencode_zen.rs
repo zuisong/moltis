@@ -263,10 +263,23 @@ mod tests {
     #[test]
     fn classify_gpt_uses_responses() {
         let gpt_models = [
-            "gpt-5.5", "gpt-5.5-pro", "gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini",
-            "gpt-5.4-nano", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2",
-            "gpt-5.2-codex", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-max",
-            "gpt-5.1-codex-mini", "gpt-5", "gpt-5-codex", "gpt-5-nano",
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-pro",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.3-codex",
+            "gpt-5.3-codex-spark",
+            "gpt-5.2",
+            "gpt-5.2-codex",
+            "gpt-5.1",
+            "gpt-5.1-codex",
+            "gpt-5.1-codex-max",
+            "gpt-5.1-codex-mini",
+            "gpt-5",
+            "gpt-5-codex",
+            "gpt-5-nano",
         ];
         for id in &gpt_models {
             assert!(
@@ -279,8 +292,13 @@ mod tests {
     #[test]
     fn classify_claude_uses_anthropic() {
         let claude_models = [
-            "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1",
-            "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4",
             "claude-haiku-4-5",
         ];
         for id in &claude_models {
@@ -294,11 +312,22 @@ mod tests {
     #[test]
     fn classify_other_uses_chat_completions() {
         let other_models = [
-            "gemini-3.1-pro", "gemini-3-flash", "glm-5.1", "glm-5",
-            "minimax-m2.7", "minimax-m2.5", "minimax-m2.5-free",
-            "kimi-k2.6", "kimi-k2.5", "qwen3.6-plus", "qwen3.5-plus",
-            "big-pickle", "hy3-preview-free", "ling-2.6-flash-free",
-            "trinity-large-preview-free", "nemotron-3-super-free",
+            "gemini-3.1-pro",
+            "gemini-3-flash",
+            "glm-5.1",
+            "glm-5",
+            "minimax-m2.7",
+            "minimax-m2.5",
+            "minimax-m2.5-free",
+            "kimi-k2.6",
+            "kimi-k2.5",
+            "qwen3.6-plus",
+            "qwen3.5-plus",
+            "big-pickle",
+            "hy3-preview-free",
+            "ling-2.6-flash-free",
+            "trinity-large-preview-free",
+            "nemotron-3-super-free",
         ];
         for id in &other_models {
             assert!(

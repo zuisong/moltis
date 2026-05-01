@@ -162,14 +162,13 @@ impl ProviderRegistry {
                 if self.has_provider_model(&provider_label, &model.id) {
                     continue;
                 }
-                let provider: Arc<dyn LlmProvider> =
-                    Arc::new(opencode_zen::ZenProvider::new(
-                        key.clone(),
-                        model.id.clone(),
-                        base_url.clone(),
-                        global_cw.clone(),
-                        provider_cw.clone(),
-                    ));
+                let provider: Arc<dyn LlmProvider> = Arc::new(opencode_zen::ZenProvider::new(
+                    key.clone(),
+                    model.id.clone(),
+                    base_url.clone(),
+                    global_cw.clone(),
+                    provider_cw.clone(),
+                ));
                 self.register(
                     ModelInfo {
                         id: model.id.clone(),

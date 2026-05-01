@@ -957,7 +957,7 @@ function BundledCategoriesSection(): VNode {
 		fetchBundledCategories();
 	}, []);
 
-	if (!cats.length) return <></>;
+	if (!cats.length) return null;
 
 	function toggle(cat: BundledCategory): void {
 		if (toggling.value) return;
