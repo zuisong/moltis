@@ -47,9 +47,11 @@ export default {
 	// ── Reasoning toggle ─────────────────────────────────────
 	reasoningTooltip: "推理強度",
 	reasoningOff: "關閉",
+	reasoningMinimal: "最低",
 	reasoningLow: "低",
 	reasoningMedium: "中",
 	reasoningHigh: "高",
+	reasoningExtraHigh: "極高",
 
 	// ── Debug panel ──────────────────────────────────────────
 	debugTooltip: "顯示上下文除錯資訊",

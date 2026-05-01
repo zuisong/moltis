@@ -5,7 +5,8 @@ export default {
 	title: "Skills",
 	refresh: "重新整理",
 	emergencyDisable: "緊急停用",
-	description: "從專案、個人及已安裝路徑中探索到的 SKILL.md Skills。匯入的 Skill Pack 會保持隔離，直到明確解除隔離為止。",
+	description:
+		"從專案、個人及已安裝路徑中探索到的 SKILL.md Skills。匯入的 Skill Pack 會保持隔離，直到明確解除隔離為止。",
 	howToWriteSkill: "如何撰寫 Skill？",
 
 	// ── Emergency disable ───────────────────────────────────
