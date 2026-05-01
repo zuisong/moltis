@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260501.01] - 2026-05-01
+### Added
+- [providers] Add Zen (opencode.ai) multi-protocol provider (#944)
+- [web-ui] Hide voice buttons when stt/tts disabled in config (#943)
+
 ## [20260430.02] - 2026-04-30
 ### Added
 - [web-ui] Add message action bar to assistant responses (#932)
