@@ -419,38 +419,33 @@ impl MsTeamsPlugin {
                 && let Some(arg) = &def.arg
                 && !arg.choices.is_empty()
             {
-                    let rows: Vec<moltis_channels::ButtonRow> = arg
-                        .choices
-                        .iter()
-                        .map(|&(label, value)| {
-                            vec![moltis_channels::InteractiveButton {
-                                label: label.to_string(),
-                                callback_data: format!("/{cmd_name} {value}"),
-                                style: moltis_channels::ButtonStyle::Default,
-                            }]
-                        })
-                        .collect();
-                    let card = moltis_channels::InteractiveMessage {
-                        text: format!("/{cmd_name}:"),
-                        button_rows: rows,
-                        replace_message_id: None,
-                    };
-                    if let Err(e) = self
-                        .outbound
-                        .send_interactive(
-                            account_id,
-                            &chat_id,
-                            &card,
-                            reply_to.message_id.as_deref(),
-                        )
-                        .await
-                    {
-                        warn!(
-                            account_id,
-                            chat_id, "failed to send Teams choices card: {e}"
-                        );
-                    }
-                    return Ok(());
+                let rows: Vec<moltis_channels::ButtonRow> = arg
+                    .choices
+                    .iter()
+                    .map(|&(label, value)| {
+                        vec![moltis_channels::InteractiveButton {
+                            label: label.to_string(),
+                            callback_data: format!("/{cmd_name} {value}"),
+                            style: moltis_channels::ButtonStyle::Default,
+                        }]
+                    })
+                    .collect();
+                let card = moltis_channels::InteractiveMessage {
+                    text: format!("/{cmd_name}:"),
+                    button_rows: rows,
+                    replace_message_id: None,
+                };
+                if let Err(e) = self
+                    .outbound
+                    .send_interactive(account_id, &chat_id, &card, reply_to.message_id.as_deref())
+                    .await
+                {
+                    warn!(
+                        account_id,
+                        chat_id, "failed to send Teams choices card: {e}"
+                    );
+                }
+                return Ok(());
             }
 
             match sink
