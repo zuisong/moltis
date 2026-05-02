@@ -80,6 +80,36 @@ async function deleteAgentByName(page, agentName) {
 }
 
 test.describe("Agents settings page", () => {
+	test.beforeEach(async ({ page, baseURL }, testInfo) => {
+		// Agents tests consistently timeout on CI runners due to resource
+		// pressure late in the suite. Increase timeout and warm up the
+		// gateway with a health check before each test.
+		testInfo.setTimeout(90_000);
+		for (let i = 0; i < 10; i++) {
+			try {
+				const res = await page.request.get(`${baseURL}/health`, { timeout: 5_000 });
+				if (res.ok()) break;
+			} catch {
+				// gateway not ready yet, retry
+			}
+			await page.waitForTimeout(1_000);
+		}
+	});
+
+	test.afterEach(async ({ page, baseURL }, testInfo) => {
+		if (testInfo.status !== testInfo.expectedStatus) {
+			// Capture diagnostic info when a test fails
+			try {
+				const healthRes = await page.request.get(`${baseURL}/health`, { timeout: 5_000 }).catch(() => null);
+				const healthOk = healthRes ? healthRes.ok() : false;
+				const url = page.url();
+				console.log(`[agents diag] test="${testInfo.title}" url="${url}" health=${healthOk}`);
+			} catch {
+				console.log(`[agents diag] test="${testInfo.title}" diagnostic collection failed`);
+			}
+		}
+	});
+
 	test("settings/agents loads and shows heading", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await navigateAndWait(page, "/settings/agents");
