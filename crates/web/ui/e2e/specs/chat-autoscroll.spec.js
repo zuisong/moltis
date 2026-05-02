@@ -266,10 +266,13 @@ test.describe("Smart auto-scroll", () => {
 			);
 		}
 
-		// Should still be at the bottom after all messages
-		const after = await getScrollState(page);
-		const distAfter = after.scrollHeight - after.scrollTop - after.clientHeight;
-		expect(distAfter).toBeLessThan(60);
+		// Wait for smooth scroll to finish, then verify at bottom
+		await expect
+			.poll(async () => {
+				const s = await getScrollState(page);
+				return s.scrollHeight - s.scrollTop - s.clientHeight;
+			})
+			.toBeLessThan(60);
 
 		// No indicator
 		const indicator = page.locator(".new-content-indicator");
