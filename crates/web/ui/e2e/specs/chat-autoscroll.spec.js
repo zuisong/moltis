@@ -47,10 +47,19 @@ async function injectScrollableMessages(page, count) {
 				el.style.minHeight = "80px";
 				box.appendChild(el);
 			}
+			// Force layout so scrollHeight is accurate before scrolling
+			void box.scrollHeight;
 			box.scrollTop = box.scrollHeight;
 		},
 		{ prefix, msgCount: count },
 	);
+	// Wait for scroll to settle on slow CI runners
+	await expect
+		.poll(async () => {
+			const s = await getScrollState(page);
+			return s.scrollHeight - s.scrollTop - s.clientHeight;
+		})
+		.toBeLessThan(60);
 }
 
 /**
@@ -253,23 +262,23 @@ test.describe("Smart auto-scroll", () => {
 		const before = await getScrollState(page);
 		expect(before.scrollHeight - before.scrollTop - before.clientHeight).toBeLessThan(60);
 
-		// Simulate streaming: add several messages in sequence while remaining at bottom
+		// Simulate streaming: add several messages one at a time (matching real WS
+		// event delivery where each chunk arrives in a separate event loop turn).
+		const prefix = await getModulePrefix(page);
 		for (let i = 0; i < 5; i++) {
 			await page.evaluate(
-				async ({ idx }) => {
-					var appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
-					var appUrl = new URL(appScript.src, window.location.origin);
-					var prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
-					var chatUi = await import(`${prefix}js/chat-ui.js`);
-					var el = chatUi.chatAddMsg("assistant", `Streaming chunk ${idx}`);
-					if (el) el.style.minHeight = "60px";
-					await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+				async ({ pfx, idx }) => {
+					var chatUi = await import(`${pfx}js/chat-ui.js`);
+					chatUi.chatAddMsg("assistant", `Streaming chunk ${idx}`);
 				},
-				{ idx: i },
+				{ pfx: prefix, idx: i },
 			);
+			// Let the rAF-based scroll from smartScrollToBottom complete
+			// before adding the next message.
+			await page.waitForTimeout(100);
 		}
 
-		// Wait for smooth scroll to finish, then verify at bottom
+		// Wait for final scroll to settle
 		await expect
 			.poll(async () => {
 				const s = await getScrollState(page);
