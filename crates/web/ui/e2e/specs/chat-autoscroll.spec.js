@@ -32,31 +32,41 @@ async function getModulePrefix(page) {
 }
 
 /**
- * Populate the chat message box with enough tall messages to make it scrollable.
+ * Populate the chat with enough messages to make it scrollable.
+ * Uses the app's RPC system-event to inject real messages that survive
+ * re-renders (unlike raw DOM injection which gets wiped by renderHistory).
  */
 async function injectScrollableMessages(page, count) {
 	const prefix = await getModulePrefix(page);
-	// Set chatBatchLoading=true to prevent any async re-render from blowing
-	// away our injected DOM, then inject and scroll.
+	// Inject all messages at once via a batch of system-events
 	await page.evaluate(
-		async ({ prefix, msgCount }) => {
-			var state = await import(`${prefix}js/state.js`);
-			state.setChatBatchLoading(true);
-			var box = document.getElementById("messages");
-			if (!box) throw new Error("chatMsgBox not mounted");
+		async ({ pfx, msgCount }) => {
+			var helpers = await import(`${pfx}js/helpers.js`);
 			for (var i = 0; i < msgCount; i++) {
-				var el = document.createElement("div");
-				el.className = "msg assistant";
-				el.textContent = `Message ${i + 1}`;
-				el.style.minHeight = "80px";
-				box.appendChild(el);
+				await helpers.sendRpc("system-event", {
+					event: "chat",
+					payload: {
+						sessionKey: window.__moltis_state?.activeSessionKey || "main",
+						state: "final",
+						text: "M".repeat(200),
+						messageIndex: 900000 + i,
+						model: "test",
+						provider: "test",
+					},
+				});
 			}
-			void box.scrollHeight;
-			box.scrollTop = box.scrollHeight;
-			state.setChatBatchLoading(false);
 		},
-		{ prefix, msgCount: count },
+		{ pfx: prefix, msgCount: count },
 	);
+	// Wait for all messages to render and scroll to settle at bottom
+	await expect
+		.poll(() => page.locator("#messages .msg.assistant").count(), { timeout: 15_000 })
+		.toBeGreaterThanOrEqual(count);
+	// Scroll to bottom
+	await page.evaluate(() => {
+		var box = document.getElementById("messages");
+		if (box) box.scrollTop = box.scrollHeight;
+	});
 	await expect
 		.poll(async () => {
 			const s = await getScrollState(page);
