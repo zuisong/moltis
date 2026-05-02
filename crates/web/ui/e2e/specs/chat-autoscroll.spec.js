@@ -1,5 +1,5 @@
 const { expect, test } = require("../base-test");
-const { navigateAndWait, waitForWsConnected, watchPageErrors } = require("../helpers");
+const { createSession, navigateAndWait, waitForWsConnected, watchPageErrors } = require("../helpers");
 
 /**
  * Wait for the chat session to finish loading AND WS subscribed so injected
@@ -46,8 +46,12 @@ async function getModulePrefix(page) {
  */
 async function injectScrollableMessages(page, count) {
 	const prefix = await getModulePrefix(page);
+	// Set chatBatchLoading=true to prevent any async re-render from blowing
+	// away our injected DOM, then inject and scroll.
 	await page.evaluate(
-		({ prefix, msgCount }) => {
+		async ({ prefix, msgCount }) => {
+			var state = await import(`${prefix}js/state.js`);
+			state.setChatBatchLoading(true);
 			var box = document.getElementById("messages");
 			if (!box) throw new Error("chatMsgBox not mounted");
 			for (var i = 0; i < msgCount; i++) {
@@ -57,13 +61,12 @@ async function injectScrollableMessages(page, count) {
 				el.style.minHeight = "80px";
 				box.appendChild(el);
 			}
-			// Force layout so scrollHeight is accurate before scrolling
 			void box.scrollHeight;
 			box.scrollTop = box.scrollHeight;
+			state.setChatBatchLoading(false);
 		},
 		{ prefix, msgCount: count },
 	);
-	// Wait for scroll to settle on slow CI runners
 	await expect
 		.poll(async () => {
 			const s = await getScrollState(page);
@@ -88,9 +91,10 @@ test.describe("Smart auto-scroll", () => {
 		await navigateAndWait(page, "/chats/main");
 		await waitForWsConnected(page);
 		await waitForSessionReady(page);
-		// Clear any messages from previous tests to prevent renderHistory()
-		// from overwriting injected DOM elements during the test.
-		await clearChat(page);
+		// Create a fresh session so no prior history can re-render and
+		// overwrite injected DOM elements during the test.
+		await createSession(page);
+		await waitForSessionReady(page);
 	});
 
 	test("new content indicator appears when scrolled up and new message arrives", async ({ page }) => {
