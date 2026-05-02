@@ -19,7 +19,6 @@ async function waitForSessionReady(page) {
 	);
 }
 
-
 /**
  * Resolve the Vite module prefix from the running page.
  */
