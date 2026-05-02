@@ -98,12 +98,20 @@ test.describe("Agents settings page", () => {
 
 	test.afterEach(async ({ page, baseURL }, testInfo) => {
 		if (testInfo.status !== testInfo.expectedStatus) {
-			// Capture diagnostic info when a test fails
 			try {
+				const failedUrl = page.url();
 				const healthRes = await page.request.get(`${baseURL}/health`, { timeout: 5_000 }).catch(() => null);
 				const healthOk = healthRes ? healthRes.ok() : false;
-				const url = page.url();
-				console.log(`[agents diag] test="${testInfo.title}" url="${url}" health=${healthOk}`);
+				const healthBody = healthRes ? await healthRes.text().catch(() => "") : "no response";
+				console.log(`[agents diag] test="${testInfo.title}" url="${failedUrl}" health=${healthOk} body="${healthBody}"`);
+
+				// Navigate to a known-working page and screenshot it to prove
+				// whether the gateway is alive or completely unresponsive.
+				await page.goto(`${baseURL}/chats/main`, { timeout: 15_000, waitUntil: "domcontentloaded" }).catch(() => null);
+				const probeScreenshot = await page.screenshot().catch(() => null);
+				if (probeScreenshot) {
+					await testInfo.attach("probe-chats-main", { body: probeScreenshot, contentType: "image/png" });
+				}
 			} catch {
 				console.log(`[agents diag] test="${testInfo.title}" diagnostic collection failed`);
 			}
