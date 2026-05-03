@@ -35,9 +35,7 @@ var test = base.extend({
 					// is alive and what state the app is in.
 					if (url === "about:blank") {
 						var baseURL = testInfo.project.use?.baseURL || "http://127.0.0.1";
-						await p
-							.goto(baseURL, { waitUntil: "load", timeout: 10_000 })
-							.catch(() => {});
+						await p.goto(baseURL, { waitUntil: "load", timeout: 10_000 }).catch(() => {});
 					}
 					var screenshot = await p.screenshot({ fullPage: true }).catch(() => null);
 					if (screenshot) {
