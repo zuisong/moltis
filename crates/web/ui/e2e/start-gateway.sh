@@ -40,6 +40,8 @@ cd "${REPO_ROOT}"
 export MOLTIS_CONFIG_DIR="${CONFIG_DIR}"
 export MOLTIS_DATA_DIR="${DATA_DIR}"
 export MOLTIS_SERVER__PORT="${PORT}"
+# Enable debug logging for gon/template tracing to diagnose page-render deadlocks.
+export RUST_LOG="${RUST_LOG:-moltis_web::templates=debug,info}"
 
 binary_is_stale() {
 	local binary="$1"
@@ -77,8 +79,10 @@ if [ -n "${BINARY}" ] && binary_is_stale "${BINARY}"; then
 	BINARY=""
 fi
 
+GATEWAY_LOG="${RUNTIME_ROOT}/gateway.log"
+
 if [ -n "${BINARY}" ]; then
-	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}"
+	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}" 2>&1 | tee "${GATEWAY_LOG}"
 else
-	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}"
+	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}" 2>&1 | tee "${GATEWAY_LOG}"
 fi

@@ -374,6 +374,8 @@ pub(crate) async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
 pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
     const GON_SESSIONS_RECENT_LIMIT: usize = 30;
 
+    let gon_start = std::time::Instant::now();
+
     let port = gw.port;
     let identity = gw
         .services
@@ -383,8 +385,10 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: identity");
 
     let mut counts = build_nav_counts(gw).await;
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: nav_counts");
 
     // Read all fields from gw.inner in a SINGLE lock acquisition to avoid
     // deadlocks with concurrent write-lock requests (tokio's fair RwLock
@@ -399,6 +403,7 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         )
     };
     counts.hooks = hooks_count;
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: inner_read");
 
     let (crons, cron_status, webhooks_val, webhook_profiles_val) = tokio::join!(
         gw.services.cron.list(),
@@ -406,6 +411,7 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         gw.services.webhooks.list(),
         gw.services.webhooks.profiles(),
     );
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: crons+webhooks");
     let webhooks: Vec<serde_json::Value> = webhooks_val
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
@@ -437,6 +443,7 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: heartbeat_runs");
 
     let sandbox = if let Some(ref router) = gw.sandbox_router {
         SandboxGonInfo {
@@ -456,6 +463,8 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         }
     };
 
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: sandbox");
+
     // Fetch agent personas for the gon data.
     let agents: Vec<serde_json::Value> = if let Some(ref store) = gw.services.agent_persona_store {
         store
@@ -472,7 +481,17 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         Vec::new()
     };
 
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: agents");
+
     let sessions_recent = build_recent_sessions_snapshot(gw, GON_SESSIONS_RECENT_LIMIT).await;
+    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: sessions_recent");
+
+    let total_ms = gon_start.elapsed().as_millis();
+    if total_ms > 1000 {
+        tracing::warn!(elapsed_ms = total_ms, "gon: build_gon_data slow");
+    } else {
+        tracing::debug!(elapsed_ms = total_ms, "gon: build_gon_data complete");
+    }
 
     GonData {
         identity,
