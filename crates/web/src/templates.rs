@@ -319,18 +319,22 @@ pub(crate) async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
         })
         .unwrap_or(0);
 
-    let mut skills = 0usize;
-    if let Ok(path) = moltis_skills::manifest::ManifestStore::default_path() {
+    let skills = tokio::task::spawn_blocking(|| {
+        let path = moltis_skills::manifest::ManifestStore::default_path().ok()?;
         let store = moltis_skills::manifest::ManifestStore::new(path);
-        if let Ok(m) = store.load() {
-            skills = m
-                .repos
+        let m = store.load().ok()?;
+        Some(
+            m.repos
                 .iter()
                 .flat_map(|r| &r.skills)
                 .filter(|s| s.enabled)
-                .count();
-        }
-    }
+                .count(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
 
     let mcp = mcp
         .ok()
@@ -440,7 +444,10 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let channels_offered = resolve_channels_offered(cached_channels_offered);
+    let channels_offered =
+        tokio::task::spawn_blocking(move || resolve_channels_offered(cached_channels_offered))
+            .await
+            .unwrap_or_default();
     let channel_descriptors: Vec<moltis_channels::ChannelDescriptor> = channels_offered
         .iter()
         .filter_map(|s| s.parse::<moltis_channels::ChannelType>().ok())
