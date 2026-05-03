@@ -79,8 +79,12 @@ if [ -n "${BINARY}" ] && binary_is_stale "${BINARY}"; then
 	BINARY=""
 fi
 
+GATEWAY_LOG="${RUNTIME_ROOT}/gateway.log"
+
 if [ -n "${BINARY}" ]; then
-	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}"
+	"${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}" 2>"${GATEWAY_LOG}" &
 else
-	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}"
+	cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}" 2>"${GATEWAY_LOG}" &
 fi
+# Forward the child PID so Playwright can stop it.
+wait $!
