@@ -81,12 +81,10 @@ fi
 
 GATEWAY_LOG="${RUNTIME_ROOT}/gateway.log"
 
-# Use exec so Playwright can manage the process lifetime.
-# Redirect stderr to a log file while keeping it on stderr for Playwright.
-exec 2> >(tee -a "${GATEWAY_LOG}" >&2)
-
+# Pipe through tee to capture logs AND keep them on stdout for Playwright.
+# Cannot use exec here because exec + pipe doesn't work.
 if [ -n "${BINARY}" ]; then
-	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}"
+	"${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}" 2>&1 | tee "${GATEWAY_LOG}"
 else
-	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}"
+	cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}" 2>&1 | tee "${GATEWAY_LOG}"
 fi
