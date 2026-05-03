@@ -80,7 +80,7 @@ async function deleteAgentByName(page, agentName) {
 }
 
 test.describe("Agents settings page", () => {
-	test.beforeEach(async ({}, testInfo) => {
+	test.beforeEach((_fixtures, testInfo) => {
 		testInfo.setTimeout(90_000);
 	});
 
