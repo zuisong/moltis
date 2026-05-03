@@ -108,7 +108,7 @@ struct SandboxGonInfo {
 }
 
 /// Memory snapshot included in gon data and tick broadcasts.
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemSnapshot {
     process: u64,
@@ -525,8 +525,13 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         tts_enabled: cfg!(feature = "voice") && gw.config.voice.tts.enabled,
         graphql_enabled: cfg!(feature = "graphql"),
         terminal_enabled: gw.config.server.is_terminal_enabled(),
-        git_branch: detect_git_branch(),
-        mem: collect_mem_snapshot(),
+        git_branch: tokio::task::spawn_blocking(detect_git_branch)
+            .await
+            .ok()
+            .flatten(),
+        mem: tokio::task::spawn_blocking(collect_mem_snapshot)
+            .await
+            .unwrap_or_default(),
         deploy_platform: gw.deploy_platform.clone(),
         channels_offered,
         channel_descriptors,
