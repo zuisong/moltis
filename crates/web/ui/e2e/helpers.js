@@ -104,7 +104,19 @@ async function navigateAndWait(page, path) {
 			await page.reload({ waitUntil: "domcontentloaded", timeout: 10_000 }).catch(() => {});
 		}
 	}
-	if (lastError) throw lastError;
+	// Capture a full-page screenshot before throwing so CI artifacts show what the browser looked like.
+	if (lastError) {
+		try {
+			var screenshot = await page.screenshot({ fullPage: true });
+			var testInfo = require("@playwright/test").test.info();
+			if (testInfo) {
+				await testInfo.attach("navigateAndWait-failure", { body: screenshot, contentType: "image/png" });
+			}
+		} catch {
+			// page may be closed already
+		}
+		throw lastError;
+	}
 	return pageErrors;
 }
 
