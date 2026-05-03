@@ -96,6 +96,38 @@ async function navigateAndWait(page, path) {
 		} catch (error) {
 			lastError = error;
 			if (!isRetryableNavigationError(error) || attempt === 2) {
+				// Capture diagnostic info when navigation fails
+				try {
+					var testInfo = require("@playwright/test").test.info();
+					var responses = [];
+					var consoleMessages = [];
+					page.on("response", (r) => responses.push(`${r.status()} ${r.url()}`));
+					page.on("console", (m) => consoleMessages.push(`[${m.type()}] ${m.text()}`));
+					// Try one more goto with a short timeout to capture what happens
+					await page.goto(path, { waitUntil: "commit", timeout: 5_000 }).catch(() => {});
+					var diag = [
+						`navigateAndWait failed for ${path} after ${attempt + 1} attempts`,
+						`page.url(): ${page.url()}`,
+						`responses: ${JSON.stringify(responses.slice(0, 5))}`,
+						`console: ${JSON.stringify(consoleMessages.slice(0, 10))}`,
+						`error: ${error.message?.slice(0, 200)}`,
+					].join("\n");
+					if (testInfo) {
+						await testInfo.attach("navigation-debug", {
+							body: Buffer.from(diag, "utf-8"),
+							contentType: "text/plain",
+						});
+						var screenshot = await page.screenshot({ fullPage: true }).catch(() => null);
+						if (screenshot) {
+							await testInfo.attach("navigation-failure-screenshot", {
+								body: screenshot,
+								contentType: "image/png",
+							});
+						}
+					}
+				} catch {
+					// diagnostic collection failed
+				}
 				break;
 			}
 		}
