@@ -53,16 +53,47 @@ function waitForWs(baseUrl, timeoutMs = 60_000) {
 	});
 }
 
+function warmUpPage(baseUrl, timeoutMs = 30_000) {
+	return new Promise((resolve) => {
+		const deadline = Date.now() + timeoutMs;
+		function attempt() {
+			if (Date.now() > deadline) {
+				resolve();
+				return;
+			}
+			const url = new URL(`${baseUrl}/chats/main`);
+			const req = http.request(
+				{ hostname: url.hostname, port: url.port, path: url.pathname, timeout: 10000 },
+				(res) => {
+					// Consume the response body so the connection closes cleanly
+					res.resume();
+					res.on("end", () => resolve());
+				},
+			);
+			req.on("error", () => setTimeout(attempt, 1000));
+			req.on("timeout", () => {
+				req.destroy();
+				setTimeout(attempt, 1000);
+			});
+			req.end();
+		}
+		attempt();
+	});
+}
+
 module.exports = async function globalSetup(config) {
-	// Wait for each webServer's WS endpoint to be ready
+	const seen = new Set();
 	for (const project of config.projects || []) {
 		const baseURL = project.use?.baseURL || config.use?.baseURL;
-		if (baseURL) {
-			try {
-				await waitForWs(baseURL, 60_000);
-			} catch (e) {
-				console.warn(`[global-setup] ${e.message}`);
-			}
+		if (!baseURL || seen.has(baseURL)) continue;
+		seen.add(baseURL);
+		try {
+			// Wait for WS handler to be ready
+			await waitForWs(baseURL, 60_000);
+			// Warm up the page-serving path (template compilation, asset loading)
+			await warmUpPage(baseURL, 30_000);
+		} catch (e) {
+			console.warn(`[global-setup] ${e.message}`);
 		}
 	}
 };
