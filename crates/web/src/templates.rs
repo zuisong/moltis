@@ -478,7 +478,7 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         }
     };
 
-    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: sandbox");
+    tracing::warn!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: sandbox");
 
     // Fetch agent personas for the gon data.
     let agents: Vec<serde_json::Value> = if let Some(ref store) = gw.services.agent_persona_store {
@@ -496,7 +496,7 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
         Vec::new()
     };
 
-    tracing::debug!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: agents");
+    tracing::warn!(elapsed_ms = gon_start.elapsed().as_millis(), "gon: agents");
 
     let sessions_recent = build_recent_sessions_snapshot(gw, GON_SESSIONS_RECENT_LIMIT).await;
     tracing::debug!(
@@ -508,7 +508,7 @@ pub(crate) async fn build_gon_data(gw: &GatewayState) -> GonData {
     if total_ms > 1000 {
         tracing::warn!(elapsed_ms = total_ms, "gon: build_gon_data slow");
     } else {
-        tracing::debug!(elapsed_ms = total_ms, "gon: build_gon_data complete");
+        tracing::warn!(elapsed_ms = total_ms, "gon: build_gon_data complete");
     }
 
     GonData {
@@ -846,9 +846,23 @@ pub(crate) async fn render_spa_template(
     let asset_prefix = build_asset_prefix();
     let nonce = build_nonce();
 
+    let gon =
+        match tokio::time::timeout(std::time::Duration::from_secs(10), build_gon_data(gateway))
+            .await
+        {
+            Ok(gon) => gon,
+            Err(_) => {
+                tracing::error!("build_gon_data timed out after 10s — possible deadlock");
+                return render_error_page(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ErrorPageKind::InternalServerError,
+                    None,
+                );
+            },
+        };
+
     let body = match template {
         SpaTemplate::Index => {
-            let gon = build_gon_data(gateway).await;
             let share_meta = build_share_meta(&gon.identity);
             let gon_json = script_safe_json(&gon);
             let template = IndexHtmlTemplate {
@@ -876,7 +890,6 @@ pub(crate) async fn render_spa_template(
             }
         },
         SpaTemplate::Login => {
-            let gon = build_gon_data(gateway).await;
             let gon_json = script_safe_json(&gon);
             let page_title = identity_name(&gon.identity).to_owned();
             let template = LoginHtmlTemplate {
@@ -899,7 +912,6 @@ pub(crate) async fn render_spa_template(
             }
         },
         SpaTemplate::Onboarding => {
-            let gon = build_gon_data(gateway).await;
             let gon_json = script_safe_json(&gon);
             let page_title = format!("{} onboarding", identity_name(&gon.identity));
             let template = OnboardingHtmlTemplate {

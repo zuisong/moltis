@@ -79,10 +79,8 @@ if [ -n "${BINARY}" ] && binary_is_stale "${BINARY}"; then
 	BINARY=""
 fi
 
-GATEWAY_LOG="${RUNTIME_ROOT}/gateway.log"
-
 if [ -n "${BINARY}" ]; then
-	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}" 2>&1 | tee "${GATEWAY_LOG}"
+	exec "${BINARY}" --no-tls --bind 127.0.0.1 --port "${PORT}"
 else
-	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}" 2>&1 | tee "${GATEWAY_LOG}"
+	exec cargo run --bin moltis -- --no-tls --bind 127.0.0.1 --port "${PORT}"
 fi
