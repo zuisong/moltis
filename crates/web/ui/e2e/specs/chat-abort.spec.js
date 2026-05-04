@@ -11,7 +11,18 @@ async function sendRpcFromPage(page, method, params) {
 	for (let attempt = 0; attempt < 40; attempt++) {
 		if (attempt > 0) {
 			if (attempt <= 5 || attempt % 10 === 0) {
-				console.log(`[sendRpc] ${method} retry #${attempt}, last error: ${lastResponse?.error?.message?.slice(0, 80)}`);
+				// Capture WS state to understand why RPCs fail
+				const wsState = await page.evaluate(() => {
+					var s = window.__moltis_state;
+					return {
+						connected: s?.connected,
+						subscribed: s?.subscribed,
+						wsExists: !!s?.ws,
+						readyState: s?.ws?.readyState,
+						pendingCount: s?.pending ? Object.keys(s.pending).length : -1,
+					};
+				}).catch(() => ({}));
+				console.log(`[sendRpc] ${method} retry #${attempt} ws=${JSON.stringify(wsState)} err=${lastResponse?.error?.message?.slice(0, 60)}`);
 			}
 			await waitForWsConnected(page);
 			await page.waitForTimeout(100);
