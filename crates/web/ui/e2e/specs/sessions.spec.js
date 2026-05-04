@@ -4,7 +4,6 @@ const {
 	expectPageContentMounted,
 	expectRpcOk,
 	navigateAndWait,
-	sendRpcFromPage,
 	waitForWsConnected,
 	watchPageErrors,
 } = require("../helpers");
