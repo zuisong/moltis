@@ -394,7 +394,7 @@ pub async fn handle_connection(
         connect_params: resolved_params,
         sender: client_tx.clone(),
         connected_at: now,
-        last_activity: now,
+        last_activity_ms: std::sync::atomic::AtomicU64::new(0),
         accept_language,
         remote_ip,
         timezone: browser_timezone,
@@ -534,8 +534,8 @@ pub async fn handle_connection(
             },
         };
 
-        // Touch activity timestamp.
-        if let Some(client) = state.inner.write().await.clients.get_mut(&conn_id) {
+        // Touch activity timestamp (lock-free atomic, no write lock needed).
+        if let Some(client) = state.inner.read().await.clients.get(&conn_id) {
             client.touch();
         }
 

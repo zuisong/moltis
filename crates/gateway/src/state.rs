@@ -107,7 +107,8 @@ pub struct ConnectedClient {
     /// Bounded channel for sending serialized frames to this client's write loop.
     pub sender: mpsc::Sender<String>,
     pub connected_at: Instant,
-    pub last_activity: Instant,
+    /// Milliseconds since process start. Updated atomically — no write lock needed.
+    pub last_activity_ms: std::sync::atomic::AtomicU64,
     /// The `Accept-Language` header from the WebSocket upgrade request, forwarded
     /// to web tools so fetched pages and search results match the user's locale.
     pub accept_language: Option<String>,
@@ -170,9 +171,23 @@ impl ConnectedClient {
         self.sender.try_send(frame.to_string()).is_ok()
     }
 
-    /// Touch the activity timestamp.
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
+    /// Touch the activity timestamp (lock-free).
+    pub fn touch(&self) {
+        use std::sync::atomic::Ordering;
+        static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let start = *PROCESS_START.get_or_init(Instant::now);
+        self.last_activity_ms
+            .store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Get the elapsed duration since last activity.
+    pub fn last_activity_elapsed(&self) -> std::time::Duration {
+        use std::sync::atomic::Ordering;
+        static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let start = *PROCESS_START.get_or_init(Instant::now);
+        let stored_ms = self.last_activity_ms.load(Ordering::Relaxed);
+        let total_elapsed = start.elapsed().as_millis() as u64;
+        std::time::Duration::from_millis(total_elapsed.saturating_sub(stored_ms))
     }
 }
 
@@ -1023,7 +1038,7 @@ mod tests {
             },
             sender: tx,
             connected_at: Instant::now(),
-            last_activity: Instant::now(),
+            last_activity_ms: std::sync::atomic::AtomicU64::new(0),
             accept_language: None,
             remote_ip: None,
             timezone: None,

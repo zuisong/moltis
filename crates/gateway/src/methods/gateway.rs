@@ -54,7 +54,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                             "role": c.role(),
                             "platform": c.connect_params.client.platform,
                             "connectedAt": c.connected_at.elapsed().as_secs(),
-                            "lastActivity": c.last_activity.elapsed().as_secs(),
+                            "lastActivity": c.last_activity_elapsed().as_secs(),
                         })
                     })
                     .collect();
@@ -113,7 +113,7 @@ pub(super) fn register(reg: &mut MethodRegistry) {
                 let inner = ctx.state.inner.read().await;
                 if let Some(client) = inner.clients.get(&ctx.client_conn_id) {
                     Ok(serde_json::json!({
-                        "lastActivitySecs": client.last_activity.elapsed().as_secs(),
+                        "lastActivitySecs": client.last_activity_elapsed().as_secs(),
                     }))
                 } else {
                     Ok(serde_json::json!({ "lastActivitySecs": 0 }))
