@@ -17,7 +17,7 @@ function isRetryableRpcError(message) {
 
 async function sendRpcFromPage(page, method, params) {
 	let lastResponse = null;
-	for (let attempt = 0; attempt < 40; attempt++) {
+	for (let attempt = 0; attempt < 10; attempt++) {
 		if (attempt > 0) {
 			if (attempt <= 5 || attempt % 10 === 0) {
 				console.log(`[sendRpc] ${method} retry #${attempt}, last error: ${lastResponse?.error?.message?.slice(0, 80)}`);
