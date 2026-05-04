@@ -46,7 +46,7 @@ pub async fn handle_connection(
 ) {
     let conn_id = uuid::Uuid::new_v4().to_string();
     let conn_remote_ip = remote_addr.ip().to_string();
-    debug!(conn_id = %conn_id, remote_ip = %conn_remote_ip, "ws: new connection");
+    info!(conn_id = %conn_id, remote_ip = %conn_remote_ip, "ws: new connection");
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     // Bounded channel prevents unbounded memory growth from slow clients.
@@ -347,7 +347,7 @@ pub async fn handle_connection(
     #[allow(clippy::unwrap_used)] // serializing known-valid struct
     let _ = client_tx.try_send(serde_json::to_string(&resp).unwrap());
 
-    debug!(
+    info!(
         conn_id = %conn_id,
         client_id = %params.client.id,
         client_version = %params.client.version,
