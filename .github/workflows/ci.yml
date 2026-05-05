@@ -362,7 +362,7 @@ jobs:
         working-directory: crates/web/ui
         env:
           CI: "true"
-        run: npx playwright test
+        run: ./e2e/run-ci.sh
 
       - name: Upload test results
         if: ${{ !cancelled() }}
@@ -372,7 +372,7 @@ jobs:
           path: |
             crates/web/ui/playwright-report/
             crates/web/ui/test-results/
-            target/e2e-runtime/gateway.log
+            target/e2e-runtime*/gateway.log
           if-no-files-found: ignore
           retention-days: 14
 

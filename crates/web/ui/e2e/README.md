@@ -43,15 +43,16 @@ app enters onboarding mode. Uses a random free port by default.
 ## Playwright Projects
 
 The local test suite keeps a single `default` project for targeted debugging.
-In CI, the default project is split into four isolated shards by default
-(`default-1` through `default-4`), controlled by `MOLTIS_E2E_SHARDS`. Each shard
-gets its own Moltis process, port, config dir, and data dir so workers can run
-without shared-state races. CI also runs `agents` and `auth` on their own
-isolated Moltis processes instead of serializing them behind the default suite.
+CI uses `e2e/run-ci.sh` to launch four independent Playwright processes by
+default, controlled by `MOLTIS_E2E_SHARDS`. Each process runs with one worker
+against its own Moltis process, port, config dir, and data dir. That gives
+parallelism without letting two stateful spec files talk to the same gateway at
+the same time. CI also runs `agents` and `auth` on their own isolated Moltis
+processes instead of serializing them behind the default suite.
 
 | Project | Port | Spec files | Notes |
 |---------|------|------------|-------|
-| `default` local, `default-1`...`default-4` CI | Random free ports (`MOLTIS_E2E_PORT`, `MOLTIS_E2E_PORT_2`, etc.) | All except isolated project specs | Seeded identity, no password |
+| `default` | Random free port (`MOLTIS_E2E_PORT`) | All except isolated project specs, or one CI shard when `MOLTIS_E2E_PROCESS_SHARD_INDEX` is set | Seeded identity, no password |
 | `agents` | Local: same as `default`; CI: random free port (`MOLTIS_E2E_AGENTS_PORT`) | `agents.spec.js` | CI uses isolated runtime state |
 | `auth` | Local: same as `default`; CI: random free port (`MOLTIS_E2E_AUTH_PORT`) | `auth.spec.js` | CI uses isolated runtime state |
 | `onboarding` | Random free port (`MOLTIS_E2E_ONBOARDING_PORT`) | `onboarding.spec.js` | Separate server without seeded identity |
@@ -121,6 +122,6 @@ npx playwright show-report
 - **Build the binary first** (`cargo build`) to avoid recompilation on every
   test run. The startup script auto-detects `target/debug/moltis`.
 - Set `MOLTIS_BINARY=/path/to/moltis` to use a specific binary.
-- Local tests run serially (`workers: 1`) because the local `default` project
-  shares one server. CI uses `workers: 4` with isolated Moltis processes.
+- Each Playwright process runs serially (`workers: 1`) because a Moltis runtime
+  is stateful. CI gets parallelism by running four single-worker processes.
 - On failure, traces, screenshots, and videos are saved in `test-results/`.

@@ -6,7 +6,17 @@ const path = require("node:path");
 const repoRoot = path.resolve(__dirname, "../../..");
 const isCi = Boolean(process.env.CI);
 const configuredShardCount = Number.parseInt(process.env.MOLTIS_E2E_SHARDS || "", 10);
-const defaultShardCount = Number.isFinite(configuredShardCount) && configuredShardCount > 0 ? configuredShardCount : isCi ? 4 : 1;
+const defaultShardCount = Number.isFinite(configuredShardCount) && configuredShardCount > 0 ? configuredShardCount : 4;
+const processShardIndex = Number.parseInt(process.env.MOLTIS_E2E_PROCESS_SHARD_INDEX || "", 10);
+const processShardTotal = Number.parseInt(process.env.MOLTIS_E2E_PROCESS_SHARD_TOTAL || "", 10);
+const processDefaultShard =
+	isCi &&
+	Number.isFinite(processShardIndex) &&
+	Number.isFinite(processShardTotal) &&
+	processShardIndex > 0 &&
+	processShardTotal > 0 &&
+	processShardIndex <= processShardTotal;
+const skipDefaultProjects = isCi && process.env.MOLTIS_E2E_SKIP_DEFAULT_PROJECTS === "1";
 
 function pickFreePort() {
 	return execFileSync(
@@ -105,13 +115,8 @@ function matchSpecFiles(files) {
 }
 
 const usedPorts = new Set();
-const defaultPorts = Array.from({ length: defaultShardCount }, (_, index) =>
-	resolvePort(index === 0 ? "MOLTIS_E2E_PORT" : `MOLTIS_E2E_PORT_${index + 1}`, usedPorts),
-);
-const defaultBaseURLs = defaultPorts.map((defaultPort, index) => {
-	const envVar = index === 0 ? "MOLTIS_E2E_BASE_URL" : `MOLTIS_E2E_BASE_URL_${index + 1}`;
-	return process.env[envVar] || `http://127.0.0.1:${defaultPort}`;
-});
+const defaultPorts = skipDefaultProjects ? [] : [resolvePort("MOLTIS_E2E_PORT", usedPorts)];
+const defaultBaseURLs = defaultPorts.map((defaultPort) => process.env.MOLTIS_E2E_BASE_URL || `http://127.0.0.1:${defaultPort}`);
 const port = defaultPorts[0];
 const baseURL = defaultBaseURLs[0];
 
@@ -155,20 +160,30 @@ const defaultProjectIgnore = [
 	/ollama-qwen-live\.spec/,
 	/oauth\.spec/,
 ];
-const defaultProjects = isCi
-	? shardSpecFiles(defaultSpecFiles(), defaultShardCount).map((files, index) => ({
-			name: `default-${index + 1}`,
-			testMatch: matchSpecFiles(files),
-			use: {
-				baseURL: defaultBaseURLs[index],
-			},
-		}))
-	: [
+const defaultProjects = (() => {
+	if (skipDefaultProjects) return [];
+	if (processDefaultShard) {
+		const shardFiles = shardSpecFiles(defaultSpecFiles(), processShardTotal)[processShardIndex - 1] || [];
+		return [
 			{
 				name: "default",
-				testIgnore: defaultProjectIgnore,
+				testMatch: matchSpecFiles(shardFiles),
+				use: {
+					baseURL,
+				},
 			},
 		];
+	}
+	return [
+		{
+			name: "default",
+			testIgnore: defaultProjectIgnore,
+			use: {
+				baseURL,
+			},
+		},
+	];
+})();
 const projects = defaultProjects.concat([
 	isCi
 		? {
@@ -262,10 +277,10 @@ function gatewayServer({ baseURL: serverBaseURL, name, port: serverPort }) {
 }
 
 const defaultWebServers = isCi
-	? defaultPorts.map((defaultPort, index) =>
+	? defaultPorts.map((defaultPort) =>
 			gatewayServer({
-				baseURL: defaultBaseURLs[index],
-				name: `default-${index + 1}`,
+				baseURL,
+				name: processDefaultShard ? `default-${processShardIndex}` : "default",
 				port: defaultPort,
 			}),
 		)
@@ -373,7 +388,7 @@ module.exports = defineConfig({
 	fullyParallel: false,
 	forbidOnly: !!process.env.CI,
 	retries: 1,
-	workers: isCi ? 4 : 1,
+	workers: 1,
 	reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : [["list"], ["html", { open: "never" }]],
 	use: {
 		baseURL: baseURL,
