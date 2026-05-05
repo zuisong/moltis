@@ -103,7 +103,7 @@ async function navigateAndWait(page, path) {
 			if (attempt > 0) {
 				await page.goto("about:blank").catch(() => undefined);
 			}
-			await page.goto(path, { waitUntil: "domcontentloaded", timeout: 10_000 });
+			await page.goto(path, { waitUntil: "commit", timeout: 5_000 });
 			await expectPageContentMounted(page);
 			return pageErrors;
 		} catch (error) {
