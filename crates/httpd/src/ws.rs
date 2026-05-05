@@ -574,27 +574,36 @@ pub async fn handle_connection(
                     state: Arc::clone(&state),
                     channel: req.channel,
                 };
-                let _rpc_t = std::time::Instant::now();
-                let response = methods.dispatch(ctx).await;
-                let rpc_ms = _rpc_t.elapsed().as_millis();
-                // Always log RPCs so CI gateway.log shows whether they arrive.
-                // TODO: remove once CI RPC issue is diagnosed.
-                if rpc_ms > 50 {
-                    warn!(conn_id = %conn_id, method = %req.method, rpc_ms, ok = response.ok, "ws: RPC slow");
-                } else {
-                    info!(conn_id = %conn_id, method = %req.method, rpc_ms, ok = response.ok, "ws: RPC");
-                }
-                if state.ws_request_logs {
-                    info!(
-                        conn_id = %conn_id,
-                        request_id = %req.id,
-                        method = %req.method,
-                        ok = response.ok,
-                        "ws: sent response frame"
-                    );
-                }
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let _ = client_tx.try_send(serde_json::to_string(&response).unwrap());
+                // Spawn RPC dispatch so the read loop is never blocked by slow
+                // lock acquisition or I/O inside a handler. The response is sent
+                // back via the client_tx channel (same path as before).
+                let rpc_tx = client_tx.clone();
+                let rpc_conn_id = conn_id.clone();
+                let rpc_method = req.method.clone();
+                let rpc_request_id = req.id.clone();
+                let rpc_methods = Arc::clone(&methods);
+                let rpc_state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let rpc_t = std::time::Instant::now();
+                    let response = rpc_methods.dispatch(ctx).await;
+                    let rpc_ms = rpc_t.elapsed().as_millis();
+                    if rpc_ms > 50 {
+                        warn!(conn_id = %rpc_conn_id, method = %rpc_method, rpc_ms, ok = response.ok, "ws: RPC slow");
+                    } else {
+                        info!(conn_id = %rpc_conn_id, method = %rpc_method, rpc_ms, ok = response.ok, "ws: RPC");
+                    }
+                    if rpc_state.ws_request_logs {
+                        info!(
+                            conn_id = %rpc_conn_id,
+                            request_id = %rpc_request_id,
+                            method = %rpc_method,
+                            ok = response.ok,
+                            "ws: sent response frame"
+                        );
+                    }
+                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                    let _ = rpc_tx.try_send(serde_json::to_string(&response).unwrap());
+                });
             },
             GatewayFrame::Response(res) => {
                 // v4 bidirectional RPC: client responding to a server-initiated request.
