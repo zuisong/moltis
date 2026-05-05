@@ -43,12 +43,13 @@ app enters onboarding mode. Uses a random free port by default.
 ## Playwright Projects
 
 The local test suite keeps a single `default` project for targeted debugging.
-CI uses `e2e/run-ci.sh` to launch four independent Playwright processes by
-default, controlled by `MOLTIS_E2E_SHARDS`. Each process runs with one worker
-against its own Moltis process, port, config dir, and data dir. That gives
-parallelism without letting two stateful spec files talk to the same gateway at
-the same time. CI also runs `agents` and `auth` on their own isolated Moltis
-processes instead of serializing them behind the default suite.
+CI uses `e2e/run-ci.sh` to launch four independent default-suite Playwright
+processes by default, controlled by `MOLTIS_E2E_SHARDS`. Each process runs with
+one worker against its own Moltis process, port, config dir, and data dir. That
+gives parallelism without letting two stateful spec files talk to the same
+gateway at the same time. CI also runs special projects (`agents`, `auth`,
+onboarding variants, OAuth, and optional live-provider suites) as separate
+single-project processes so each one starts only its own web server.
 
 | Project | Port | Spec files | Notes |
 |---------|------|------------|-------|
@@ -123,5 +124,5 @@ npx playwright show-report
   test run. The startup script auto-detects `target/debug/moltis`.
 - Set `MOLTIS_BINARY=/path/to/moltis` to use a specific binary.
 - Each Playwright process runs serially (`workers: 1`) because a Moltis runtime
-  is stateful. CI gets parallelism by running four single-worker processes.
+  is stateful. CI gets parallelism by running multiple single-worker processes.
 - On failure, traces, screenshots, and videos are saved in `test-results/`.
