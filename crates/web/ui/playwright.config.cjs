@@ -135,7 +135,7 @@ const webServer = [
 		cwd: __dirname,
 		url: `${baseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_PORT: port,
@@ -146,7 +146,7 @@ const webServer = [
 		cwd: __dirname,
 		url: `${onboardingBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_ONBOARDING_PORT: onboardingPort,
@@ -157,7 +157,7 @@ const webServer = [
 		cwd: __dirname,
 		url: `${onboardingAuthBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_ONBOARDING_AUTH_PORT: onboardingAuthPort,
@@ -168,7 +168,7 @@ const webServer = [
 		cwd: __dirname,
 		url: `${oauthBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_OAUTH_PORT: oauthPort,
@@ -179,7 +179,7 @@ const webServer = [
 		cwd: __dirname,
 		url: `${onboardingAnthropicBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_ONBOARDING_ANTHROPIC_PORT: onboardingAnthropicPort,
@@ -193,7 +193,7 @@ if (enableOpenAiLiveProject) {
 		cwd: __dirname,
 		url: `${openaiLiveBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_OPENAI_LIVE_PORT: openaiLivePort,
@@ -207,7 +207,7 @@ if (ollamaQwenLiveEnabled) {
 		cwd: __dirname,
 		url: `${ollamaQwenLiveBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
-		timeout: 300_000,
+		timeout: 60_000,
 		env: {
 			...process.env,
 			MOLTIS_E2E_OLLAMA_QWEN_LIVE_PORT: ollamaQwenLivePort,

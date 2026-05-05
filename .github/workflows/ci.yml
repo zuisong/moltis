@@ -344,6 +344,7 @@ jobs:
           TAILWINDCSS=./tailwindcss-linux-x64 ./scripts/build-web-assets.sh
 
       - name: Build moltis binary
+        timeout-minutes: 10
         run: cargo build --bin moltis
 
       - name: Cache Playwright browsers
