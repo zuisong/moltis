@@ -42,13 +42,18 @@ app enters onboarding mode. Uses a random free port by default.
 
 ## Playwright Projects
 
-The test suite is split into seven Playwright projects, plus one opt-in live
-project for local Ollama/Qwen validation:
+The local test suite keeps a single `default` project for targeted debugging.
+In CI, the default project is split into four isolated shards by default
+(`default-1` through `default-4`), controlled by `MOLTIS_E2E_SHARDS`. Each shard
+gets its own Moltis process, port, config dir, and data dir so workers can run
+without shared-state races. CI also runs `agents` and `auth` on their own
+isolated Moltis processes instead of serializing them behind the default suite.
 
 | Project | Port | Spec files | Notes |
 |---------|------|------------|-------|
-| `default` | Random free port (`MOLTIS_E2E_PORT`) | All except `auth.spec.js` and `onboarding.spec.js` | Seeded identity, no password |
-| `auth` | Same as `default` | `auth.spec.js` | Runs after `default`; sets a password to test login |
+| `default` local, `default-1`...`default-4` CI | Random free ports (`MOLTIS_E2E_PORT`, `MOLTIS_E2E_PORT_2`, etc.) | All except isolated project specs | Seeded identity, no password |
+| `agents` | Local: same as `default`; CI: random free port (`MOLTIS_E2E_AGENTS_PORT`) | `agents.spec.js` | CI uses isolated runtime state |
+| `auth` | Local: same as `default`; CI: random free port (`MOLTIS_E2E_AUTH_PORT`) | `auth.spec.js` | CI uses isolated runtime state |
 | `onboarding` | Random free port (`MOLTIS_E2E_ONBOARDING_PORT`) | `onboarding.spec.js` | Separate server without seeded identity |
 | `onboarding-auth` | Random free port (`MOLTIS_E2E_ONBOARDING_AUTH_PORT`) | `onboarding-auth.spec.js` | Separate server with remote-auth simulation |
 | `onboarding-anthropic` | Random free port (`MOLTIS_E2E_ONBOARDING_ANTHROPIC_PORT`) | `onboarding-anthropic.spec.js` | Separate server proving first-run Anthropic onboarding with zero providers at startup |
@@ -116,5 +121,6 @@ npx playwright show-report
 - **Build the binary first** (`cargo build`) to avoid recompilation on every
   test run. The startup script auto-detects `target/debug/moltis`.
 - Set `MOLTIS_BINARY=/path/to/moltis` to use a specific binary.
-- Tests run serially (`workers: 1`) because they share a single server.
+- Local tests run serially (`workers: 1`) because the local `default` project
+  shares one server. CI uses `workers: 4` with isolated Moltis processes.
 - On failure, traces, screenshots, and videos are saved in `test-results/`.

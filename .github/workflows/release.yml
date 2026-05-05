@@ -282,7 +282,7 @@ jobs:
 
       - name: Build moltis binary
         if: ${{ env.RELEASE_DRY_RUN != 'true' }}
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: cargo build --bin moltis
 
       - name: Install Playwright browsers

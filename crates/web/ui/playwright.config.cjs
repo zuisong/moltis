@@ -1,5 +1,12 @@
 const { defineConfig } = require("@playwright/test");
 const { execFileSync } = require("node:child_process");
+const { readFileSync, readdirSync } = require("node:fs");
+const path = require("node:path");
+
+const repoRoot = path.resolve(__dirname, "../../..");
+const isCi = Boolean(process.env.CI);
+const configuredShardCount = Number.parseInt(process.env.MOLTIS_E2E_SHARDS || "", 10);
+const defaultShardCount = Number.isFinite(configuredShardCount) && configuredShardCount > 0 ? configuredShardCount : isCi ? 4 : 1;
 
 function pickFreePort() {
 	return execFileSync(
@@ -27,9 +34,92 @@ function resolvePort(envVar, usedPortSet) {
 	return picked;
 }
 
+function escapeRegExp(value) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function defaultSpecFiles() {
+	const ignored = [
+		/agents\.spec\.js$/,
+		/auth\.spec\.js$/,
+		/onboarding\.spec\.js$/,
+		/onboarding-openai\.spec\.js$/,
+		/onboarding-auth\.spec\.js$/,
+		/onboarding-anthropic\.spec\.js$/,
+		/openai-live\.spec\.js$/,
+		/ollama-qwen-live\.spec\.js$/,
+		/oauth\.spec\.js$/,
+	];
+	return readdirSync(path.join(__dirname, "e2e/specs"))
+		.filter((file) => file.endsWith(".spec.js") && !ignored.some((pattern) => pattern.test(file)))
+		.sort();
+}
+
+const defaultSpecWeights = new Map([
+	// Keep CI shards balanced by test count. Specs with data-driven tests can
+	// look small in source but expand heavily after Playwright loads them.
+	["settings-nav.spec.js", 48],
+	["sessions.spec.js", 26],
+	["cron.spec.js", 21],
+	["chat-input.spec.js", 20],
+	["websocket.spec.js", 19],
+	["command-palette.spec.js", 17],
+	["mcp.spec.js", 12],
+	["chat-autoscroll.spec.js", 11],
+	["sandboxes.spec.js", 11],
+	["channels-matrix.spec.js", 10],
+	["skills.spec.js", 10],
+	["i18n.spec.js", 9],
+	["providers.spec.js", 9],
+	["smoke.spec.js", 9],
+]);
+
+function countSpecTests(file) {
+	const source = readFileSync(path.join(__dirname, "e2e/specs", file), "utf8");
+	return source.match(/\btest(?:\.(?:fixme|only|skip))?\s*\(/g)?.length || 1;
+}
+
+function specWeight(file) {
+	return defaultSpecWeights.get(file) || countSpecTests(file);
+}
+
+function shardSpecFiles(files, shardCount) {
+	const shards = Array.from({ length: shardCount }, () => ({ files: [], weight: 0 }));
+	files
+		.toSorted((a, b) => specWeight(b) - specWeight(a) || a.localeCompare(b))
+		.forEach((file) => {
+			const shard = shards.toSorted((a, b) => a.weight - b.weight)[0];
+			shard.files.push(file);
+			shard.weight += specWeight(file);
+		});
+	return shards
+		.filter((shard) => shard.files.length > 0)
+		.map((shard) => {
+			shard.files.sort();
+			return shard.files;
+		});
+}
+
+function matchSpecFiles(files) {
+	return files.map((file) => new RegExp(`${escapeRegExp(file)}$`));
+}
+
 const usedPorts = new Set();
-const port = resolvePort("MOLTIS_E2E_PORT", usedPorts);
-const baseURL = process.env.MOLTIS_E2E_BASE_URL || `http://127.0.0.1:${port}`;
+const defaultPorts = Array.from({ length: defaultShardCount }, (_, index) =>
+	resolvePort(index === 0 ? "MOLTIS_E2E_PORT" : `MOLTIS_E2E_PORT_${index + 1}`, usedPorts),
+);
+const defaultBaseURLs = defaultPorts.map((defaultPort, index) => {
+	const envVar = index === 0 ? "MOLTIS_E2E_BASE_URL" : `MOLTIS_E2E_BASE_URL_${index + 1}`;
+	return process.env[envVar] || `http://127.0.0.1:${defaultPort}`;
+});
+const port = defaultPorts[0];
+const baseURL = defaultBaseURLs[0];
+
+const agentsPort = resolvePort("MOLTIS_E2E_AGENTS_PORT", usedPorts);
+const agentsBaseURL = process.env.MOLTIS_E2E_AGENTS_BASE_URL || `http://127.0.0.1:${agentsPort}`;
+
+const authPort = resolvePort("MOLTIS_E2E_AUTH_PORT", usedPorts);
+const authBaseURL = process.env.MOLTIS_E2E_AUTH_BASE_URL || `http://127.0.0.1:${authPort}`;
 
 const onboardingPort = resolvePort("MOLTIS_E2E_ONBOARDING_PORT", usedPorts);
 const onboardingBaseURL = process.env.MOLTIS_E2E_ONBOARDING_BASE_URL || `http://127.0.0.1:${onboardingPort}`;
@@ -54,31 +144,58 @@ const ollamaQwenLiveBaseURL =
 // hidden cross-run state leaks. Set MOLTIS_E2E_REUSE_SERVER=1 to trade
 // determinism for faster startup in ad-hoc local runs.
 const reuseExistingServer = !process.env.CI && process.env.MOLTIS_E2E_REUSE_SERVER === "1";
-const projects = [
-	{
-		name: "default",
-		testIgnore: [
-			/agents\.spec/,
-			/auth\.spec/,
-			/onboarding\.spec/,
-			/onboarding-openai\.spec/,
-			/onboarding-auth\.spec/,
-			/onboarding-anthropic\.spec/,
-			/openai-live\.spec/,
-			/ollama-qwen-live\.spec/,
-			/oauth\.spec/,
-		],
-	},
-	{
-		name: "agents",
-		testMatch: /agents\.spec/,
-		dependencies: ["default"],
-	},
-	{
-		name: "auth",
-		testMatch: /\/auth\.spec/,
-		dependencies: ["default"],
-	},
+const defaultProjectIgnore = [
+	/agents\.spec/,
+	/auth\.spec/,
+	/onboarding\.spec/,
+	/onboarding-openai\.spec/,
+	/onboarding-auth\.spec/,
+	/onboarding-anthropic\.spec/,
+	/openai-live\.spec/,
+	/ollama-qwen-live\.spec/,
+	/oauth\.spec/,
+];
+const defaultProjects = isCi
+	? shardSpecFiles(defaultSpecFiles(), defaultShardCount).map((files, index) => ({
+			name: `default-${index + 1}`,
+			testMatch: matchSpecFiles(files),
+			use: {
+				baseURL: defaultBaseURLs[index],
+			},
+		}))
+	: [
+			{
+				name: "default",
+				testIgnore: defaultProjectIgnore,
+			},
+		];
+const projects = defaultProjects.concat([
+	isCi
+		? {
+				name: "agents",
+				testMatch: /agents\.spec/,
+				use: {
+					baseURL: agentsBaseURL,
+				},
+			}
+		: {
+				name: "agents",
+				testMatch: /agents\.spec/,
+				dependencies: ["default"],
+			},
+	isCi
+		? {
+				name: "auth",
+				testMatch: /\/auth\.spec/,
+				use: {
+					baseURL: authBaseURL,
+				},
+			}
+		: {
+				name: "auth",
+				testMatch: /\/auth\.spec/,
+				dependencies: ["default"],
+			},
 	{
 		name: "onboarding",
 		testMatch: /onboarding(?:-openai)?\.spec/,
@@ -107,7 +224,7 @@ const projects = [
 			baseURL: onboardingAnthropicBaseURL,
 		},
 	},
-];
+]);
 
 if (enableOpenAiLiveProject) {
 	projects.push({
@@ -129,18 +246,50 @@ if (ollamaQwenLiveEnabled) {
 	});
 }
 
-const webServer = [
-	{
+function gatewayServer({ baseURL: serverBaseURL, name, port: serverPort }) {
+	return {
 		command: "./e2e/start-gateway.sh",
 		cwd: __dirname,
-		url: `${baseURL}/health`,
+		url: `${serverBaseURL}/health`,
 		reuseExistingServer: reuseExistingServer,
 		timeout: 60_000,
 		env: {
 			...process.env,
-			MOLTIS_E2E_PORT: port,
+			MOLTIS_E2E_PORT: serverPort,
+			MOLTIS_E2E_RUNTIME_DIR: path.join(repoRoot, "target", `e2e-runtime-${name}`),
 		},
-	},
+	};
+}
+
+const defaultWebServers = isCi
+	? defaultPorts.map((defaultPort, index) =>
+			gatewayServer({
+				baseURL: defaultBaseURLs[index],
+				name: `default-${index + 1}`,
+				port: defaultPort,
+			}),
+		)
+	: [
+			{
+				command: "./e2e/start-gateway.sh",
+				cwd: __dirname,
+				url: `${baseURL}/health`,
+				reuseExistingServer: reuseExistingServer,
+				timeout: 60_000,
+				env: {
+					...process.env,
+					MOLTIS_E2E_PORT: port,
+				},
+			},
+		];
+const ciIsolatedProjectWebServers = isCi
+	? [
+			gatewayServer({ baseURL: agentsBaseURL, name: "agents", port: agentsPort }),
+			gatewayServer({ baseURL: authBaseURL, name: "auth", port: authPort }),
+		]
+	: [];
+
+const webServer = defaultWebServers.concat(ciIsolatedProjectWebServers, [
 	{
 		command: "./e2e/start-gateway-onboarding.sh",
 		cwd: __dirname,
@@ -185,7 +334,7 @@ const webServer = [
 			MOLTIS_E2E_ONBOARDING_ANTHROPIC_PORT: onboardingAnthropicPort,
 		},
 	},
-];
+]);
 
 if (enableOpenAiLiveProject) {
 	webServer.push({
@@ -224,7 +373,7 @@ module.exports = defineConfig({
 	fullyParallel: false,
 	forbidOnly: !!process.env.CI,
 	retries: 1,
-	workers: 1,
+	workers: isCi ? 4 : 1,
 	reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : [["list"], ["html", { open: "never" }]],
 	use: {
 		baseURL: baseURL,

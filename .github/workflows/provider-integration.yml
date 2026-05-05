@@ -300,7 +300,7 @@ jobs:
 
       - name: Build moltis binary
         if: env.SKIP != 'true'
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: cargo build --bin moltis
 
       - name: Cache Playwright browsers
@@ -389,7 +389,7 @@ jobs:
           TAILWINDCSS=./tailwindcss-linux-x64 ./scripts/build-web-assets.sh
 
       - name: Build moltis binary
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: cargo build --bin moltis
 
       - name: Cache Playwright browsers
