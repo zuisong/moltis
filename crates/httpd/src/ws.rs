@@ -602,7 +602,33 @@ pub async fn handle_connection(
                         );
                     }
                     #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                    let _ = rpc_tx.try_send(serde_json::to_string(&response).unwrap());
+                    let response_json = serde_json::to_string(&response).unwrap();
+                    let response_len = response_json.len();
+                    let send_t = std::time::Instant::now();
+                    match rpc_tx.send(response_json).await {
+                        Ok(()) => {
+                            let send_ms = send_t.elapsed().as_millis();
+                            if send_ms > 50 || rpc_method == "chat.send" {
+                                info!(
+                                    conn_id = %rpc_conn_id,
+                                    request_id = %rpc_request_id,
+                                    method = %rpc_method,
+                                    response_len,
+                                    send_ms,
+                                    "ws: queued response frame"
+                                );
+                            }
+                        },
+                        Err(_) => {
+                            warn!(
+                                conn_id = %rpc_conn_id,
+                                request_id = %rpc_request_id,
+                                method = %rpc_method,
+                                response_len,
+                                "ws: failed to queue response frame; client writer is closed"
+                            );
+                        },
+                    }
                 });
             },
             GatewayFrame::Response(res) => {
