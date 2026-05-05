@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-use std::env;
+use std::{env, sync::atomic::Ordering};
 
 use super::*;
 
@@ -470,6 +470,25 @@ async fn test_resolve_image_config_override() {
     };
     let router = SandboxRouter::new(config);
     let img = router.resolve_image("main", None).await;
+    assert_eq!(img, "my-org/image:v1");
+}
+
+#[tokio::test]
+async fn test_resolve_image_nowait_ignores_active_build() {
+    let config = SandboxConfig {
+        image: Some("my-org/image:v1".into()),
+        ..Default::default()
+    };
+    let router = SandboxRouter::new(config);
+    router.building_flag.store(true, Ordering::Relaxed);
+
+    let img = tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        router.resolve_image_nowait("main", None),
+    )
+    .await
+    .expect("resolve_image_nowait must not wait for background image builds");
+
     assert_eq!(img, "my-org/image:v1");
 }
 

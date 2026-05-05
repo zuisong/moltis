@@ -8,7 +8,7 @@ use std::{
 use {
     async_trait::async_trait,
     tokio::sync::RwLock,
-    tracing::{debug, warn},
+    tracing::{debug, info, warn},
 };
 
 #[cfg(target_os = "macos")]
@@ -689,6 +689,33 @@ impl SandboxRouter {
             .image
             .clone()
             .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string())
+    }
+
+    /// Resolve the container image for prompt/runtime metadata without waiting
+    /// for any background image build. This must stay cheap: callers use it
+    /// while preparing chat turns, where blocking on sandbox provisioning would
+    /// delay the RPC response that returns the run id.
+    pub async fn resolve_image_nowait(
+        &self,
+        session_key: &str,
+        skill_image: Option<&str>,
+    ) -> String {
+        if let Some(img) = skill_image {
+            return img.to_string();
+        }
+        if let Some(img) = self.image_overrides.read().await.get(session_key) {
+            return img.clone();
+        }
+        if self
+            .building_flag
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            info!(
+                session = %session_key,
+                "sandbox image build in progress, resolving prompt image without waiting"
+            );
+        }
+        self.resolve_default_image_nowait().await
     }
 
     /// Get the current effective default image (runtime override > config > hardcoded).

@@ -27,9 +27,11 @@ export function IdentitySection(): VNode {
 	const [languageSaved, setLanguageSaved] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const [languageError, setLanguageError] = useState<string | null>(null);
+	const userNameEditingRef = useRef(false);
 
 	useEffect(() => {
 		if (!id) return;
+		if (userNameEditingRef.current) return;
 		setUserName(id.user_name || "");
 	}, [id]);
 
@@ -55,8 +57,12 @@ export function IdentitySection(): VNode {
 	function onUserNameBlur(e: Event): void {
 		const trimmed = targetValue(e).trim();
 		const currentValue = (identity.value?.user_name || "").trim();
-		if (trimmed === currentValue) return;
+		if (trimmed === currentValue) {
+			userNameEditingRef.current = false;
+			return;
+		}
 		if (!trimmed) {
+			userNameEditingRef.current = false;
 			setError("Your name is required.");
 			return;
 		}
@@ -65,6 +71,7 @@ export function IdentitySection(): VNode {
 		setUserNameSaving(true);
 		updateIdentity({ user_name: trimmed }, { agentId: "main" }).then((res: RpcResponse) => {
 			setUserNameSaving(false);
+			userNameEditingRef.current = false;
 			if (res?.ok) {
 				const payload = res.payload as IdentityData;
 				identity.value = payload;
@@ -121,6 +128,9 @@ export function IdentitySection(): VNode {
 							className="provider-key-input"
 							style={{ width: "100%", maxWidth: "280px" }}
 							value={userName}
+							onFocus={() => {
+								userNameEditingRef.current = true;
+							}}
 							onInput={(e: Event) => setUserName(targetValue(e))}
 							onBlur={onUserNameBlur}
 							placeholder="e.g. Alice"
