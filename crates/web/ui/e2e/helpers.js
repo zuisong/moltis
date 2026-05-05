@@ -101,7 +101,7 @@ async function navigateAndWait(page, path) {
 			// Navigate to about:blank first to release any pending connections
 			// from previous navigations (HTTP/1.1 has a 6-connection-per-host limit).
 			if (attempt > 0) {
-				await page.goto("about:blank").catch(() => {});
+				await page.goto("about:blank").catch(() => undefined);
 			}
 			await page.goto(path, { waitUntil: "domcontentloaded", timeout: 10_000 });
 			await expectPageContentMounted(page);
@@ -117,7 +117,7 @@ async function navigateAndWait(page, path) {
 					page.on("response", (r) => responses.push(`${r.status()} ${r.url()}`));
 					page.on("console", (m) => consoleMessages.push(`[${m.type()}] ${m.text()}`));
 					// Try one more goto with a short timeout to capture what happens
-					await page.goto(path, { waitUntil: "commit", timeout: 5_000 }).catch(() => {});
+					await page.goto(path, { waitUntil: "commit", timeout: 5_000 }).catch(() => undefined);
 					// Check server health to see if it's alive
 					var healthOk = "unknown";
 					try {
@@ -232,6 +232,20 @@ async function createSession(page) {
 	await expectPageContentMounted(page);
 }
 
+async function waitForChatSessionReady(page) {
+	await page.waitForFunction(
+		async () => {
+			var appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
+			if (!appScript) return false;
+			var appUrl = new URL(appScript.src, window.location.origin);
+			var prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
+			var state = await import(`${prefix}js/state.js`);
+			return state.subscribed && !(state.sessionSwitchInProgress || state.chatBatchLoading);
+		},
+		{ timeout: 5_000 },
+	);
+}
+
 function isRetryableRpcError(message) {
 	if (typeof message !== "string") return false;
 	return message.includes("WebSocket not connected") || message.includes("WebSocket disconnected");
@@ -260,7 +274,7 @@ async function sendRpcFromPage(page, method, params) {
 			console.log(
 				`[sendRpc] ${method} retry #${attempt} ws=${JSON.stringify(wsState)} err=${lastResponse?.error?.message?.slice(0, 60)}`,
 			);
-			await waitForWsConnected(page, 1_000).catch(() => {});
+			await waitForWsConnected(page, 1_000).catch(() => undefined);
 		}
 		lastResponse = await page
 			.evaluate(
@@ -296,6 +310,7 @@ module.exports = {
 	expectPageContentMounted,
 	watchPageErrors,
 	waitForWsConnected,
+	waitForChatSessionReady,
 	navigateAndWait,
 	createSession,
 	sendRpcFromPage,

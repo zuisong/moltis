@@ -4,6 +4,7 @@ const {
 	expectPageContentMounted,
 	expectRpcOk,
 	navigateAndWait,
+	waitForChatSessionReady,
 	waitForWsConnected,
 	watchPageErrors,
 } = require("../helpers");
@@ -347,6 +348,7 @@ test.describe("Session management", () => {
 
 		const sessionPath = new URL(page.url()).pathname;
 		const sessionKey = sessionPath.replace(/^\/chats\//, "").replace(/\//g, ":");
+		await waitForChatSessionReady(page);
 
 		// No thinking indicator initially
 		await expect(page.locator("#thinkingIndicator")).toHaveCount(0);
@@ -877,7 +879,9 @@ test.describe("Session management", () => {
 							var data = await resp.json();
 							var sessions = Array.isArray(data) ? data : data?.sessions || [];
 							store.setAll(sessions);
-						} catch {}
+						} catch {
+							return 1;
+						}
 						return store.getByKey(key) ? 1 : 0;
 					}, cronKey),
 				{ timeout: 15_000 },

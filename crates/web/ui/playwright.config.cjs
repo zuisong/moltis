@@ -420,7 +420,7 @@ module.exports = defineConfig({
 	},
 	fullyParallel: false,
 	forbidOnly: !!process.env.CI,
-	retries: 1,
+	retries: 0,
 	workers: 1,
 	reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : [["list"], ["html", { open: "never" }]],
 	use: {
