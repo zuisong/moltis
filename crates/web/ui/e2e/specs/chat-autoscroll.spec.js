@@ -31,44 +31,37 @@ async function getModulePrefix(page) {
 	});
 }
 
-/**
- * Populate the chat with enough messages to make it scrollable.
- * Uses the app's RPC system-event to inject real messages that survive
- * re-renders (unlike raw DOM injection which gets wiped by renderHistory).
- */
 async function injectScrollableMessages(page, count) {
 	const prefix = await getModulePrefix(page);
-	// Inject all messages at once via a batch of system-events
 	await page.evaluate(
 		async ({ pfx, msgCount }) => {
-			var helpers = await import(`${pfx}js/helpers.js`);
-			for (var i = 0; i < msgCount; i++) {
-				await helpers.sendRpc("system-event", {
-					event: "chat",
-					payload: {
-						sessionKey: window.__moltis_state?.activeSessionKey || "main",
-						state: "final",
-						text: "M".repeat(200),
-						messageIndex: 900000 + i,
-						model: "test",
-						provider: "test",
-					},
-				});
+			var chatUi = await import(`${pfx}js/chat-ui.js`);
+			var state = await import(`${pfx}js/state.js`);
+			state.setChatBatchLoading(true);
+			try {
+				for (var i = 0; i < msgCount; i++) {
+					var el = chatUi.chatAddMsg("assistant", "M".repeat(200));
+					if (el) el.dataset.e2eAutoscrollFixture = "true";
+				}
+			} finally {
+				state.setChatBatchLoading(false);
 			}
+			var box = document.getElementById("messages");
+			if (box) {
+				var indicator = box.querySelector(".new-content-indicator");
+				if (indicator) indicator.remove();
+				box.scrollTop = box.scrollHeight;
+			}
+			await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
 		},
 		{ pfx: prefix, msgCount: count },
 	);
-	// Wait for all messages to render
 	await expect
-		.poll(() => page.locator("#messages .msg.assistant").count(), { timeout: 15_000 })
+		.poll(() => page.locator("#messages .msg.assistant[data-e2e-autoscroll-fixture='true']").count())
 		.toBeGreaterThanOrEqual(count);
 	// Ensure welcome/empty-state cards are gone (they overlap #messages)
-	await expect(page.locator("#welcomeCard"))
-		.toHaveCount(0, { timeout: 5_000 })
-		.catch(() => {});
-	await expect(page.locator("#messages .empty-state"))
-		.toHaveCount(0, { timeout: 2_000 })
-		.catch(() => {});
+	await expect(page.locator("#welcomeCard")).toHaveCount(0, { timeout: 5_000 });
+	await expect(page.locator("#messages .empty-state")).toHaveCount(0, { timeout: 2_000 });
 	// Scroll to bottom
 	await page.evaluate(() => {
 		var box = document.getElementById("messages");
