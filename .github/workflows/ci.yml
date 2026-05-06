@@ -396,7 +396,7 @@ jobs:
         uses: dtolnay/rust-toolchain@f7ccc83f9ed1e5b9c81d8a67d7ad1a747e22a561 # master
         with:
           toolchain: stable
-          targets: aarch64-apple-darwin,wasm32-wasip2
+          targets: aarch64-apple-darwin
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
@@ -422,7 +422,9 @@ jobs:
 
       - name: Build Swift bridge and generate Xcode project
         env:
+          MOLTIS_SWIFT_BRIDGE_PROFILE: swift-ci
           MOLTIS_SWIFT_BRIDGE_TARGETS: aarch64-apple-darwin
+          MOLTIS_SWIFT_BRIDGE_SKIP_WASM_BUILD: "1"
           MOLTIS_SWIFT_BRIDGE_SKIP_WASM_PRECOMPILE: "1"
         run: |
           ./scripts/build-swift-bridge.sh

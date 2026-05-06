@@ -410,5 +410,10 @@ lto           = "thin"
 panic         = "abort"
 strip         = true
 
+[profile.swift-ci]
+debug    = 0
+inherits = "dev"
+panic    = "abort"
+
 [profile.dev]
 debug = "line-tables-only"
