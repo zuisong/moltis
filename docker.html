@@ -307,6 +307,22 @@ complete example:</p>
       - ./data:/home/moltis/.moltis
       - /var/run/docker.sock:/var/run/docker.sock
 </code></pre>
+<p>For unattended recovery after host reboots or in-place <code>/update</code>, store the
+vault recovery key as a Docker secret and point Moltis at the mounted file:</p>
+<pre><code class="language-yaml">services:
+  moltis:
+    image: ghcr.io/moltis-org/moltis:latest
+    environment:
+      MOLTIS_VAULT_AUTO_UNSEAL_KEY_FILE: /run/secrets/moltis_vault_recovery_key
+    secrets:
+      - moltis_vault_recovery_key
+
+secrets:
+  moltis_vault_recovery_key:
+    file: ./moltis-vault-recovery-key
+</code></pre>
+<p>This lets encrypted environment variables and channel credentials load during
+startup. Treat the secret file as sensitive as the vault recovery key itself.</p>
 <h3 id="coolify-hetznervps"><a class="header" href="#coolify-hetznervps">Coolify (Hetzner/VPS)</a></h3>
 <p>For Coolify service stacks, use
 <a href="../examples/docker-compose.coolify.yml"><code>examples/docker-compose.coolify.yml</code></a>.

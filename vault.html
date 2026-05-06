@@ -236,9 +236,10 @@ Uninitialized ──────────────► Unsealed
                                 ▼  │
                               Sealed
 </code></pre>
-<p>After a server restart, the vault is always in the <strong>Sealed</strong> state until
+<p>After a server restart, the vault is normally in the <strong>Sealed</strong> state until
 the user logs in (which provides the password needed to derive the KEK and
-unwrap the DEK).</p>
+unwrap the DEK). For unattended deployments, Moltis can also auto-unseal at
+startup from an explicitly configured recovery key.</p>
 <h2 id="lifecycle-integration"><a class="header" href="#lifecycle-integration">Lifecycle Integration</a></h2>
 <p>The vault integrates transparently with the authentication flow:</p>
 <h3 id="first-password-set-post-apiauthsetup-or-first-post-apiauthpasswordchange"><a class="header" href="#first-password-set-post-apiauthsetup-or-first-post-apiauthpasswordchange">First password set (<code>POST /api/auth/setup</code> or first <code>POST /api/auth/password/change</code>)</a></h3>
@@ -264,8 +265,39 @@ derived from the new password</li>
 </ol>
 <p>No new recovery key is generated during normal password rotation.</p>
 <h3 id="server-restart"><a class="header" href="#server-restart">Server restart</a></h3>
-<p>The vault starts in <strong>Sealed</strong> state. All encrypted data is unreadable
-until the user logs in, which triggers unseal.</p>
+<p>The vault starts in <strong>Sealed</strong> state unless unattended auto-unseal is
+configured. All encrypted data is unreadable until the user logs in or the
+configured auto-unseal recovery key is accepted.</p>
+<h3 id="unattended-auto-unseal"><a class="header" href="#unattended-auto-unseal">Unattended auto-unseal</a></h3>
+<p>For servers that need to recover fully after a reboot or <code>/update</code>, set one
+of these environment variables:</p>
+<div class="table-wrapper"><table><thead><tr><th>Variable</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>MOLTIS_VAULT_AUTO_UNSEAL_KEY_FILE</code></td><td>Path to a file containing the vault recovery key. Preferred for Docker/Kubernetes secrets.</td></tr>
+<tr><td><code>MOLTIS_VAULT_AUTO_UNSEAL_KEY</code></td><td>Vault recovery key value directly in the process environment.</td></tr>
+</tbody></table>
+</div>
+<p>If both are set, Moltis logs a warning and uses
+<code>MOLTIS_VAULT_AUTO_UNSEAL_KEY_FILE</code>.</p>
+<p>Auto-unseal runs immediately after the vault is opened from SQLite and before
+Moltis loads persisted environment variables, MCP server configuration, cron
+runtime environment, and stored channel accounts. That means encrypted env vars
+and channel credentials are available during normal startup rather than only
+after a manual browser unlock.</p>
+<div id="admonition-warning" class="admonition admonish-warning" role="note" aria-labelledby="admonition-warning-title">
+<div class="admonition-title">
+<div id="admonition-warning-title">
+<p>Warning</p>
+</div>
+<a class="admonition-anchor-link" href="#admonition-warning"></a>
+</div>
+<div>
+<p>Auto-unseal trades manual recovery for unattended availability. If an attacker
+can read both the Moltis database and the configured recovery-key env/file, they
+can decrypt vault-protected secrets. Prefer a Docker/Kubernetes secret file over
+a plain env var, restrict file permissions, and keep the recovery key out of
+<code>moltis.toml</code>.</p>
+</div>
+</div>
 <h2 id="recovery-key"><a class="header" href="#recovery-key">Recovery Key</a></h2>
 <p>At vault initialization, a human-readable recovery key is generated and
 returned in the API response that performed initialization. It looks like:</p>
@@ -273,12 +305,12 @@ returned in the API response that performed initialization. It looks like:</p>
 </code></pre>
 <p>The alphabet excludes ambiguous characters (<code>I</code>, <code>O</code>, <code>0</code>, <code>1</code>) to avoid
 transcription errors. The key is case-insensitive.</p>
-<div id="admonition-warning" class="admonition admonish-warning" role="note" aria-labelledby="admonition-warning-title">
+<div id="admonition-warning-1" class="admonition admonish-warning" role="note" aria-labelledby="admonition-warning-1-title">
 <div class="admonition-title">
-<div id="admonition-warning-title">
+<div id="admonition-warning-1-title">
 <p>Warning</p>
 </div>
-<a class="admonition-anchor-link" href="#admonition-warning"></a>
+<a class="admonition-anchor-link" href="#admonition-warning-1"></a>
 </div>
 <div>
 <p>The recovery key is shown <strong>exactly once</strong> when the vault is initialized.

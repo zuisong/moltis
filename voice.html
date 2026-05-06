@@ -303,14 +303,16 @@ endpoint = "http://localhost:5002"  # Coqui TTS server
 pip install piper-tts
 
 # Or download pre-built binaries from:
-# https://github.com/rhasspy/piper/releases
+# https://github.com/OHF-Voice/piper1-gpl/releases
 </code></pre>
 </li>
 <li>
-<p>Download a voice model from <a href="https://github.com/rhasspy/piper#voices">Piper Voices</a>:</p>
+<p>Download a voice model from <a href="https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md">Piper Voices</a>:</p>
 <pre><code class="language-bash">mkdir -p ~/.moltis/models
 curl -L -o ~/.moltis/models/en_US-lessac-medium.onnx \
-  https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+  https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx
+curl -L -o ~/.moltis/models/en_US-lessac-medium.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json
 </code></pre>
 </li>
 <li>
@@ -320,20 +322,25 @@ provider = "piper"
 
 [voice.tts.piper]
 model_path = "~/.moltis/models/en_US-lessac-medium.onnx"
+config_path = "~/.moltis/models/en_US-lessac-medium.onnx.json"
 </code></pre>
 </li>
 </ol>
 <h4 id="coqui-tts"><a class="header" href="#coqui-tts">Coqui TTS</a></h4>
-<p>Coqui TTS is a high-quality neural TTS with voice cloning capabilities.</p>
+<p>Coqui TTS is a high-quality neural TTS with voice cloning capabilities. Use the
+maintained <a href="https://github.com/idiap/coqui-ai-TTS">Coqui TTS fork</a>, published as
+the <a href="https://pypi.org/project/coqui-tts/"><code>coqui-tts</code> PyPI package</a>.</p>
 <ol>
 <li>
 <p>Install and start the server:</p>
-<pre><code class="language-bash"># Via pip
-pip install TTS
+<pre><code class="language-bash"># Via uv
+uv pip install torch torchaudio torchcodec --torch-backend=auto
+uv pip install 'coqui-tts[server]'
 tts-server --model_name tts_models/en/ljspeech/tacotron2-DDC
 
 # Or via Docker
-docker run -p 5002:5002 ghcr.io/coqui-ai/tts
+docker run --rm -p 5002:5002 --entrypoint /bin/bash ghcr.io/idiap/coqui-tts-cpu \
+  -lc 'python3 TTS/server/server.py --model_name tts_models/en/ljspeech/tacotron2-DDC'
 </code></pre>
 </li>
 <li>
@@ -346,7 +353,7 @@ endpoint = "http://localhost:5002"
 </code></pre>
 </li>
 </ol>
-<p>Browse available models at <a href="https://github.com/coqui-ai/TTS#available-models">Coqui TTS Models</a>.</p>
+<p>Browse available models in the maintained fork’s <a href="https://github.com/idiap/coqui-ai-TTS/blob/dev/TTS/.models.json">standard model list</a>.</p>
 <h3 id="rpc-methods"><a class="header" href="#rpc-methods">RPC Methods</a></h3>
 <h4 id="ttsstatus"><a class="header" href="#ttsstatus"><code>tts.status</code></a></h4>
 <p>Get current TTS status.</p>
