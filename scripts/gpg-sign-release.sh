@@ -123,25 +123,25 @@ echo "Downloading release artifacts for $VERSION..."
 gh release download "$VERSION" \
   --repo "$REPO" \
   --dir "$WORK_DIR" \
-  --pattern '*.deb' \
-  --pattern '*.rpm' \
-  --pattern '*.pkg.tar.zst' \
-  --pattern '*.AppImage' \
-  --pattern '*.snap' \
-  --pattern '*.tar.gz' \
-  --pattern '*.zip' \
-  --pattern '*.exe' \
-  --pattern '*.cdx.json' \
-  --pattern '*.spdx.json'
+  --pattern 'moltis*.deb' \
+  --pattern 'moltis*.rpm' \
+  --pattern 'moltis*.pkg.tar.zst' \
+  --pattern 'moltis*.AppImage' \
+  --pattern 'moltis*.snap' \
+  --pattern 'moltis*.tar.gz' \
+  --pattern 'moltis*.zip' \
+  --pattern 'moltis*.exe' \
+  --pattern 'moltis*.cdx.json' \
+  --pattern 'moltis*.spdx.json'
 
 ARTIFACTS=()
 while IFS= read -r -d '' f; do
   ARTIFACTS+=("$f")
 done < <(find "$WORK_DIR" -maxdepth 1 -type f \
-  \( -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \
-     -o -name '*.AppImage' -o -name '*.snap' -o -name '*.tar.gz' \
-     -o -name '*.zip' -o -name '*.exe' \
-     -o -name '*.cdx.json' -o -name '*.spdx.json' \) \
+  \( -name 'moltis*.deb' -o -name 'moltis*.rpm' -o -name 'moltis*.pkg.tar.zst' \
+     -o -name 'moltis*.AppImage' -o -name 'moltis*.snap' -o -name 'moltis*.tar.gz' \
+     -o -name 'moltis*.zip' -o -name 'moltis*.exe' \
+     -o -name 'moltis*.cdx.json' -o -name 'moltis*.spdx.json' \) \
   -print0 | sort -z)
 
 if [[ ${#ARTIFACTS[@]} -eq 0 ]]; then
@@ -163,7 +163,9 @@ if [[ "$SKIP_CONFIRM" != true ]]; then
   else
     read -r -p "Sign and upload .asc files to release $VERSION? [y/N] " confirm
   fi
-  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+  confirm="${confirm#"${confirm%%[![:space:]]*}"}"
+  confirm="${confirm%"${confirm##*[![:space:]]}"}"
+  if [[ ! "$confirm" =~ ^[Yy]([Ee][Ss])?$ ]]; then
     echo "Aborted."
     exit 0
   fi

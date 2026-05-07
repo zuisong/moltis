@@ -1214,11 +1214,11 @@ jobs:
         with:
           name: moltis-${{ env.BUILD_TARGET }}.exe
           path: |
-            *.exe
-            *.exe.sha256
-            *.exe.sha512
-            *.exe.sig
-            *.exe.crt
+            moltis-${{ steps.version.outputs.version }}-${{ env.BUILD_TARGET }}.exe
+            moltis-${{ steps.version.outputs.version }}-${{ env.BUILD_TARGET }}.exe.sha256
+            moltis-${{ steps.version.outputs.version }}-${{ env.BUILD_TARGET }}.exe.sha512
+            moltis-${{ steps.version.outputs.version }}-${{ env.BUILD_TARGET }}.exe.sig
+            moltis-${{ steps.version.outputs.version }}-${{ env.BUILD_TARGET }}.exe.crt
 
   build-docker:
     if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
@@ -1489,9 +1489,11 @@ jobs:
         run: |
           mkdir -p release-files
           find artifacts -type f \( \
-            -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \
-            -o -name '*.AppImage' -o -name '*.snap' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \
-            -o -name '*.sha256' -o -name '*.sha512' -o -name '*.sig' -o -name '*.crt' \
+            -name 'moltis*.deb' -o -name 'moltis*.rpm' -o -name 'moltis*.pkg.tar.zst' \
+            -o -name 'moltis*.AppImage' -o -name 'moltis*.snap' -o -name 'moltis*.tar.gz' \
+            -o -name 'moltis*.zip' -o -name 'moltis*.exe' \
+            -o -name 'moltis*.sha256' -o -name 'moltis*.sha512' \
+            -o -name 'moltis*.sig' -o -name 'moltis*.crt' \
           \) -exec cp {} release-files/ \;
           cp CHANGELOG.md release-files/
           echo "Files to upload:"
