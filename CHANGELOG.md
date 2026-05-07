@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260507.04] - 2026-05-07
+### Fixed
+- [e2e] Align sandbox settings tests with tabs
+
 ## [20260507.03] - 2026-05-07
 ### Fixed
 - [sandbox] Clean up linux firecracker checks
