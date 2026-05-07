@@ -33,10 +33,7 @@ use {
 use crate::{
     error::{Error, Result},
     exec::{ExecOpts, ExecResult},
-    sandbox::{
-        file_system::SandboxReadResult,
-        types::{Sandbox, SandboxConfig, SandboxId},
-    },
+    sandbox::types::{Sandbox, SandboxConfig, SandboxId},
 };
 
 const GUEST_USER: &str = "sandbox";
@@ -258,9 +255,9 @@ impl FirecrackerSandbox {
             .arg(api_socket)
             .arg("--level")
             .arg("Warning")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::message(format!("firecracker: failed to spawn: {e}")))?;
 
@@ -716,11 +713,6 @@ impl Sandbox for FirecrackerSandbox {
             Error::message(format!("firecracker: failed to create images dir: {e}"))
         })?;
 
-        // Boot a temporary VM, install packages, shut down, keep the rootfs.
-        let build_id = SandboxId {
-            scope: super::types::SandboxScope::Session,
-            key: format!("build-{tag}"),
-        };
         let temp_rootfs = images_dir.join(format!("{tag}.building.ext4"));
         Self::copy_rootfs(&self.fc.rootfs_path, &temp_rootfs).await?;
 
@@ -842,7 +834,7 @@ impl Sandbox for FirecrackerSandbox {
 
         // Use pre-built rootfs if available (from build_image()), otherwise base.
         let source_rootfs = image_override
-            .map(std::path::Path::new)
+            .map(Path::new)
             .filter(|p| p.exists())
             .unwrap_or(&self.fc.rootfs_path);
 
