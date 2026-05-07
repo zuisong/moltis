@@ -214,19 +214,20 @@ enabled behind a TLS-terminating proxy. Use <code>--no-tls</code> (or
 TCP TLS passthrough). In that case, set <code>MOLTIS_ALLOW_TLS_BEHIND_PROXY=true</code>.</p>
 </div>
 </div>
-<div id="admonition-warning" class="admonition admonish-warning" role="note" aria-labelledby="admonition-warning-title">
+<div id="admonition-tip-1" class="admonition admonish-tip" role="note" aria-labelledby="admonition-tip-1-title">
 <div class="admonition-title">
-<div id="admonition-warning-title">
-<p>Warning</p>
+<div id="admonition-tip-1-title">
+<p>Tip</p>
 </div>
-<a class="admonition-anchor-link" href="#admonition-warning"></a>
+<a class="admonition-anchor-link" href="#admonition-tip-1"></a>
 </div>
 <div>
-<p><strong>Sandbox limitation</strong>: Most cloud providers do not support Docker-in-Docker.
-The sandboxed command execution feature (where the LLM runs shell commands
-inside isolated containers) will not work on these platforms. The agent will
-still function for chat, tool calls that don’t require shell execution, and
-MCP server connections.</p>
+<p><strong>Sandbox on cloud deploys</strong>: Most cloud providers do not support
+Docker-in-Docker. To enable sandboxed command execution, configure a
+<a href="sandbox-remote.html">remote sandbox backend</a> — set <code>VERCEL_TOKEN</code> for Vercel
+Firecracker microVMs, or <code>DAYTONA_API_KEY</code> for Daytona cloud sandboxes
+(including self-hosted). Moltis auto-detects these when no local Docker is
+available.</p>
 </div>
 </div>
 <h3 id="moltis_deploy_platform"><a class="header" href="#moltis_deploy_platform"><code>MOLTIS_DEPLOY_PLATFORM</code></a></h3>
@@ -380,12 +381,12 @@ callback capture fails, Moltis prompts you to paste the callback URL (or
 <code>code#state</code>) directly in the terminal. After you log in, tokens are saved to
 the config volume and the running gateway picks them up automatically — no
 restart needed.</p>
-<div id="admonition-tip-1" class="admonition admonish-tip" role="note" aria-labelledby="admonition-tip-1-title">
+<div id="admonition-tip-2" class="admonition admonish-tip" role="note" aria-labelledby="admonition-tip-2-title">
 <div class="admonition-title">
-<div id="admonition-tip-1-title">
+<div id="admonition-tip-2-title">
 <p>Tip</p>
 </div>
-<a class="admonition-anchor-link" href="#admonition-tip-1"></a>
+<a class="admonition-anchor-link" href="#admonition-tip-2"></a>
 </div>
 <div>
 <p>GitHub Copilot uses device-flow authentication (a code you enter on
@@ -420,7 +421,7 @@ the gateway is ready. Configure your provider’s health check to use:</p>
                                 <i class="fa fa-angle-left"></i>
                             </a>
 
-                            <a rel="next prefetch" href="deploy-vps.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="sandbox-remote.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <i class="fa fa-angle-right"></i>
                             </a>
 
@@ -434,7 +435,7 @@ the gateway is ready. Configure your provider’s health check to use:</p>
                         <i class="fa fa-angle-left"></i>
                     </a>
 
-                    <a rel="next prefetch" href="deploy-vps.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="sandbox-remote.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <i class="fa fa-angle-right"></i>
                     </a>
             </nav>
