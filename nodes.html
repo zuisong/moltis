@@ -201,8 +201,10 @@ Pi, or leverage a GPU machine — all from a single chat session.</p>
 </code></pre>
 <ol>
 <li>The gateway runs on your primary machine (or a server).</li>
+<li>On the gateway, briefly enable node pairing.</li>
 <li>On the remote machine, run <code>moltis node add</code> to register it with the gateway.</li>
-<li>The gateway authenticates the node using a <strong>device token</strong> from the pairing flow.</li>
+<li>The gateway authenticates the node using <strong>Ed25519 challenge-response</strong> (TOFU
+model).</li>
 <li>Once connected, the agent can execute commands on the node, query its
 telemetry, and discover its LLM providers.</li>
 </ol>
@@ -210,18 +212,48 @@ telemetry, and discover its LLM providers.</li>
 disconnect freely. There is no start/stop lifecycle managed by the gateway;
 a node is available when its process is running and connected.</p>
 <h2 id="pairing-a-node"><a class="header" href="#pairing-a-node">Pairing a Node</a></h2>
-<p>Before a node can connect, it must be paired with the gateway.</p>
+<p>The node generates an Ed25519 keypair on first run and
+presents its public key to the gateway. The operator approves the key
+fingerprint (TOFU model, same as SSH).</p>
+<p>New pairing requests are disabled by default to prevent unauthenticated
+connection spam. Open the pairing window only while adding a node.</p>
 <ol>
-<li>Open the <strong>Nodes</strong> page in the web UI (Settings → Nodes).</li>
-<li>Click <strong>Generate Token</strong> to create a device token.</li>
-<li>Copy the connection command shown in the UI.</li>
-<li>Run it on the remote machine.</li>
+<li>
+<p>On the gateway, enable pairing:</p>
+<pre><code class="language-bash">moltis node pairing enable
+</code></pre>
+</li>
+<li>
+<p>On the remote machine:</p>
+<pre><code class="language-bash">moltis node add --host ws://your-gateway:9090/ws --name "Build Server"
+</code></pre>
+<p>The node prints its fingerprint and waits for approval.</p>
+</li>
+<li>
+<p>Approve the pairing:</p>
+<ul>
+<li><strong>Web UI</strong>: Open Settings → Nodes → Pending tab, verify the fingerprint,
+click <strong>Approve</strong>.</li>
+<li><strong>CLI</strong> (headless gateways):
+<pre><code class="language-bash">moltis node pending                 # list pending requests
+moltis node approve &lt;request-id&gt;    # approve by ID
+</code></pre>
+</li>
+</ul>
+</li>
+<li>
+<p>The gateway sends a challenge nonce, the node signs it, and authentication
+completes. The public key is pinned to this device (TOFU).</p>
+</li>
+<li>
+<p>Disable new pairing requests:</p>
+<pre><code class="language-bash">moltis node pairing disable
+</code></pre>
+</li>
 </ol>
-<p>The pairing flow produces a device token that authenticates the node on every
-connection. Tokens can be revoked from the Nodes page at any time.</p>
 <h2 id="adding-a-node"><a class="header" href="#adding-a-node">Adding a Node</a></h2>
 <p>On the remote machine, register it as a node:</p>
-<pre><code class="language-bash">moltis node add --host ws://your-gateway:9090/ws --token &lt;device-token&gt; --name "Build Server"
+<pre><code class="language-bash">moltis node add --host ws://your-gateway:9090/ws --name "Build Server"
 </code></pre>
 <p>This saves the connection parameters to <code>~/.moltis/node.json</code> and installs an
 OS service that starts on boot and reconnects on failure:</p>
@@ -233,7 +265,6 @@ OS service that starts on boot and reconnects on failure:</p>
 <p>Options:</p>
 <div class="table-wrapper"><table><thead><tr><th>Flag</th><th>Description</th><th>Default</th></tr></thead><tbody>
 <tr><td><code>--host</code></td><td>Gateway WebSocket URL</td><td>(required)</td></tr>
-<tr><td><code>--token</code></td><td>Device token from pairing</td><td>(required)</td></tr>
 <tr><td><code>--name</code></td><td>Display name shown in the UI</td><td>none</td></tr>
 <tr><td><code>--node-id</code></td><td>Custom node identifier</td><td>random UUID</td></tr>
 <tr><td><code>--working-dir</code></td><td>Working directory for commands</td><td><code>$HOME</code></td></tr>
@@ -241,12 +272,12 @@ OS service that starts on boot and reconnects on failure:</p>
 <tr><td><code>--foreground</code></td><td>Run in the terminal instead of installing a service</td><td>off</td></tr>
 </tbody></table>
 </div>
-<p>You can also set <code>MOLTIS_GATEWAY_URL</code> and <code>MOLTIS_DEVICE_TOKEN</code> as
-environment variables instead of passing <code>--host</code> and <code>--token</code>.</p>
+<p>You can also set <code>MOLTIS_GATEWAY_URL</code> as an environment variable instead of
+passing <code>--host</code>.</p>
 <h3 id="foreground-mode"><a class="header" href="#foreground-mode">Foreground mode</a></h3>
 <p>For debugging or one-off use, pass <code>--foreground</code> to run the node in the
 current terminal session instead of installing a service:</p>
-<pre><code class="language-bash">moltis node add --host ws://your-gateway:9090/ws --token &lt;device-token&gt; --foreground
+<pre><code class="language-bash">moltis node add --host ws://your-gateway:9090/ws --name "Build Server" --foreground
 </code></pre>
 <p>Press <code>Ctrl+C</code> to disconnect.</p>
 <h2 id="removing-a-node"><a class="header" href="#removing-a-node">Removing a Node</a></h2>
@@ -260,6 +291,11 @@ configuration from <code>~/.moltis/node.json</code>.</p>
 </code></pre>
 <p>Shows the gateway URL, display name, and whether the background service is
 running.</p>
+<h2 id="node-fingerprint"><a class="header" href="#node-fingerprint">Node Fingerprint</a></h2>
+<pre><code class="language-bash">moltis node fingerprint
+</code></pre>
+<p>Prints the Ed25519 public key fingerprint (<code>SHA256:&lt;base64&gt;</code>) for this node.
+Use this to verify the key shown in the gateway UI during pairing.</p>
 <h2 id="logs"><a class="header" href="#logs">Logs</a></h2>
 <pre><code class="language-bash">moltis node logs
 # Tail the log:
@@ -328,24 +364,46 @@ doctor panel</li>
 </ul>
 <h2 id="cli-reference"><a class="header" href="#cli-reference">CLI Reference</a></h2>
 <div class="table-wrapper"><table><thead><tr><th>Command</th><th>Description</th></tr></thead><tbody>
-<tr><td><code>moltis node generate-token</code></td><td>Generate a device token and print the <code>add</code> command</td></tr>
-<tr><td><code>moltis node list</code></td><td>List all connected nodes</td></tr>
-<tr><td><code>moltis node add --host &lt;url&gt; --token &lt;tok&gt;</code></td><td>Join this machine to a gateway as a node</td></tr>
+<tr><td><code>moltis node add --host &lt;url&gt;</code></td><td>Join this machine to a gateway as a node</td></tr>
 <tr><td><code>moltis node add ... --foreground</code></td><td>Run in the terminal instead of installing a service</td></tr>
+<tr><td><code>moltis node fingerprint</code></td><td>Print this node’s Ed25519 fingerprint</td></tr>
+<tr><td><code>moltis node list</code></td><td>List all connected nodes</td></tr>
+<tr><td><code>moltis node pairing status</code></td><td>Show whether new node pairing requests are accepted</td></tr>
+<tr><td><code>moltis node pairing enable</code></td><td>Enable new node pairing requests</td></tr>
+<tr><td><code>moltis node pairing disable</code></td><td>Disable new node pairing requests</td></tr>
+<tr><td><code>moltis node pending</code></td><td>List pending pairing requests</td></tr>
+<tr><td><code>moltis node approve &lt;id&gt;</code></td><td>Approve a pending pairing request</td></tr>
+<tr><td><code>moltis node reject &lt;id&gt;</code></td><td>Reject a pending pairing request</td></tr>
 <tr><td><code>moltis node remove</code></td><td>Disconnect this machine and remove the service</td></tr>
 <tr><td><code>moltis node status</code></td><td>Show connection info and service status</td></tr>
 <tr><td><code>moltis node logs</code></td><td>Print log file path</td></tr>
 </tbody></table>
 </div>
 <h2 id="security"><a class="header" href="#security">Security</a></h2>
+<h3 id="node-identity-tofu"><a class="header" href="#node-identity-tofu">Node Identity (TOFU)</a></h3>
+<p>Nodes authenticate using <strong>Ed25519 challenge-response</strong>, following the same
+Trust On First Use model as SSH:</p>
 <ul>
-<li><strong>Device tokens</strong> are SHA-256 hashed before storage. The raw token is shown
-once during pairing and never stored on the gateway.</li>
+<li><strong>First connection</strong>: The node presents its public key. The operator verifies
+the fingerprint and approves the pairing.</li>
+<li><strong>Subsequent connections</strong>: The gateway sends a random 32-byte nonce. The node
+signs it with its private key. The gateway verifies the signature against the
+pinned public key.</li>
+<li><strong>Key pinning</strong>: Once a public key is approved for a device, the gateway
+rejects any future connection from that device with a different key. This
+prevents impersonation.</li>
+<li><strong>Re-keying</strong>: If a node legitimately needs a new key (e.g., after a disk
+wipe), revoke the old device from the Nodes page, then re-pair.</li>
+</ul>
+<p>The private key (<code>~/.moltis/node_key</code>) is stored with mode 0600. The gateway
+only stores the public key. No shared secret crosses the wire.</p>
+<h3 id="general"><a class="header" href="#general">General</a></h3>
+<ul>
 <li><strong>Environment filtering</strong>: When the gateway forwards commands to a node, only
 safe environment variables are forwarded (<code>TERM</code>, <code>LANG</code>, <code>LC_*</code>). Secrets
 like API keys, <code>DYLD_*</code>, and <code>LD_PRELOAD</code> are always blocked.</li>
-<li><strong>Token revocation</strong>: Revoke a device token from the Nodes page at any time.
-The node will be disconnected on its next reconnect attempt.</li>
+<li><strong>Key revocation</strong>: Revoke from the Nodes page at any time. The node
+will be disconnected on its next reconnect attempt.</li>
 </ul>
 
                     </main>

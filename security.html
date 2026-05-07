@@ -424,6 +424,27 @@ dedicated <a href="authentication.html">Authentication</a> page.</p>
 <tr><td><strong>3</strong></td><td>No credentials + remote/proxied connection</td><td>Onboarding only (setup code required)</td></tr>
 </tbody></table>
 </div>
+<h3 id="node-identity-ed25519-tofu"><a class="header" href="#node-identity-ed25519-tofu">Node Identity (Ed25519 TOFU)</a></h3>
+<p>Remote nodes authenticate using Ed25519 challenge-response, following the same
+Trust On First Use (TOFU) model as SSH:</p>
+<ol>
+<li><strong>First connection</strong>: The operator opens the pairing window from the Nodes UI
+or with <code>moltis node pairing enable</code>. The node generates an Ed25519 keypair
+and presents its public key to the gateway. The operator verifies the
+fingerprint and approves the pairing (via the web UI or <code>moltis node approve</code>).</li>
+<li><strong>Subsequent connections</strong>: The gateway sends a random 32-byte nonce. The node
+signs it with its private key. The gateway verifies the signature against the
+stored public key. No shared secret crosses the wire.</li>
+<li><strong>Key pinning</strong>: Once approved, the public key is pinned to the device ID. If
+the same device reconnects with a different key, the connection is rejected
+and a <code>node.security.key-mismatch</code> alert is broadcast to operators.</li>
+<li><strong>Revocation</strong>: Revoked keys are kept in the database so they cannot be
+re-paired without explicit operator action.</li>
+</ol>
+<p>The private key (<code>~/.moltis/node_key</code>) is stored with mode 0600 and never
+leaves the node. The gateway stores only public keys.</p>
+<p>Pairing is disabled by default. Keep it disabled except while onboarding a new
+node, then close the window with <code>moltis node pairing disable</code>.</p>
 <h2 id="http-endpoint-throttling"><a class="header" href="#http-endpoint-throttling">HTTP Endpoint Throttling</a></h2>
 <p>Moltis includes built-in per-IP endpoint throttling to reduce brute force
 attempts and traffic spikes, but only when auth is required for the current
