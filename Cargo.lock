@@ -8341,6 +8341,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "futures",
  "globset",
  "grep-matcher",
@@ -8384,6 +8385,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "which 8.0.2",
 ]
 
 [[package]]
@@ -8490,6 +8492,7 @@ dependencies = [
  "moltis-skills",
  "moltis-tools",
  "portable-pty",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "sysinfo",

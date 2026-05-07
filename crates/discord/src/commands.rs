@@ -231,7 +231,7 @@ async fn respond_ephemeral(ctx: &Context, command: &CommandInteraction, text: &s
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
