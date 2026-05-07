@@ -164,9 +164,13 @@ if [[ "$SKIP_CONFIRM" != true ]]; then
     prompt="Sign and upload .asc files to release $VERSION? [y/N] "
   fi
 
+  confirm_source="stdin"
   if [[ -r /dev/tty ]]; then
+    confirm_source="/dev/tty"
+    echo "Confirmation source: ${confirm_source}"
     IFS= read -r -p "$prompt" confirm </dev/tty || confirm=""
   else
+    echo "Confirmation source: ${confirm_source}"
     IFS= read -r -p "$prompt" confirm || confirm=""
   fi
 
@@ -174,7 +178,7 @@ if [[ "$SKIP_CONFIRM" != true ]]; then
   case "$confirm" in
     y|yes) ;;
     *)
-      echo "Aborted."
+      echo "Aborted: confirmation was '${confirm:-<empty>}' after normalization."
       exit 0
       ;;
   esac
