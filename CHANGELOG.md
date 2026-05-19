@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [20260519.01] - 2026-05-19
+### Fixed
+- [web] Avoid false websocket disconnect timeouts (#1023)
+- [sandbox] Reap docker sandbox zombies (#1025)
+- [ci] Avoid slow session cleanup in e2e
+
 ## [20260518.01] - 2026-05-18
 ### Fixed
 - [ci] Drain fake claude stdin in coverage test
