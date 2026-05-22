@@ -252,7 +252,13 @@
 
 
 
-<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>disabled</code></td><td>bool</td><td><code>false</code></td><td>When <code>true</code>, authentication is explicitly disabled (no login required).</td></tr></tbody></table>
+
+
+
+
+
+
+<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>disabled</code></td><td>bool</td><td><code>false</code></td><td>When <code>true</code>, authentication is explicitly disabled (no login required).</td></tr><tr><td><code>vault_enabled</code></td><td>bool</td><td><code>true</code></td><td>When <code>true</code>, stored secrets are encrypted at rest using the password-backed vault. Set <code>false</code> to keep password auth without vault unlocks after restart.</td></tr></tbody></table>
 <h3 id="tls--tlsconfig"><code>tls</code> — TlsConfig</h3>
 <p>TLS configuration for the gateway HTTPS server.</p>
 

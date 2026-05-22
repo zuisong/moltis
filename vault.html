@@ -13,6 +13,9 @@ derived from your password via <strong>Argon2id</strong>.</p>
 <p>The vault is enabled by default (the <code>vault</code> cargo feature) and requires
 no configuration. It initializes automatically when you set your first
 password (during setup or later in <strong>Settings > Authentication</strong>).</p>
+<p>Set <code>auth.vault_enabled = false</code> to keep password authentication without
+encrypting stored secrets at rest. Existing installs keep vault behavior on
+upgrade because the default is <code>true</code>.</p>
 <h2 id="key-hierarchy">Key Hierarchy</h2>
 <p>The vault uses a two-layer key hierarchy to separate the encryption key
 from the password:</p>
@@ -191,7 +194,17 @@ password:</p>
 
 
 
-<table><thead><tr><th>Data</th><th>Storage</th><th>AAD</th></tr></thead><tbody><tr><td>Environment variables (<code>env_variables</code> table)</td><td>SQLite</td><td><code>env:{key}</code></td></tr><tr><td>Managed SSH private keys (<code>ssh_keys</code> table)</td><td>SQLite</td><td><code>ssh-key:{name}</code></td></tr><tr><td>Provider API keys (<code>provider_keys.json.enc</code>)</td><td>File</td><td><code>provider_keys</code></td></tr></tbody></table>
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Data</th><th>Storage</th><th>AAD</th></tr></thead><tbody><tr><td>Environment variables (<code>env_variables</code> table)</td><td>SQLite</td><td><code>env:{key}</code></td></tr><tr><td>Managed SSH private keys (<code>ssh_keys</code> table)</td><td>SQLite</td><td><code>ssh-key:{name}</code></td></tr><tr><td>Channel account secrets, including Discord bot tokens</td><td>SQLite</td><td><code>channel:{type}:{account_id}:{field}</code></td></tr><tr><td>Webhook auth/source secrets</td><td>SQLite</td><td><code>webhook:config:{field}</code></td></tr><tr><td>Provider API keys (<code>provider_keys.json.enc</code>)</td><td>File</td><td><code>provider_keys</code></td></tr></tbody></table>
 <p>The <code>encrypted</code> column in <code>env_variables</code> and <code>ssh_keys</code> tracks whether each
 row is encrypted (1) or plaintext (0). When the vault is unsealed, new env vars
 and managed SSH private keys are written encrypted. Imported passphrase-protected
@@ -225,8 +238,9 @@ initial setup.</p>
 <li>Non-API routes — static assets, HTML pages, health check</li>
 </ul>
 <h2 id="api-endpoints">API Endpoints</h2>
-<p>All vault endpoints are under <code>/api/auth/vault/</code> and require no session
-(they are on the public auth allowlist):</p>
+<p>Vault unlock endpoints are under <code>/api/auth/vault/</code>. Unlock and recovery are
+available before login so a sealed vault can be opened during authentication.
+Disabling the vault requires an authenticated session.</p>
 
 
 
@@ -252,7 +266,23 @@ initial setup.</p>
 
 
 
-<table><thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/api/auth/vault/status</code></td><td>Returns <code>{"status": "uninitialized"|"sealed"|"unsealed"|"disabled"}</code></td></tr><tr><td><code>POST</code></td><td><code>/api/auth/vault/unlock</code></td><td>Unseal with password: <code>{"password": "..."}</code></td></tr><tr><td><code>POST</code></td><td><code>/api/auth/vault/recovery</code></td><td>Unseal with recovery key: <code>{"recovery_key": "..."}</code></td></tr></tbody></table>
+
+
+
+
+
+<table><thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead><tbody><tr><td><code>GET</code></td><td><code>/api/auth/vault/status</code></td><td>Returns <code>{"status": "uninitialized"|"sealed"|"unsealed"|"disabled"}</code></td></tr><tr><td><code>POST</code></td><td><code>/api/auth/vault/unlock</code></td><td>Unseal with password: <code>{"password": "..."}</code></td></tr><tr><td><code>POST</code></td><td><code>/api/auth/vault/recovery</code></td><td>Unseal with recovery key: <code>{"recovery_key": "..."}</code></td></tr><tr><td><code>POST</code></td><td><code>/api/auth/vault/disable</code></td><td>Decrypt stored secrets and set <code>auth.vault_enabled = false</code>; accepts <code>{"password":"..."}</code> when sealed.</td></tr></tbody></table>
+<h2 id="disabling-the-vault">Disabling The Vault</h2>
+<p>Use <strong>Settings > Encryption > Disable encryption at rest</strong> to opt out of the
+vault while keeping password login. Moltis decrypts all known vault-backed data
+before writing <code>auth.vault_enabled = false</code>; if any decrypt step fails, the flag
+is not changed.</p>
+<p>After disabling, restart Moltis so startup no longer wires the vault into auth,
+channel, webhook, env-var, and SSH secret storage. The running process also
+stops encrypting new secret writes immediately after a successful disable, so
+secrets added before the restart remain readable in no-vault mode. Local secrets
+remain on disk as plaintext, so only use this mode on trusted machines with
+appropriate file and disk protections.</p>
 <p>Error responses:</p>
 
 
@@ -391,7 +421,7 @@ work.” Links to Encryption settings to unlock.</li>
 <li><strong>Not set up</strong>: “Set a password to encrypt your stored keys.” Links
 to Authentication settings.</li>
 </ul>
-<h2 id="disabling-the-vault">Disabling the Vault</h2>
+<h2 id="disabling-the-vault-1">Disabling the Vault</h2>
 <p>To compile without vault support, disable the <code>vault</code> feature:</p>
 <pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="bash" data-code="cargo build --no-default-features --features &#x22;web-ui,tls&#x22;"><code><span class="line"><span style="color:#6F42C1;--shiki-dark:#B392F0">cargo</span><span style="color:#2B5581;--shiki-dark:#9ECBFF"> build</span><span style="color:#2B5581;--shiki-dark:#79B8FF"> --no-default-features</span><span style="color:#2B5581;--shiki-dark:#79B8FF"> --features</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "web-ui,tls"</span></span></code></pre>
 <p>When the feature is disabled, all vault code is compiled out via
