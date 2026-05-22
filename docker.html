@@ -158,16 +158,23 @@ inside the Moltis container but without filesystem or network isolation.</p>
 <p>For full container-level isolation (filesystem boundaries, network policies),
 mount the Docker socket.</p>
 <p>If Moltis is itself running in Docker and your <code>data_dir()</code> mount is backed by
-a different host path than <code>/home/moltis/.moltis</code>, Moltis will try to discover
-that host path automatically from <code>docker inspect</code>/<code>podman inspect</code>. If that
-lookup fails, add this to <code>/home/moltis/.config/moltis/moltis.toml</code> inside the
+a different host path than <code>/home/moltis/.moltis</code>, Moltis tries to discover that
+host path automatically from <code>docker inspect</code>/<code>podman inspect</code>. It first checks
+the current container’s hostname/cgroup references, then scans running
+containers for an unambiguous mount of Moltis’ data directory. If that lookup
+still fails, add this to <code>/home/moltis/.config/moltis/moltis.toml</code> inside the
 container:</p>
 <pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="toml" data-code="[tools.exec.sandbox]
 host_data_dir = &#x22;/absolute/host/path/to/data&#x22;"><code><span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">tools</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">exec</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">sandbox</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
 <span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">host_data_dir </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "/absolute/host/path/to/data"</span></span></code></pre>
 <p>For a bind mount like <code>-v ./data:/home/moltis/.moltis</code>, use the resolved host
-path to <code>./data</code>. Restart Moltis after changing the config so new sandbox
-containers pick up the corrected mount source.</p>
+path to <code>./data</code>. This setting is also used by sandboxed browser containers for
+their persistent Chrome profile directory. If browser startup logs show
+<code>/data/browser-profile/SingletonLock: Permission denied</code>, Moltis probably fell
+back to the in-container path (<code>/home/moltis/.moltis/...</code>) instead of the real
+host path. Set <code>host_data_dir</code> to the host-visible data directory and restart
+Moltis so new sandbox and browser containers pick up the corrected mount
+source.</p>
 <h3 id="security-consideration">Security Consideration</h3>
 <p>Mounting the Docker socket gives the container full access to the Docker
 daemon. This is equivalent to root access on the host for practical purposes.
@@ -248,6 +255,13 @@ docker compose logs -f moltis  # watch for startup messages"><code><span class="
 <p>When Moltis runs inside Docker and launches a sandboxed browser, the browser
 container is a sibling container on the host. By default, Moltis connects to
 <code>127.0.0.1</code> which only reaches its own loopback, not the browser.</p>
+<p>The sibling browser also needs a host-visible mount for its Chrome profile. If
+your Moltis data directory is bind-mounted or stored somewhere that is not
+visible on the host as <code>/home/moltis/.moltis</code>, configure
+<code>[tools.exec.sandbox].host_data_dir</code> as described in
+<a href="#docker-socket-sandbox-execution">Docker Socket Sandbox Execution</a>. Without
+that override, Chrome may fail with <code>SingletonLock: Permission denied</code> when the
+browser container tries to write <code>/data/browser-profile</code>.</p>
 <p>Add <code>container_host</code> to your <code>moltis.toml</code> so Moltis can reach the browser
 container through the host’s port mapping:</p>
 <pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="toml" data-code="[tools.browser]
