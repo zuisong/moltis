@@ -73,6 +73,17 @@ and can be parsed, but it does not treat <code>defaults.toml</code> as user-auth
 implementation. Moltis regenerates <code>defaults.toml</code> from those built-in defaults
 on startup, while <code>moltis.toml</code> should contain only values you intentionally
 override.</p>
+<h2 id="agent-readable-docs">Agent-Readable Docs</h2>
+<p>Moltis packages the documentation as local markdown files when the install
+format supports external share files, such as <code>.deb</code>, <code>.rpm</code>, Homebrew, and
+similar system packages. Agents are pointed at those local files through the
+system prompt so they can read setup, configuration, channel, and
+troubleshooting docs without needing web access.</p>
+<p>Resolution order is <code>MOLTIS_DOCS_DIR</code>, the packaged share docs directory
+(<code>&#x3C;share>/docs</code>), the source checkout docs in development, then an embedded
+fallback copied to <code>~/.moltis/docs/moltis/</code>. Moltis also writes a generated
+<code>config-template.md</code> under <code>~/.moltis/docs/moltis/</code> for the current server port
+and points agents at it separately.</p>
 <h2 id="basic-settings">Basic Settings</h2>
 <pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="toml" data-code="[server]
 port = 13131                    # HTTP/WebSocket port
