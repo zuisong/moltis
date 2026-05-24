@@ -27,7 +27,7 @@ use super::paths::{
 #[cfg(target_os = "macos")]
 use super::types::{
     BuildImageResult, DEFAULT_SANDBOX_IMAGE, NetworkPolicy, SANDBOX_HOME_DIR, Sandbox,
-    SandboxConfig, SandboxId, canonical_sandbox_packages, truncate_output_for_display,
+    SandboxConfig, SandboxId, canonical_sandbox_packages, tail_lines, truncate_output_for_display,
 };
 #[cfg(target_os = "macos")]
 use crate::error::{Error, Result};
@@ -1134,7 +1134,7 @@ impl Sandbox for AppleContainerSandbox {
         let tag = sandbox_image_tag(self.image_repo(), base, packages);
 
         if sandbox_image_exists("container", &tag).await {
-            info!(
+            debug!(
                 tag,
                 "pre-built sandbox image already exists, skipping build"
             );
@@ -1165,6 +1165,7 @@ impl Sandbox for AppleContainerSandbox {
 
         let output = output?;
         if !output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("XPC connection error") || stderr.contains("Connection invalid") {
                 return Err(Error::message(
@@ -1172,9 +1173,19 @@ impl Sandbox for AppleContainerSandbox {
                      Start it with `container system start` and restart moltis",
                 ));
             }
+            debug!(
+                tag,
+                stdout = %tail_lines(&stdout, 20),
+                stderr = %tail_lines(&stderr, 20),
+                "container build failed"
+            );
+            let status = output.status.code().map_or_else(
+                || output.status.to_string(),
+                |code| format!("exit code {code}"),
+            );
             return Err(Error::message(format!(
                 "container build failed for {tag}: {}",
-                stderr.trim()
+                status
             )));
         }
 
