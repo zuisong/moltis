@@ -5,4 +5,5 @@ mod basic_tool_names;
 mod basic_tool_results;
 mod compaction;
 mod helpers;
+mod image_edge_cases;
 mod parallel;
