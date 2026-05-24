@@ -102,8 +102,11 @@ sessions.can_send = true"><code><span class="line"><span style="color:#24292EFF;
 <li><code>identity.name</code>, <code>identity.emoji</code>, <code>identity.theme</code></li>
 <li><code>model</code></li>
 <li><code>tools.allow</code>, <code>tools.deny</code></li>
+<li><code>mcp</code> — MCP server access: <code>allow_servers</code> or <code>deny_servers</code></li>
+<li><code>sandbox.*</code> — per-agent sandbox overrides</li>
+<li><code>skills.allow</code>, <code>skills.deny</code></li>
 <li><code>system_prompt_suffix</code></li>
-<li><code>max_iterations</code>, <code>timeout_secs</code></li>
+<li><code>max_iterations</code>, <code>timeout_secs</code> (override <code>[tools]</code> runtime limits for matching direct sessions and spawned sub-agents)</li>
 <li><code>sessions.*</code> access policy</li>
 <li><code>memory.scope</code>, <code>memory.max_lines</code></li>
 <li><code>delegate_only</code></li>
@@ -146,6 +149,49 @@ scope = &#x22;project&#x22;
 max_lines = 100"><code><span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">agents</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">presets</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">researcher</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">memory</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
 <span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">scope </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "project"</span></span>
 <span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">max_lines </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#1976D2;--shiki-dark:#79B8FF"> 100</span></span></code></pre>
+<h2 id="mcp-server-access-control">MCP Server Access Control</h2>
+<p>Each preset can restrict which MCP servers are visible. Use <code>allow_servers</code> for
+a positive allow-list, or <code>deny_servers</code> for a deny-list. The two are mutually
+exclusive — set one or the other, not both.</p>
+<pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="toml" data-code="# Only allow specific MCP servers:
+[agents.presets.restricted.mcp]
+allow_servers = [&#x22;github&#x22;, &#x22;memory&#x22;]
+
+# Block specific MCP servers:
+[agents.presets.open.mcp]
+deny_servers = [&#x22;home-assistant&#x22;]"><code><span class="line"><span style="color:#C2C3C5;--shiki-dark:#6A737D"># Only allow specific MCP servers:</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">agents</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">presets</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">restricted</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">mcp</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">allow_servers </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8"> [</span><span style="color:#22863A;--shiki-dark:#9ECBFF">"github"</span><span style="color:#212121;--shiki-dark:#E1E4E8">,</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "memory"</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#C2C3C5;--shiki-dark:#6A737D"># Block specific MCP servers:</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">agents</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">presets</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">open</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">mcp</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">deny_servers </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8"> [</span><span style="color:#22863A;--shiki-dark:#9ECBFF">"home-assistant"</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span></code></pre>
+<p>When <code>allow_servers</code> is set, every configured MCP server not in the list is
+denied. An empty <code>allow_servers = []</code> blocks all MCP tools.</p>
+<h2 id="per-agent-sandbox-mode">Per-Agent Sandbox Mode</h2>
+<p>Override the global sandbox mode per agent.</p>
+<pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="toml" data-code="[agents.presets.kids.sandbox]
+mode = &#x22;all&#x22;                 # Always sandbox this agent"><code><span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">agents</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">presets</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">kids</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">sandbox</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">mode </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "all"</span><span style="color:#C2C3C5;--shiki-dark:#6A737D">                 # Always sandbox this agent</span></span></code></pre>
+<p>Available values: <code>"off"</code>, <code>"all"</code>, <code>"non-main"</code>. The override is applied
+as a per-session setting on the sandbox router.</p>
+<h2 id="per-agent-skill-policy">Per-Agent Skill Policy</h2>
+<p>Filter which skills are visible to an agent by name or category.</p>
+<pre class="astro-code astro-code-themes min-light github-dark" style="background-color:#ffffff;--shiki-dark-bg:#24292e;color:#24292eff;--shiki-dark:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="toml" data-code="# Only allow specific skills:
+[agents.presets.focused.skills]
+allow = [&#x22;web_search&#x22;, &#x22;research&#x22;]
+
+# Block specific categories:
+[agents.presets.safe.skills]
+deny = [&#x22;gaming&#x22;, &#x22;social-media&#x22;]"><code><span class="line"><span style="color:#C2C3C5;--shiki-dark:#6A737D"># Only allow specific skills:</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">agents</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">presets</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">focused</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">skills</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">allow </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8"> [</span><span style="color:#22863A;--shiki-dark:#9ECBFF">"web_search"</span><span style="color:#212121;--shiki-dark:#E1E4E8">,</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "research"</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#C2C3C5;--shiki-dark:#6A737D"># Block specific categories:</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">[</span><span style="color:#24292EFF;--shiki-dark:#B392F0">agents</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">presets</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">safe</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">.</span><span style="color:#24292EFF;--shiki-dark:#B392F0">skills</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span>
+<span class="line"><span style="color:#24292EFF;--shiki-dark:#E1E4E8">deny </span><span style="color:#D32F2F;--shiki-dark:#E1E4E8">=</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8"> [</span><span style="color:#22863A;--shiki-dark:#9ECBFF">"gaming"</span><span style="color:#212121;--shiki-dark:#E1E4E8">,</span><span style="color:#22863A;--shiki-dark:#9ECBFF"> "social-media"</span><span style="color:#24292EFF;--shiki-dark:#E1E4E8">]</span></span></code></pre>
+<p>When <code>allow</code> is non-empty, only matching skills (by name or category) are
+visible. <code>deny</code> is then applied on top.</p>
 <h2 id="model-selection-order">Model Selection Order</h2>
 <p>When <code>spawn_agent</code> runs, model choice is:</p>
 <ol>
