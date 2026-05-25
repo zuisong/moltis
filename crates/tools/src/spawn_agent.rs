@@ -1,12 +1,20 @@
 //! Sub-agent tool: lets the LLM delegate tasks to a child agent loop.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{Arc, OnceLock},
+};
 
-use {async_trait::async_trait, tracing::info};
+use {
+    async_trait::async_trait,
+    futures::{FutureExt, future::Abortable},
+    tracing::info,
+};
 
 use crate::{
     error::Error,
     params::{bool_param, str_param, string_array_param, u64_param},
+    spawn_agent_tasks::{SpawnTaskStore, SpawnTaskUpdate},
 };
 
 use {
@@ -38,6 +46,10 @@ const SPAWN_DEPTH_KEY: &str = "_spawn_depth";
 /// Minimal delegate-only toolset for coordinator-style sub-agents.
 const DELEGATE_TOOLS: &[&str] = &[
     "spawn_agent",
+    "spawn_status",
+    "spawn_result",
+    "spawn_list",
+    "cancel_spawn",
     "sessions_list",
     "sessions_history",
     "sessions_search",
@@ -45,12 +57,6 @@ const DELEGATE_TOOLS: &[&str] = &[
     "task_list",
 ];
 
-/// A tool that spawns a sub-agent running its own agent loop.
-///
-/// The sub-agent executes synchronously (blocks until done) and its result
-/// is returned as the tool output. Sub-agents get a filtered copy of the
-/// parent's tool registry (without the `spawn_agent` tool itself) and a
-/// focused system prompt.
 /// Callback for emitting events from the sub-agent back to the parent UI.
 pub type OnSpawnEvent = Arc<dyn Fn(RunnerEvent) + Send + Sync>;
 
@@ -62,6 +68,15 @@ pub struct SessionDeps {
     pub send_to_session: SendToSessionFn,
 }
 
+/// A tool that spawns a sub-agent running its own agent loop.
+///
+/// By default the sub-agent executes synchronously (blocks until done) and
+/// its result is returned as the tool output. With `nonblocking: true`, the
+/// sub-agent runs in the background and the caller gets a `task_id` to poll
+/// via `spawn_status` / `spawn_result`.
+///
+/// Sub-agents get a filtered copy of the parent's tool registry and a
+/// focused system prompt.
 pub struct SpawnAgentTool {
     provider_registry: Arc<tokio::sync::RwLock<ProviderRegistry>>,
     default_provider: Arc<dyn LlmProvider>,
@@ -69,6 +84,7 @@ pub struct SpawnAgentTool {
     agents_config: Option<Arc<tokio::sync::RwLock<AgentsConfig>>>,
     on_event: Option<OnSpawnEvent>,
     session_deps: Option<SessionDeps>,
+    task_store: Arc<SpawnTaskStore>,
 }
 
 impl SpawnAgentTool {
@@ -84,6 +100,7 @@ impl SpawnAgentTool {
             agents_config: None,
             on_event: None,
             session_deps: None,
+            task_store: default_spawn_task_store(),
         }
     }
 
@@ -105,6 +122,12 @@ impl SpawnAgentTool {
     /// Provide session dependencies so sub-agents can get policy-aware session tools.
     pub fn with_session_deps(mut self, deps: SessionDeps) -> Self {
         self.session_deps = Some(deps);
+        self
+    }
+
+    /// Share background task state with `spawn_status` and `spawn_result`.
+    pub fn with_task_store(mut self, task_store: Arc<SpawnTaskStore>) -> Self {
+        self.task_store = task_store;
         self
     }
 
@@ -138,7 +161,23 @@ impl SpawnAgentTool {
             sub_tools = sub_tools.clone_allowed_by(|name| !deny.contains(name));
         }
 
+        if delegate_only && sub_tools.get("spawn_agent").is_none() {
+            sub_tools.replace(Box::new(self.child_spawn_tool()));
+        }
+
         sub_tools
+    }
+
+    fn child_spawn_tool(&self) -> Self {
+        Self {
+            provider_registry: Arc::clone(&self.provider_registry),
+            default_provider: Arc::clone(&self.default_provider),
+            tool_registry: Arc::clone(&self.tool_registry),
+            agents_config: self.agents_config.clone(),
+            on_event: self.on_event.clone(),
+            session_deps: self.session_deps.clone(),
+            task_store: Arc::clone(&self.task_store),
+        }
     }
 
     /// Apply reasoning_effort from the agent preset to the provider, if set.
@@ -204,6 +243,11 @@ impl SpawnAgentTool {
         })?;
         Ok((Some(preset_name), Some(preset)))
     }
+}
+
+fn default_spawn_task_store() -> Arc<SpawnTaskStore> {
+    static STORE: OnceLock<Arc<SpawnTaskStore>> = OnceLock::new();
+    Arc::clone(STORE.get_or_init(|| Arc::new(SpawnTaskStore::default())))
 }
 
 /// Resolve the memory directory for a preset based on its scope.
@@ -359,6 +403,10 @@ impl AgentTool for SpawnAgentTool {
                 "delegate_only": {
                     "type": "boolean",
                     "description": "If true, sub-agent is restricted to delegation/session/task tools."
+                },
+                "nonblocking": {
+                    "type": "boolean",
+                    "description": "If true, return immediately with a task_id and let the sub-agent continue in the background. Use spawn_status and spawn_result to inspect it."
                 }
             },
             "required": ["task"]
@@ -403,6 +451,7 @@ impl AgentTool for SpawnAgentTool {
             "delegate_only",
             preset.as_ref().map(|p| p.delegate_only).unwrap_or(false),
         );
+        let nonblocking = bool_param(&params, "nonblocking", false);
 
         // Check nesting depth.
         let depth = u64_param(&params, SPAWN_DEPTH_KEY, 0);
@@ -487,42 +536,203 @@ impl AgentTool for SpawnAgentTool {
             build_sub_agent_prompt(task, context, preset.as_ref(), preset_name.as_deref());
 
         // Build tool context with incremented depth and propagated session key.
+        let session_key = params
+            .get("_session_key")
+            .and_then(serde_json::Value::as_str)
+            .map(String::from);
         let mut tool_context = serde_json::json!({
             SPAWN_DEPTH_KEY: depth + 1,
         });
-        if let Some(session_key) = params.get("_session_key") {
-            tool_context["_session_key"] = session_key.clone();
+        if let Some(ref key) = session_key {
+            tool_context["_session_key"] = serde_json::Value::String(key.clone());
         }
 
-        // Run the sub-agent loop, optionally with a timeout.
-        let user_content = moltis_agents::UserContent::text(task);
-        let agent_future = run_agent_loop_with_context_and_limits(
-            provider,
-            &sub_tools,
-            &system_prompt,
-            &user_content,
-            None,
-            None, // no history
-            Some(tool_context),
-            None, // no hooks for sub-agents
-            None, // no sender name for spawned agents
-            AgentLoopLimits {
-                max_iterations: Some(runtime_limits.max_iterations),
-            },
-        );
-
-        let result = if runtime_limits.timeout_secs > 0 {
-            let timeout_secs = runtime_limits.timeout_secs;
-            let duration = std::time::Duration::from_secs(timeout_secs);
-            match tokio::time::timeout(duration, agent_future).await {
-                Ok(r) => r,
-                Err(_) => Err(AgentRunError::Other(anyhow::anyhow!(
-                    "sub-agent timed out after {timeout_secs}s"
-                ))),
+        if nonblocking {
+            #[cfg(feature = "metrics")]
+            {
+                use moltis_metrics::{counter, gauge, labels, spawn as spawn_metrics};
+                counter!(spawn_metrics::SPAWNED_TOTAL, labels::MODE => "nonblocking").increment(1);
+                gauge!(spawn_metrics::TASKS_IN_FLIGHT).increment(1.0);
             }
-        } else {
-            agent_future.await
-        };
+
+            let (abort_handle, abort_registration) = futures::future::AbortHandle::new_pair();
+            let task_entry = self
+                .task_store
+                .insert_running(
+                    task.to_string(),
+                    session_key,
+                    model_id.clone(),
+                    preset_name.clone(),
+                    abort_handle,
+                )
+                .await;
+            let task_id = task_entry.id.clone();
+            let store = Arc::clone(&self.task_store);
+            let on_event = self.on_event.clone();
+            let task_for_run = task.to_string();
+            let model_for_run = model_id.clone();
+            let preset_for_log = preset_name.clone();
+            tokio::spawn(async move {
+                let result = Abortable::new(
+                    std::panic::AssertUnwindSafe(run_spawned_agent(
+                        provider,
+                        sub_tools,
+                        system_prompt,
+                        task_for_run.clone(),
+                        tool_context,
+                        runtime_limits,
+                    ))
+                    .catch_unwind(),
+                    abort_registration,
+                )
+                .await;
+
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_aborted) => {
+                        store
+                            .complete(&task_id, SpawnTaskUpdate {
+                                text: None,
+                                iterations: 0,
+                                tool_calls_made: 0,
+                                error: Some("cancelled by caller".to_string()),
+                            })
+                            .await;
+
+                        #[cfg(feature = "metrics")]
+                        {
+                            use moltis_metrics::{counter, gauge, labels, spawn as spawn_metrics};
+                            counter!(
+                                spawn_metrics::COMPLETED_TOTAL,
+                                labels::STATUS => "cancelled"
+                            )
+                            .increment(1);
+                            gauge!(spawn_metrics::TASKS_IN_FLIGHT).decrement(1.0);
+                        }
+
+                        if let Some(cb) = on_event {
+                            cb(RunnerEvent::SubAgentEnd {
+                                task: task_for_run,
+                                model: model_for_run,
+                                depth,
+                                iterations: 0,
+                                tool_calls_made: 0,
+                            });
+                        }
+                        return;
+                    },
+                };
+
+                let (update, iterations, tool_calls_made) = match result {
+                    Ok(Ok(result)) => {
+                        let iterations = result.iterations;
+                        let tool_calls_made = result.tool_calls_made;
+                        (
+                            SpawnTaskUpdate {
+                                text: Some(result.text),
+                                iterations,
+                                tool_calls_made,
+                                error: None,
+                            },
+                            iterations,
+                            tool_calls_made,
+                        )
+                    },
+                    Ok(Err(err)) => (
+                        SpawnTaskUpdate {
+                            text: None,
+                            iterations: 0,
+                            tool_calls_made: 0,
+                            error: Some(err.to_string()),
+                        },
+                        0,
+                        0,
+                    ),
+                    Err(_panic) => {
+                        tracing::error!(
+                            task_id = %task_id,
+                            task = %task_for_run,
+                            "nonblocking sub-agent panicked"
+                        );
+                        (
+                            SpawnTaskUpdate {
+                                text: None,
+                                iterations: 0,
+                                tool_calls_made: 0,
+                                error: Some("sub-agent panicked".to_string()),
+                            },
+                            0,
+                            0,
+                        )
+                    },
+                };
+
+                let status_label = if update.error.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                };
+
+                store.complete(&task_id, update).await;
+
+                info!(
+                    task_id = %task_id,
+                    task = %task_for_run,
+                    model = %model_for_run,
+                    depth = depth,
+                    iterations = iterations,
+                    tool_calls = tool_calls_made,
+                    preset = ?preset_for_log,
+                    status = status_label,
+                    "nonblocking sub-agent finished"
+                );
+
+                #[cfg(feature = "metrics")]
+                {
+                    use moltis_metrics::{counter, gauge, labels, spawn as spawn_metrics};
+                    counter!(
+                        spawn_metrics::COMPLETED_TOTAL,
+                        labels::STATUS => status_label.to_string()
+                    )
+                    .increment(1);
+                    gauge!(spawn_metrics::TASKS_IN_FLIGHT).decrement(1.0);
+                }
+
+                if let Some(cb) = on_event {
+                    cb(RunnerEvent::SubAgentEnd {
+                        task: task_for_run,
+                        model: model_for_run,
+                        depth,
+                        iterations,
+                        tool_calls_made,
+                    });
+                }
+            });
+
+            return Ok(serde_json::json!({
+                "task_id": task_entry.id,
+                "status": "running",
+                "started_at": task_entry.started_at,
+                "model": model_id,
+                "preset": preset_name,
+            }));
+        }
+
+        #[cfg(feature = "metrics")]
+        {
+            use moltis_metrics::{counter, labels, spawn as spawn_metrics};
+            counter!(spawn_metrics::SPAWNED_TOTAL, labels::MODE => "blocking").increment(1);
+        }
+
+        let result = run_spawned_agent(
+            provider,
+            sub_tools,
+            system_prompt,
+            task.to_string(),
+            tool_context,
+            runtime_limits,
+        )
+        .await;
 
         // Emit SubAgentEnd regardless of success/failure.
         let (iterations, tool_calls_made) = match &result {
@@ -536,6 +746,21 @@ impl AgentTool for SpawnAgentTool {
             iterations,
             tool_calls_made,
         });
+
+        #[cfg(feature = "metrics")]
+        {
+            use moltis_metrics::{counter, labels, spawn as spawn_metrics};
+            let status = if result.is_ok() {
+                "completed"
+            } else {
+                "failed"
+            };
+            counter!(
+                spawn_metrics::COMPLETED_TOTAL,
+                labels::STATUS => status.to_string()
+            )
+            .increment(1);
+        }
 
         let result = result?;
 
@@ -558,571 +783,46 @@ impl AgentTool for SpawnAgentTool {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-#[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        moltis_agents::model::{ChatMessage, CompletionResponse, StreamEvent, Usage},
-        moltis_config::schema::{AgentIdentity, PresetToolPolicy},
-        std::{pin::Pin, sync::Mutex},
-        tokio_stream::Stream,
-    };
+#[tracing::instrument(skip(provider, sub_tools, system_prompt, tool_context, runtime_limits), fields(task_len = task.len()))]
+async fn run_spawned_agent(
+    provider: Arc<dyn LlmProvider>,
+    sub_tools: ToolRegistry,
+    system_prompt: String,
+    task: String,
+    tool_context: serde_json::Value,
+    runtime_limits: AgentRuntimeLimits,
+) -> Result<moltis_agents::runner::AgentRunResult, AgentRunError> {
+    let user_content = moltis_agents::UserContent::text(&task);
+    let agent_future = run_agent_loop_with_context_and_limits(
+        provider,
+        &sub_tools,
+        &system_prompt,
+        &user_content,
+        None,
+        None,
+        Some(tool_context),
+        None,
+        None,
+        AgentLoopLimits {
+            max_iterations: Some(runtime_limits.max_iterations),
+        },
+    );
 
-    /// Mock provider that returns a fixed response.
-    struct MockProvider {
-        response: String,
-        model_id: String,
-        seen_tool_names: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl MockProvider {
-        fn with_capture(
-            response: impl Into<String>,
-            model_id: impl Into<String>,
-        ) -> (Arc<dyn LlmProvider>, Arc<Mutex<Vec<String>>>) {
-            let seen_tool_names = Arc::new(Mutex::new(Vec::new()));
-            let provider: Arc<dyn LlmProvider> = Arc::new(Self {
-                response: response.into(),
-                model_id: model_id.into(),
-                seen_tool_names: Arc::clone(&seen_tool_names),
-            });
-            (provider, seen_tool_names)
+    if runtime_limits.timeout_secs > 0 {
+        let timeout_secs = runtime_limits.timeout_secs;
+        let duration = std::time::Duration::from_secs(timeout_secs);
+        match tokio::time::timeout(duration, agent_future).await {
+            Ok(r) => r,
+            Err(_) => Err(AgentRunError::Other(anyhow::anyhow!(
+                "sub-agent timed out after {timeout_secs}s"
+            ))),
         }
-    }
-
-    #[async_trait]
-    impl LlmProvider for MockProvider {
-        fn name(&self) -> &str {
-            "mock"
-        }
-
-        fn id(&self) -> &str {
-            &self.model_id
-        }
-
-        async fn complete(
-            &self,
-            _messages: &[ChatMessage],
-            tools: &[serde_json::Value],
-        ) -> anyhow::Result<CompletionResponse> {
-            let tool_names = tools
-                .iter()
-                .filter_map(|tool| {
-                    tool.get("name")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect();
-            *self.seen_tool_names.lock().unwrap() = tool_names;
-            Ok(CompletionResponse {
-                text: Some(self.response.clone()),
-                tool_calls: vec![],
-                usage: Usage {
-                    input_tokens: 10,
-                    output_tokens: 5,
-                    ..Default::default()
-                },
-            })
-        }
-
-        fn stream(
-            &self,
-            _messages: Vec<ChatMessage>,
-        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-            Box::pin(tokio_stream::empty())
-        }
-
-        fn supports_tools(&self) -> bool {
-            true
-        }
-    }
-
-    fn make_empty_provider_registry() -> Arc<tokio::sync::RwLock<ProviderRegistry>> {
-        let env_overrides = std::collections::HashMap::new();
-        Arc::new(tokio::sync::RwLock::new(
-            ProviderRegistry::from_config_with_static_catalogs(
-                &Default::default(),
-                &env_overrides,
-                std::collections::HashMap::new(),
-            ),
-        ))
-    }
-
-    struct DummyNamedTool {
-        name: String,
-    }
-
-    #[async_trait]
-    impl AgentTool for DummyNamedTool {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn description(&self) -> &str {
-            "dummy"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({})
-        }
-
-        async fn execute(&self, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-            Ok(params)
-        }
-    }
-
-    fn registry_with_tools(names: &[&str]) -> Arc<ToolRegistry> {
-        let mut registry = ToolRegistry::new();
-        for name in names {
-            registry.register(Box::new(DummyNamedTool {
-                name: (*name).to_string(),
-            }));
-        }
-        Arc::new(registry)
-    }
-
-    fn agents_config_with_presets(
-        default_preset: Option<&str>,
-        presets: &[(&str, AgentPreset)],
-    ) -> Arc<tokio::sync::RwLock<AgentsConfig>> {
-        let mut cfg = AgentsConfig {
-            default_preset: default_preset.map(String::from),
-            ..Default::default()
-        };
-        for (name, preset) in presets {
-            cfg.presets.insert((*name).to_string(), preset.clone());
-        }
-        Arc::new(tokio::sync::RwLock::new(cfg))
-    }
-
-    #[tokio::test]
-    async fn test_sub_agent_runs_and_returns_result() {
-        let (provider, _) = MockProvider::with_capture("Sub-agent result", "mock-model");
-        let tool_registry = Arc::new(ToolRegistry::new());
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            Arc::clone(&provider),
-            tool_registry,
-        );
-
-        let params = serde_json::json!({ "task": "do something" });
-        let result = spawn_tool.execute(params).await.unwrap();
-
-        assert_eq!(result["text"], "Sub-agent result");
-        assert_eq!(result["iterations"], 1);
-        assert_eq!(result["tool_calls_made"], 0);
-        assert_eq!(result["model"], "mock-model");
-    }
-
-    #[tokio::test]
-    async fn test_depth_limit_rejects() {
-        let (provider, _) = MockProvider::with_capture("nope", "mock");
-        let tool_registry = Arc::new(ToolRegistry::new());
-        let spawn_tool =
-            SpawnAgentTool::new(make_empty_provider_registry(), provider, tool_registry);
-
-        let params = serde_json::json!({
-            "task": "do something",
-            "_spawn_depth": MAX_SPAWN_DEPTH,
-        });
-        let result = spawn_tool.execute(params).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("nesting depth"));
-    }
-
-    #[tokio::test]
-    async fn test_spawn_agent_excluded_from_sub_registry() {
-        let (provider, _) = MockProvider::with_capture("ok", "mock");
-
-        // Create a registry with spawn_agent in it.
-        let mut registry = ToolRegistry::new();
-
-        struct DummyTool;
-        #[async_trait]
-        impl AgentTool for DummyTool {
-            fn name(&self) -> &str {
-                "spawn_agent"
-            }
-
-            fn description(&self) -> &str {
-                "dummy"
-            }
-
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-                Ok(serde_json::json!("dummy"))
-            }
-        }
-
-        struct EchoTool;
-        #[async_trait]
-        impl AgentTool for EchoTool {
-            fn name(&self) -> &str {
-                "echo"
-            }
-
-            fn description(&self) -> &str {
-                "echo"
-            }
-
-            fn parameters_schema(&self) -> serde_json::Value {
-                serde_json::json!({})
-            }
-
-            async fn execute(&self, p: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-                Ok(p)
-            }
-        }
-
-        registry.register(Box::new(DummyTool));
-        registry.register(Box::new(EchoTool));
-
-        let filtered = registry.clone_without(&["spawn_agent"]);
-        assert!(filtered.get("spawn_agent").is_none());
-        assert!(filtered.get("echo").is_some());
-
-        // Also verify schemas don't include spawn_agent.
-        let schemas = filtered.list_schemas();
-        assert_eq!(schemas.len(), 1);
-        assert_eq!(schemas[0]["name"], "echo");
-
-        // Ensure original is unaffected.
-        assert!(registry.get("spawn_agent").is_some());
-
-        // The SpawnAgentTool itself should work with the filtered registry.
-        let spawn_tool =
-            SpawnAgentTool::new(make_empty_provider_registry(), provider, Arc::new(registry));
-        let result = spawn_tool
-            .execute(serde_json::json!({ "task": "test" }))
-            .await
-            .unwrap();
-        assert_eq!(result["text"], "ok");
-    }
-
-    #[tokio::test]
-    async fn test_context_passed_to_sub_agent() {
-        let (provider, _) = MockProvider::with_capture("done with context", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            Arc::new(ToolRegistry::new()),
-        );
-
-        let params = serde_json::json!({
-            "task": "analyze code",
-            "context": "The code is in src/main.rs",
-        });
-        let result = spawn_tool.execute(params).await.unwrap();
-        assert_eq!(result["text"], "done with context");
-    }
-
-    #[tokio::test]
-    async fn test_null_optional_array_params_are_treated_as_absent() {
-        let (provider, seen_tool_names) = MockProvider::with_capture("done", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
-        );
-
-        let params = serde_json::json!({
-            "task": "analyze code",
-            "allow_tools": null,
-            "deny_tools": null,
-            "context": null,
-            "model": null,
-            "preset": null,
-            "delegate_only": null,
-        });
-        let result = spawn_tool.execute(params).await.unwrap();
-        assert_eq!(result["text"], "done");
-        let mut seen = seen_tool_names.lock().unwrap().clone();
-        seen.sort();
-        assert_eq!(seen, vec![
-            "exec".to_string(),
-            "task_list".to_string(),
-            "web_fetch".to_string(),
-        ]);
-    }
-
-    #[tokio::test]
-    async fn test_missing_task_parameter() {
-        let (provider, _) = MockProvider::with_capture("nope", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            Arc::new(ToolRegistry::new()),
-        );
-
-        let result = spawn_tool.execute(serde_json::json!({})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("task"));
-    }
-
-    #[tokio::test]
-    async fn test_build_sub_tools_applies_allow_and_deny() {
-        let (provider, _) = MockProvider::with_capture("ok", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            registry_with_tools(&["spawn_agent", "exec", "web_fetch", "task_list"]),
-        );
-
-        let filtered = spawn_tool.build_sub_tools(
-            &[
-                "exec".to_string(),
-                "task_list".to_string(),
-                "spawn_agent".to_string(),
-            ],
-            &["task_list".to_string()],
-            false,
-        );
-        assert!(filtered.get("exec").is_some());
-        assert!(filtered.get("task_list").is_none());
-        assert!(filtered.get("spawn_agent").is_none());
-        assert!(filtered.get("web_fetch").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_build_sub_tools_delegate_only_uses_delegate_set() {
-        let (provider, _) = MockProvider::with_capture("ok", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            registry_with_tools(&[
-                "spawn_agent",
-                "sessions_list",
-                "sessions_history",
-                "sessions_send",
-                "task_list",
-                "exec",
-            ]),
-        );
-
-        let filtered = spawn_tool.build_sub_tools(&[], &[], true);
-        assert!(filtered.get("spawn_agent").is_some());
-        assert!(filtered.get("sessions_list").is_some());
-        assert!(filtered.get("sessions_history").is_some());
-        assert!(filtered.get("sessions_send").is_some());
-        assert!(filtered.get("task_list").is_some());
-        assert!(filtered.get("exec").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_resolve_preset_uses_explicit_name() {
-        let (provider, _) = MockProvider::with_capture("ok", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_agents_config(agents_config_with_presets(Some("default"), &[(
-            "research",
-            AgentPreset {
-                delegate_only: true,
-                ..Default::default()
-            },
-        )]));
-
-        let (name, preset) = spawn_tool
-            .resolve_preset(&serde_json::json!({ "preset": "research" }))
-            .await
-            .expect("resolve preset");
-        assert_eq!(name.as_deref(), Some("research"));
-        assert_eq!(preset.as_ref().map(|p| p.delegate_only), Some(true));
-    }
-
-    #[tokio::test]
-    async fn test_resolve_preset_uses_default_when_missing() {
-        let (provider, _) = MockProvider::with_capture("ok", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_agents_config(agents_config_with_presets(Some("default"), &[(
-            "default",
-            AgentPreset {
-                tools: PresetToolPolicy {
-                    allow: vec!["task_list".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )]));
-
-        let (name, preset) = spawn_tool
-            .resolve_preset(&serde_json::json!({}))
-            .await
-            .expect("resolve default preset");
-        assert_eq!(name.as_deref(), Some("default"));
-        assert_eq!(
-            preset
-                .as_ref()
-                .map(|p| p.tools.allow.clone())
-                .unwrap_or_default(),
-            vec!["task_list".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_resolve_preset_errors_when_name_missing() {
-        let (provider, _) = MockProvider::with_capture("ok", "mock");
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_agents_config(agents_config_with_presets(None, &[]));
-
-        let result = spawn_tool
-            .resolve_preset(&serde_json::json!({ "preset": "missing" }))
-            .await;
-        assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .map(|e| e.to_string().contains("not found"))
-                .unwrap_or(false)
-        );
-    }
-
-    #[test]
-    fn test_identity_injected_into_system_prompt() {
-        let preset = AgentPreset {
-            identity: AgentIdentity {
-                name: Some("scout".into()),
-                emoji: Some("🔍".into()),
-                theme: Some("thorough".into()),
-            },
-            system_prompt_suffix: Some("Focus on accuracy.".into()),
-            ..Default::default()
-        };
-
-        let prompt =
-            build_sub_agent_prompt("find bugs", "in main.rs", Some(&preset), Some("scout"));
-
-        assert!(prompt.contains("You are scout (🔍)"));
-        assert!(prompt.contains("Your style is thorough"));
-        assert!(prompt.contains("Task: find bugs"));
-        assert!(prompt.contains("Context: in main.rs"));
-        assert!(prompt.contains("Focus on accuracy."));
-    }
-
-    #[test]
-    fn test_no_identity_uses_default_prompt() {
-        let prompt = build_sub_agent_prompt("do work", "", None, None);
-
-        assert!(prompt.contains("You are a sub-agent"));
-        assert!(prompt.contains("Task: do work"));
-        assert!(!prompt.contains("Context:"));
-    }
-
-    #[test]
-    fn test_memory_injected_into_system_prompt() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory_dir = dir.path().join("agent-memory").join("researcher");
-        std::fs::create_dir_all(&memory_dir).unwrap();
-        std::fs::write(
-            memory_dir.join("MEMORY.md"),
-            "- Always check edge cases\n- Prefer iterators",
-        )
-        .unwrap();
-
-        // Load memory directly to verify the function works.
-        let content = load_memory_from_dir(&memory_dir, 200);
-        assert!(content.is_some());
-        let content = content.unwrap();
-        assert!(content.contains("Always check edge cases"));
-        assert!(content.contains("Prefer iterators"));
-    }
-
-    #[test]
-    fn test_load_memory_truncates() {
-        let dir = tempfile::tempdir().unwrap();
-        let memory_dir = dir.path();
-        let lines: Vec<String> = (0..10).map(|i| format!("Line {i}")).collect();
-        std::fs::write(memory_dir.join("MEMORY.md"), lines.join("\n")).unwrap();
-
-        let content = load_memory_from_dir(memory_dir, 3).unwrap();
-        assert!(content.contains("Line 0"));
-        assert!(content.contains("Line 2"));
-        assert!(!content.contains("Line 3"));
-    }
-
-    #[test]
-    fn test_load_memory_empty_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("MEMORY.md"), "   \n  \n").unwrap();
-
-        let content = load_memory_from_dir(dir.path(), 200);
-        assert!(content.is_none());
-    }
-
-    #[test]
-    fn test_load_memory_missing_file_returns_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let content = load_memory_from_dir(dir.path(), 200);
-        assert!(content.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_timeout_cancels_long_running_agent() {
-        // Mock provider with a slow response.
-        struct SlowProvider;
-
-        #[async_trait]
-        impl LlmProvider for SlowProvider {
-            fn name(&self) -> &str {
-                "slow"
-            }
-
-            fn id(&self) -> &str {
-                "slow-model"
-            }
-
-            async fn complete(
-                &self,
-                _messages: &[ChatMessage],
-                _tools: &[serde_json::Value],
-            ) -> anyhow::Result<CompletionResponse> {
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                Ok(CompletionResponse {
-                    text: Some("too late".into()),
-                    tool_calls: vec![],
-                    usage: Usage::default(),
-                })
-            }
-
-            fn stream(
-                &self,
-                _messages: Vec<ChatMessage>,
-            ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
-                Box::pin(tokio_stream::empty())
-            }
-        }
-
-        let provider: Arc<dyn LlmProvider> = Arc::new(SlowProvider);
-        let spawn_tool = SpawnAgentTool::new(
-            make_empty_provider_registry(),
-            provider,
-            Arc::new(ToolRegistry::new()),
-        )
-        .with_agents_config(agents_config_with_presets(None, &[("slow", AgentPreset {
-            timeout_secs: Some(1),
-            ..Default::default()
-        })]));
-
-        let params = serde_json::json!({
-            "task": "do something slowly",
-            "preset": "slow",
-        });
-        let result = spawn_tool.execute(params).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("timed out"));
+    } else {
+        agent_future.await
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "spawn_agent_tests.rs"]
+mod spawn_agent_tests;
