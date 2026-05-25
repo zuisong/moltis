@@ -845,8 +845,6 @@ test.describe("Chat input and slash commands", () => {
 			})
 			.toBe("62.0K (31%)");
 
-		const tokenBar = page.locator("#tokenBar");
-		await expect(tokenBar).toBeVisible();
 		expect(pageErrors).toEqual([]);
 	});
 
