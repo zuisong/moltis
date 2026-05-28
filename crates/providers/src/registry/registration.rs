@@ -32,6 +32,9 @@ use crate::{
     anthropic, async_openai_provider, config_helpers::*, discovered_model::*, genai_provider,
     model_capabilities::*, model_catalogs::*, model_id::*, ollama::*, openai, opencode_zen,
 };
+
+const CUSTOM_REASONING_CONTENT_MODEL_PREFIXES: &[&str] = &["kimi-", "deepseek-v4"];
+
 impl ProviderRegistry {
     /// Register models from a [`RediscoveryResult`], skipping those already
     /// present. All I/O (model list fetches, Ollama probes) must be completed
@@ -261,6 +264,16 @@ impl ProviderRegistry {
                 )
                 .with_stream_transport(stream_transport)
                 .with_cache_retention(cache_retention)
+                .with_supports_user_name(def.supports_user_name)
+                .with_default_strict_tools(def.default_strict_tools)
+                .with_default_reasoning_content(def.default_reasoning_content_on_tool_messages)
+                .with_reasoning_content_model_prefixes(def.reasoning_content_model_prefixes)
+                .with_rejects_null_in_enums(def.rejects_null_in_enums)
+                .with_gemini_tool_call_extra_content(def.requires_gemini_tool_call_extra_content)
+                .with_system_message_rewrite(def.system_message_rewrite)
+                .with_qwen_models_require_single_leading_system(
+                    def.qwen_models_require_single_leading_system,
+                )
                 .with_context_window_overrides(
                     self.global_cw_overrides.clone(),
                     config
@@ -330,6 +343,8 @@ impl ProviderRegistry {
                     name.clone(),
                 )
                 .with_stream_transport(entry.stream_transport)
+                .with_reasoning_content_model_prefixes(CUSTOM_REASONING_CONTENT_MODEL_PREFIXES)
+                .with_qwen_models_require_single_leading_system(true)
                 .with_context_window_overrides(
                     self.global_cw_overrides.clone(),
                     extract_cw_overrides(&entry.model_overrides),
@@ -1109,6 +1124,8 @@ impl ProviderRegistry {
                 )
                 .with_stream_transport(entry.stream_transport)
                 .with_cache_retention(entry.cache_retention)
+                .with_reasoning_content_model_prefixes(CUSTOM_REASONING_CONTENT_MODEL_PREFIXES)
+                .with_qwen_models_require_single_leading_system(true)
                 .with_context_window_overrides(
                     self.global_cw_overrides.clone(),
                     extract_cw_overrides(&entry.model_overrides),
