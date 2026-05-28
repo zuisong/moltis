@@ -6,7 +6,7 @@ use {
         },
         async_trait,
         gateway::ActivityData,
-        model::user::OnlineStatus as SerenityOnlineStatus,
+        model::{event::MessageUpdateEvent, user::OnlineStatus as SerenityOnlineStatus},
     },
     tracing::{debug, info, warn},
 };
@@ -267,6 +267,10 @@ fn select_media_attachment(attachments: &[Attachment]) -> Option<&Attachment> {
         return Some(a);
     }
     attachments.iter().find(|a| attachment_is_image(a))
+}
+
+fn should_drop_empty_discord_message(text: &str, attachments: &[Attachment]) -> bool {
+    text.is_empty() && attachments.is_empty()
 }
 
 /// Normalize an audio attachment to a short format string the STT provider
@@ -659,6 +663,16 @@ impl EventHandler for Handler {
             return;
         }
 
+        info!(
+            account_id = %self.account_id,
+            message_id = msg.id.get(),
+            content_len = msg.content.len(),
+            attachment_count = msg.attachments.len(),
+            flags = ?msg.flags,
+            kind = ?msg.kind,
+            "discord raw message event received"
+        );
+
         let accounts_lock_wait_start = std::time::Instant::now();
         let (config, event_sink, message_log, bot_user_id) = {
             let accounts = self.accounts.read().unwrap_or_else(|e| e.into_inner());
@@ -712,7 +726,19 @@ impl EventHandler for Handler {
 
         // Drop truly empty messages (no text and no attachments). Messages with
         // attachments but no caption still need processing (e.g. voice notes).
-        if text.is_empty() && msg.attachments.is_empty() {
+        if should_drop_empty_discord_message(&text, &msg.attachments) {
+            warn!(
+                account_id = %self.account_id,
+                message_id,
+                chat_id,
+                peer_id,
+                text_len = text.len(),
+                content_len = msg.content.len(),
+                attachment_count = msg.attachments.len(),
+                flags = ?msg.flags,
+                kind = ?msg.kind,
+                "discord dropping empty message event"
+            );
             return;
         }
 
@@ -729,6 +755,8 @@ impl EventHandler for Handler {
             is_guild,
             bot_mentioned,
             text_len = text.len(),
+            attachment_count = msg.attachments.len(),
+            flags = ?msg.flags,
             ingress_lag_ms,
             accounts_lock_wait_ms,
             "discord inbound message received"
@@ -1074,6 +1102,24 @@ impl EventHandler for Handler {
             sink.dispatch_to_chat_with_attachments(&body, attachments, reply_to, meta)
                 .await;
         }
+    }
+
+    async fn message_update(
+        &self,
+        _ctx: Context,
+        _old_if_available: Option<Message>,
+        _new: Option<Message>,
+        event: MessageUpdateEvent,
+    ) {
+        info!(
+            account_id = %self.account_id,
+            message_id = event.id.get(),
+            channel_id = event.channel_id.get(),
+            content_len = event.content.as_ref().map(String::len),
+            attachment_count = event.attachments.as_ref().map(Vec::len),
+            flags = ?event.flags,
+            "discord message update event received"
+        );
     }
 
     async fn ready(&self, ctx: Context, ready: Ready) {
