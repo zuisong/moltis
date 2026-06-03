@@ -31,7 +31,7 @@ drawings:
   </div>
 
   <div class="mt-9 text-3xl font-semibold text-gray-900">
-    Fabien Penso · @fabienpenso
+    Fabien Penso · https://pen.so · @fabienpenso
   </div>
 
   <div class="mt-3 text-2xl leading-9 text-gray-700">
