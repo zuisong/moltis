@@ -107,6 +107,8 @@
 <li><a href="#mcp"><code>mcp</code></a></li>
 <li><a href="#mcpserversname"><code>mcp.servers.&#x3C;name></code></a></li>
 <li><a href="#mcpserversnameoauth"><code>mcp.servers.&#x3C;name>.oauth</code></a></li>
+<li><a href="#external-agents"><code>external_agents</code></a></li>
+<li><a href="#external-agentsagentskind"><code>external_agents.agents.&#x3C;kind></code></a></li>
 </ul>
 </li>
 <li><strong>Memory</strong>
@@ -232,7 +234,13 @@
 
 
 
-<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>bind</code></td><td>string</td><td><code>"127.0.0.1"</code></td><td>Address to bind to.</td></tr><tr><td><code>port</code></td><td>integer</td><td><code>0</code></td><td>Port to listen on. <code>0</code> is replaced with a random available port when config is created.</td></tr><tr><td><code>http_request_logs</code></td><td>bool</td><td><code>false</code></td><td>Enable verbose Axum/Tower HTTP request logs (<code>http_request</code> spans). Useful for debugging redirects and request flow.</td></tr><tr><td><code>ws_request_logs</code></td><td>bool</td><td><code>false</code></td><td>Enable WebSocket request/response logs (<code>ws:</code> entries). Useful for debugging RPC calls from the web UI.</td></tr><tr><td><code>log_buffer_size</code></td><td>integer</td><td><code>1000</code></td><td>Maximum number of log entries kept in the in-memory ring buffer. Older entries are persisted to disk. Increase for busy servers, decrease for memory-constrained devices.</td></tr><tr><td><code>update_releases_url</code></td><td>optional string</td><td>—</td><td>URL of the releases manifest (<code>releases.json</code>) used by the update checker. Defaults to <code>https://www.moltis.org/releases.json</code> when unset.</td></tr><tr><td><code>db_pool_max_connections</code></td><td>integer</td><td><code>5</code></td><td>Maximum number of SQLite pool connections. Lower values reduce memory usage for personal gateways.</td></tr><tr><td><code>shiki_cdn_url</code></td><td>optional string</td><td>—</td><td>Base URL for the Shiki syntax-highlighting library loaded by the web UI. Defaults to <code>https://esm.sh/shiki@3.2.1?bundle</code> when unset.</td></tr><tr><td><code>terminal_enabled</code></td><td>bool</td><td><code>true</code></td><td>Enable or disable the host terminal in the web UI. Set to <code>false</code> to prevent an unsandboxed shell. The <code>MOLTIS_TERMINAL_DISABLED</code> env var (<code>1</code> or <code>true</code>) takes precedence.</td></tr></tbody></table>
+
+
+
+
+
+
+<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>bind</code></td><td>string</td><td><code>"127.0.0.1"</code></td><td>Address to bind to.</td></tr><tr><td><code>port</code></td><td>integer</td><td><code>0</code></td><td>Port to listen on. <code>0</code> is replaced with a random available port when config is created.</td></tr><tr><td><code>http_request_logs</code></td><td>bool</td><td><code>false</code></td><td>Enable verbose Axum/Tower HTTP request logs (<code>http_request</code> spans). Useful for debugging redirects and request flow.</td></tr><tr><td><code>ws_request_logs</code></td><td>bool</td><td><code>false</code></td><td>Enable WebSocket request/response logs (<code>ws:</code> entries). Useful for debugging RPC calls from the web UI.</td></tr><tr><td><code>log_buffer_size</code></td><td>integer</td><td><code>1000</code></td><td>Maximum number of log entries kept in the in-memory ring buffer. Older entries are persisted to disk. Increase for busy servers, decrease for memory-constrained devices.</td></tr><tr><td><code>update_releases_url</code></td><td>optional string</td><td>—</td><td>URL of the releases manifest (<code>releases.json</code>) used by the update checker. Defaults to <code>https://www.moltis.org/releases.json</code> when unset.</td></tr><tr><td><code>db_pool_max_connections</code></td><td>integer</td><td><code>5</code></td><td>Maximum number of SQLite pool connections. Lower values reduce memory usage for personal gateways.</td></tr><tr><td><code>rpc_timeout_ms</code></td><td>integer</td><td><code>5000</code></td><td>Milliseconds the web UI waits for a WebSocket RPC reply before failing with a <code>TIMEOUT</code> error.</td></tr><tr><td><code>shiki_cdn_url</code></td><td>optional string</td><td>—</td><td>Base URL for the Shiki syntax-highlighting library loaded by the web UI. Defaults to <code>https://esm.sh/shiki@3.2.1?bundle</code> when unset.</td></tr><tr><td><code>terminal_enabled</code></td><td>bool</td><td><code>true</code></td><td>Enable or disable the host terminal in the web UI. Set to <code>false</code> to prevent an unsandboxed shell. The <code>MOLTIS_TERMINAL_DISABLED</code> env var (<code>1</code> or <code>true</code>) takes precedence.</td></tr></tbody></table>
 <h3 id="auth--authconfig"><code>auth</code> — AuthConfig</h3>
 <p>Authentication configuration.</p>
 
@@ -2163,6 +2171,95 @@ not create chat agents, change memory, or affect <code>spawn_agent</code> preset
 
 <table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>client_id</code></td><td>string</td><td><em>(required)</em></td><td>The OAuth client ID.</td></tr><tr><td><code>client_secret</code></td><td>optional string</td><td><code>None</code></td><td>Optional OAuth client secret sent to the token endpoint.</td></tr><tr><td><code>auth_url</code></td><td>string</td><td><em>(required)</em></td><td>The authorization endpoint URL.</td></tr><tr><td><code>token_url</code></td><td>string</td><td><em>(required)</em></td><td>The token endpoint URL.</td></tr><tr><td><code>scopes</code></td><td>array of string</td><td><code>[]</code></td><td>OAuth scopes to request.</td></tr></tbody></table>
 <hr>
+<hr>
+<h3 id="external_agents"><code>external_agents</code></h3>
+<p><strong>Struct:</strong> <code>ExternalAgentsConfig</code></p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable the external CLI agent bridge.</td></tr><tr><td><code>agents</code></td><td>map</td><td><code>{}</code></td><td>Per-agent configuration keyed by agent kind, such as <code>claude-code</code> or <code>codex</code>.</td></tr></tbody></table>
+<h3 id="external_agentsagentskind"><code>external_agents.agents.&#x3C;kind></code></h3>
+<p><strong>Struct:</strong> <code>ExternalAgentConfig</code></p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr></thead><tbody><tr><td><code>binary</code></td><td>optional string</td><td><code>null</code></td><td>Override the CLI binary path.</td></tr><tr><td><code>args</code></td><td>array of strings</td><td><code>[]</code></td><td>Override CLI arguments for the external agent runtime.</td></tr><tr><td><code>models</code></td><td>array of strings</td><td><code>[]</code></td><td>Optional model choices shown in <code>/model</code>; selected values are passed to the external CLI runtime.</td></tr><tr><td><code>efforts</code></td><td>array of strings</td><td><code>[]</code></td><td>Optional thinking/reasoning effort choices shown in <code>/model</code>; selected values are passed to runtimes that support effort.</td></tr><tr><td><code>env</code></td><td>map</td><td><code>{}</code></td><td>Environment variables for this external agent runtime.</td></tr><tr><td><code>working_dir</code></td><td>optional string</td><td><code>null</code></td><td>Working directory for this external agent runtime.</td></tr><tr><td><code>timeout_secs</code></td><td>optional integer</td><td><code>null</code></td><td>Timeout for external agent startup or turns.</td></tr><tr><td><code>use_tmux</code></td><td>optional bool</td><td><code>null</code></td><td>Force tmux-backed runtime when supported.</td></tr></tbody></table>
 <hr>
 <h2 id="memory">Memory</h2>
 <h3 id="memory-1"><code>memory</code></h3>
